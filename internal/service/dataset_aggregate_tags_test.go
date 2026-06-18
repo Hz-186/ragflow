@@ -19,6 +19,8 @@ type aggregateTagsMockEngine struct {
 	pagedSearchResults map[string]map[int]*types.SearchResult
 	searchErr          error
 	requests           []*types.SearchRequest
+	chunkStoreExists   bool
+	chunkStoreErr      error
 }
 
 func (m *aggregateTagsMockEngine) Search(ctx context.Context, req *types.SearchRequest) (*types.SearchResult, error) {
