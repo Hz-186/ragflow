@@ -2,6 +2,12 @@
 
 Use this file as the local operating guide for the current codebase. Prefer the code and the current CLAUDE.md over any older convention or remembered project shape.
 
+## Before Any Analysis — Code Graph First (MANDATORY)
+- **Always read `CODEGRAPH.md` at the repo root FIRST** before analyzing, modifying, or reviewing any part of this project. It is the maintained code map: directory index, dual-backend (Python/Go) mechanics, the four core data flows, and a jump table to high-frequency entry files.
+- After locating the involved modules via `CODEGRAPH.md`, read the relevant code's overall call chain with a code-graph approach (symbol usage/reference tracing, value-flow tracing, or an exploration subagent) — entry → middle layers → persistence/output — before drawing conclusions or making edits. Do not start with blind repo-wide searches.
+- Always determine whether the task belongs to the Python path (`api/` `rag/` `deepdoc/` `agent/`) or the Go path (`cmd/` `internal/`) before editing; they are parallel implementations and changing the wrong one has no effect.
+- If project structure changes significantly (new top-level dirs, backend convergence, port/service changes), update `CODEGRAPH.md` in the same change.
+
 ## Core Stance
 - Treat legacy code as liability, not as a compatibility target.
 - Prefer deletion over shims, deprecated branches, wrapper APIs, and dual-track migration notes.
