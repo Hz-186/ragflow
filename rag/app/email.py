@@ -104,20 +104,26 @@ def chunk(
 
     main_res.extend(tokenize_chunks(chunks, doc, eng, None, language=lang))
     logging.debug("naive_merge({}): {}".format(filename, timer() - st))
-    # get the attachment info
-    for part in msg.iter_attachments():
+    # ===== 递归切片：每个附件交给「通用解析器」再切一遍 =====
+    for part in msg.iter_attachments():  # 遍历邮件里的所有附件部分
         content_disposition = part.get("Content-Disposition")
         if content_disposition:
             dispositions = content_disposition.strip().split(";")
-            if dispositions[0].lower() == "attachment":
+            if dispositions[0].lower() == "attachment":  # 只处理明确标记为附件的部分（忽略内联图）
                 filename = part.get_filename()
-                payload = part.get_payload(decode=True)
+                payload = part.get_payload(decode=True)  # 解出附件的原始字节
                 try:
+                    # 递归调用通用解析器：附件（docx/pdf/xlsx/图片…）按自己的扩展名
+                    # 走对应解析流程，切片结果并入本邮件的切片列表。
+                    # 注意：这里没传 is_root=False，顶层邮件场景下附件的 is_root 默认
+                    # True，所以「附件里的内嵌文件」还会再被挖一层（递归深度实际约
+                    # 两三层，由 is_root 防爆闸天然兜底）；只有当本邮件自身是递归
+                    # 进来的（如作为某文档的附件），kwargs 里的 is_root=False 才会透传
                     attachment_res.extend(naive_chunk(filename, payload, callback=callback, **kwargs))
                 except Exception:
-                    pass
+                    pass  # 单个附件解析失败静默跳过，不影响邮件正文入库
 
-    return main_res + attachment_res
+    return main_res + attachment_res  # 正文切片 + 附件切片一起返回
 
 
 if __name__ == "__main__":

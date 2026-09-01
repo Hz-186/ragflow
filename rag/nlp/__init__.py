@@ -210,8 +210,26 @@ QUESTION_PATTERN = [
     r"QUESTION ([0-9]+)",
 ]
 
-
 def has_qbullet(reg, box, last_box, last_index, last_bull, bull_x0_list):
+    """判断「当前文本框是不是一道题目」—— 题目鉴定员。
+
+    输入数据的样子（一份试卷 PDF 被 OCR 出的文本框序列，逐框送进来；
+    reg 是 qbullets_category 投票选出的「问法风格」正则，如 "第([零一二三四五六七八九十百0-9]+)问"）：
+        box = {
+            "text": "第一问 简述RAG的原理？",
+            "x0": 72.0,              # 该框的左边缘 x 坐标
+            "top": 120.0,            # 该框的顶部 y 坐标
+            "layout_type": "text",   # 版面类型：普通文本/标题
+        }
+        last_box = {
+            "text": "一、背景介绍：",
+            "x0": 72.0,
+            "top": 90.0,
+        }
+    输出：(命中的正则匹配对象, 本题题号)；不是题目则返回 (None, last_index)。
+    鉴定手段：正则匹配题号 + 题号必须递增 + 一排位置防误判
+    （缩进太深/紧贴上行/前一段以冒号收尾 都判为「不是题目」）。
+    """
     section, last_section = box["text"], last_box["text"]
     q_reg = r"(\w|\W)*?(?:？|\?|\n|$)+"
     full_reg = reg + q_reg
@@ -226,6 +244,11 @@ def has_qbullet(reg, box, last_box, last_index, last_bull, bull_x0_list):
             return None, last_index
         if not last_bull and box["x0"] >= last_box["x0"] and box["top"] - last_box["top"] < 20:
             return None, last_index
+        # 题目在 PDF 里通常靠左、另起一行。
+        # 如果前一个框已经是题目、这个框却深深缩进，那它更像是答案的换行；
+        # 如果前面没有题目、这个框既没左移又紧贴上一行，那它只是同一段话的续行。
+        # 这两个条件就是「位置防误判」——纯靠正则会把正文里的「第2条」误判成题目
+        # 加上排版位置就能挡掉一部分。
         avg_bull_x0 = 0
         if bull_x0_list:
             avg_bull_x0 = sum(bull_x0_list) / len(bull_x0_list)
@@ -233,12 +256,12 @@ def has_qbullet(reg, box, last_box, last_index, last_bull, bull_x0_list):
             avg_bull_x0 = box["x0"]
         if box["x0"] - avg_bull_x0 > 10:
             return None, last_index
-        index_str = has_bull.group(1)
-        index = index_int(index_str)
+        index_str = has_bull.group(1)          # 抓到 "一"
+        index = index_int(index_str)           # "一" → 1（走 cn2an 中文数字转换）
         if last_section[-1] == ":" or last_section[-1] == "：":
-            return None, last_index
+            return None, last_index            # 前一段以冒号结尾 → 说明是引导语，不是题目
         if not last_index or index >= last_index:
-            bull_x0_list.append(box["x0"])
+            bull_x0_list.append(box["x0"])     # 题号递增（1→2→3）→ 确认是题目，记入坐标表
             return has_bull, index
         if section[-1] == "?" or section[-1] == "？":
             bull_x0_list.append(box["x0"])
@@ -255,39 +278,73 @@ def has_qbullet(reg, box, last_box, last_index, last_bull, bull_x0_list):
 
 
 def index_int(index_str):
+    """把「题号字符串」翻译成整数 —— 题号翻译官。
+
+    输入数据的样子（各种题号写法都能认）：
+        "5"     -> 5    （阿拉伯数字）
+        "three" -> 3    （英文单词）
+        "三"    -> 3    （中文数字）
+        "十二"  -> 12   （中文数字，多位）
+        "IV"    -> 4    （罗马数字）
+        "abc"   -> -1   （四层都不认识 -> 返回 -1 表示失败）
+
+    翻译链（逐级降级，上一层失败才走下一层）：
+        int() -> w2n.word_to_num() -> cn2an() -> r.number() -> -1
+    调用方：has_qbullet 里把 PDF 抓到的题号（如 "一"）转成数字，
+    用来判断「题号是否在递增」（1->2->3），递增的才是真题目。
+    """
     res = -1
     try:
-        res = int(index_str)
+        res = int(index_str)                    # 第 1 层：阿拉伯数字   "5" -> 5
     except ValueError:
         try:
-            res = w2n.word_to_num(index_str)
+            res = w2n.word_to_num(index_str)    # 第 2 层：英文单词     "three" -> 3
         except ValueError:
             try:
-                res = cn2an(index_str)
+                res = cn2an(index_str)          # 第 3 层：中文数字     "三" -> 3、"十二" -> 12
             except ValueError:
                 try:
-                    res = r.number(index_str)
+                    res = r.number(index_str)   # 第 4 层：罗马数字     "IV" -> 4
                 except ValueError:
-                    return -1
+                    return -1                   # 四层全失败 -> 返回 -1
     return res
 
 
 def qbullets_category(sections):
+    """给一份 Q&A 文档投票选出「题目风格」—— 问法投票器。
+
+    输入数据的样子（sections：文档被切出来的每一行文本）：
+        sections = [
+            "1. 什么是 RAG？",
+            "2. 为什么需要知识库？",
+            "3. 怎么实现多轮对话？",
+        ]
+    输出：(命中风格的下标, 命中的正则)
+        上面的示例 sections 命中的是 QUESTION_PATTERN 第 5 个风格：
+        (5, r"([0-9]{1,2})[\\. 、]")  —— 表示这份文档的题目是「阿拉伯数字编号」风格
+
+    投票规则（其实是「先到先得」，不是「得票最多者胜」）：
+        按 QUESTION_PATTERN 的顺序遍历每种题目风格（"第1问 xxx" / "第1条 xxx" / "1. xxx"...），
+        每种风格只要命中 sections 中任意一行就算「命中」（命中一行立即停止计数），
+        第一个命中的风格获胜 —— QUESTION_PATTERN 的书写顺序就是优先级顺序。
+    输出 -1 时：没有任何风格命中，说明这不是一份 Q&A 文档
+        （rag/app/qa.py:101 会因此 raise "Unable to recognize Q&A structure."）
+    """
     global QUESTION_PATTERN
-    hits = [0] * len(QUESTION_PATTERN)
-    for i, pro in enumerate(QUESTION_PATTERN):
-        for sec in sections:
-            if re.match(pro, sec) and not not_bullet(sec):
+    hits = [0] * len(QUESTION_PATTERN)          # 每种风格一个计票箱，初始 0 票
+    for i, pro in enumerate(QUESTION_PATTERN):  # 按顺序遍历每一种题目风格正则
+        for sec in sections:                    # 遍历文档的每一行
+            if re.match(pro, sec) and not not_bullet(sec):  # 命中且不是冒牌编号 -> 记该风格「命中」
                 hits[i] += 1
-                break
+                break                           # 命中第一行就停止：hits 实际只会是 0 或 1（是否命中）
     maximum = 0
     res = -1
-    for i, h in enumerate(hits):
-        if h <= maximum:
+    for i, h in enumerate(hits):                # 找第一个命中的风格（hits 只有 0/1，平票保留靠前者）
+        if h <= maximum:                        # <= 而非 <：靠前的风格优先（先到先得）
             continue
         res = i
         maximum = h
-    return res, QUESTION_PATTERN[res]
+    return res, QUESTION_PATTERN[res]           # 返回 (风格下标, 该风格的正则)，供后续逐行判断题目用
 
 
 BULLET_PATTERN = [
@@ -330,6 +387,7 @@ def random_choices(arr, k):
     return random.choices(arr, k=k)
 
 
+# 防误判黑名单
 def not_bullet(line):
     patt = [r"0", r"[0-9]+ +[0-9~个只-]", r"[0-9]+\.{2,}", r"[0-9]+(\.[0-9]+){2,}[的中]"]
     return any([re.match(r, line) for r in patt])
@@ -337,14 +395,14 @@ def not_bullet(line):
 
 def bullets_category(sections):
     global BULLET_PATTERN
-    hits = [0] * len(BULLET_PATTERN)
-    for i, pro in enumerate(BULLET_PATTERN):
-        for sec in sections:
+    hits = [0] * len(BULLET_PATTERN)          # 五套模板各记一个票数
+    for i, pro in enumerate(BULLET_PATTERN):  # 遍历五套候选
+        for sec in sections:                  # 遍历文档所有行
             sec = sec.strip()
-            for p in pro:
+            for p in pro:                     # 遍历这套里的每个标题模板
                 if re.match(p, sec) and not not_bullet(sec):
-                    hits[i] += 1
-                    break
+                    hits[i] += 1              # 命中 → 这套得一分
+                    break                     # 每行只给一套投一票（内层 break）
     maximum = 0
     res = -1
     for i, h in enumerate(hits):
@@ -352,7 +410,7 @@ def bullets_category(sections):
             continue
         res = i
         maximum = h
-    return res
+    return res                                # 返回票数最高的那套的编号
 
 
 def is_english(texts):
@@ -388,21 +446,60 @@ def is_chinese(text):
 
 
 def tokenize(d, txt, eng, language="English"):
+    """把一段纯文本转成「可检索的 ES 文档字段」—— 分词包装器。
+
+    输入数据的样子：
+        d = {"docnm_kwd": "book.pdf", "title_tks": [...]}   # 文档元信息（会被原地塞入分词结果）
+        txt = "第一章 绪论"                                   # 待分词的原文
+        language = "chinese"                                 # 语言（决定用中文还是英文分词规则）
+
+    输出（原地修改 d，返回 None）：
+        d["content_with_weight"] = "第一章 绪论"    # ① 原文（带权重，检索展示用）
+        d["content_ltks"]       = "第一章 绪论"    # ② 粗粒度分词（BM25 全文检索用）
+        d["content_sm_ltks"]    = "第一章 绪论"    # ③ 细粒度分词（精确匹配用）
+
+    干了三件事：
+        1. 给 C++ 分词器设置语言（中文/英文切词规则不同）
+        2. 原文塞进 content_with_weight（带权重原文）
+        3. 把 HTML 表格标签替换成空格后做两层分词：
+           content_ltks（粗）→ content_sm_ltks（细）
+    """
     from . import rag_tokenizer
 
-    rag_tokenizer.tokenizer.set_language(language)
-    d["content_with_weight"] = txt
-    t = re.sub(r"</?(table|td|caption|tr|th)( [^<>]{0,12})?>", " ", txt)
-    d["content_ltks"] = rag_tokenizer.tokenize(t)
-    d["content_sm_ltks"] = rag_tokenizer.fine_grained_tokenize(d["content_ltks"])
+    rag_tokenizer.tokenizer.set_language(language)  # ① 设置分词器语言
+    d["content_with_weight"] = txt                  # ② 原文带权重
+    t = re.sub(r"</?(table|td|caption|tr|th)( [^<>]{0,12})?>", " ", txt)  # ③ 表格 HTML 标签 → 空格
+    d["content_ltks"] = rag_tokenizer.tokenize(t)                           # ④ 粗粒度分词
+    d["content_sm_ltks"] = rag_tokenizer.fine_grained_tokenize(d["content_ltks"])  # ⑤ 细粒度分词
 
 
 def split_with_pattern(d, pattern: str, content: str, eng, language="English") -> list:
+    """按「子分隔符正则」把一块文本再切成更小的块 —— 子切块器。
+
+    背景：RAGFlow 支持「多级切分」。第一级按段落/标题切出 chunks，
+    每个 chunk 若配置了 child_delimiters_pattern（子分隔符），
+    还要再按它切成更小的子块（parent 文档 + child 文档，实现父子检索）。
+
+    输入数据的样子：
+        d = {"docnm_kwd": "manual.pdf", ...}    # 文档元信息（每个子块都拷贝一份）
+        pattern  = r"\n\n"                      # 子分隔符（用户配置）
+        content  = "第一节 介绍\n\n这是正文。\n\n第二节 用法"   # 一块待切文本
+
+    输出：
+        [ {d1 拷贝, content_with_weight="第一节 介绍"},       # 第 1 子块
+          {d2 拷贝, content_with_weight="这是正文。"},        # 第 2 子块
+          {d3 拷贝, content_with_weight="第二节 用法"} ]      # 第 3 子块
+
+    关键技巧：用「捕获组正则」split —— re.split(r"(分隔符)", content)
+    会把分隔符本身也留在结果里（奇数下标），偶数下标是正文段。
+    代码把每对 (正文段, 紧随其后的分隔符) 拼回一个子块，
+    这样分隔符不丢失、子块仍保留完整原文。
+    """
     docs = []
 
-    # Validate and compile regex pattern before use
+    # 先校验正则合法性；非法时降级为「整块当单块」返回（不抛异常）
     try:
-        compiled_pattern = re.compile(r"(%s)" % pattern, flags=re.DOTALL)
+        compiled_pattern = re.compile(r"(%s)" % pattern, flags=re.DOTALL)  # 捕获组包裹分隔符
     except re.error as e:
         logging.warning(f"Invalid delimiter regex pattern '{pattern}': {e}. Falling back to no split.")
         # Fallback: return content as single chunk
@@ -410,151 +507,223 @@ def split_with_pattern(d, pattern: str, content: str, eng, language="English") -
         tokenize(dd, content, eng, language=language)
         return [dd]
 
-    txts = [txt for txt in compiled_pattern.split(content)]
-    for j in range(0, len(txts), 2):
+    txts = [txt for txt in compiled_pattern.split(content)]  # 正文段与分隔符交替排列
+    for j in range(0, len(txts), 2):                         # 步长 2：只取偶数下标（正文段）
         txt = txts[j]
         if not txt:
             continue
         if j + 1 < len(txts):
-            txt += txts[j + 1]
+            txt += txts[j + 1]                               # 把紧随的分隔符拼回正文，保持原文完整
         dd = copy.deepcopy(d)
-        tokenize(dd, txt, eng, language=language)
+        tokenize(dd, txt, eng, language=language)            # 每个子块独立分词
         docs.append(dd)
     return docs
 
 
 def tokenize_chunks(chunks, doc, eng, pdf_parser=None, child_delimiters_pattern=None, language="English"):
+    """把一批「纯文本切片」变成「可检索的 ES 文档列表」—— 主干包装流水线。
+
+    输入数据的样子：
+        chunks —— ["第一段正文@@1\\t0\\t595\\t100\\t200##...", "第二段正文..."]
+                    （@@...## 是 PDF 解析时埋进去的位置标签，见 pdf_parser.crop）
+        doc    —— 模板文档 {"docnm_kwd": "报告.docx", "title_tks": "..."}（所有切片共享的文档级字段）
+        pdf_parser —— PDF 解析器对象（能按位置标签裁图），非 PDF 格式传 None
+        child_delimiters_pattern —— 子分隔符正则（如 "；|。"），为空表示不启用父子切片
+
+    输出：
+        ES 文档列表，每个元素都是带 content_with_weight / content_ltks / position_int 等字段的 dict
+
+    干了四件事：
+        ① 每块切片深拷贝一份文档模板（文档级字段共享、切片级字段各自填）
+        ② 有 PDF 解析器时：用位置标签裁出该切片对应的页面截图存进 d["image"]，再把 @@标签## 从正文里删掉；
+           个别解析器（如 PlainParser）没实现 crop 会抛 NotImplementedError，这里静默跳过裁图
+        ③ 配置了子分隔符 → 进入「父子切片」模式：先把整块原文存进 mom_with_weight（母切片内容），
+           再交给 split_with_pattern 切成多个子切片
+        ④ 否则按普通切片 tokenize 分词入库
+    """
     res = []
-    # wrap up as es documents
     for ii, ck in enumerate(chunks):
-        if len(ck.strip()) == 0:
+        if len(ck.strip()) == 0:  # 空切片直接跳过
             continue
         logging.debug(f"-- {ck}")
-        d = copy.deepcopy(doc)
+        d = copy.deepcopy(doc)  # ① 每块切片复制一份模板
         if pdf_parser:
             try:
-                d["image"], poss = pdf_parser.crop(ck, need_position=True)
-                add_positions(d, poss)
-                ck = pdf_parser.remove_tag(ck)
+                d["image"], poss = pdf_parser.crop(ck, need_position=True)  # ② 按位置标签裁页面截图
+                add_positions(d, poss)  # 把裁图用的真实坐标写进 ES 字段
+                ck = pdf_parser.remove_tag(ck)  # 删掉 @@...## 位置标签，正文只留纯文字
             except NotImplementedError:
-                pass
+                pass  # 解析器不支持裁图就跳过，不影响文本入库
         else:
-            add_positions(d, [[ii] * 5])
+            add_positions(d, [[ii] * 5])  # 非 PDF：用切片序号伪造位置（五位都填序号）
 
         if child_delimiters_pattern:
-            d["mom_with_weight"] = ck.removeprefix("\n")
+            d["mom_with_weight"] = ck.removeprefix("\n")  # ③ 父子模式：整块原文作为母切片内容
             res.extend(split_with_pattern(d, child_delimiters_pattern, ck, eng, language=language))
             continue
 
-        tokenize(d, ck, eng, language=language)
+        tokenize(d, ck, eng, language=language)  # ④ 普通模式：分词后整块入库
         res.append(d)
     return res
 
 
 def tokenize_chunks_with_positions(chunks_with_pos, doc, eng, child_delimiters_pattern=None, language="English"):
-    """Tokenize chunks that already carry real positions (Excel sheet/row).
+    """把「自带真实位置（Excel 工作表/行号）的切片」变成 ES 文档 —— Excel 包装流水线。
 
-    chunks_with_pos: iterable of (text, position) where position is a 5-tuple
-    suitable for add_positions (first component 0-based).
+    输入数据的样子：
+        chunks_with_pos —— [(文本, 位置五元组), ...]，位置是 add_positions 能直接
+                           登记的五元组（第一维是 0 基的页/表序号）
+        与 tokenize_chunks 的区别：切片自带真实位置，既不用 PDF 裁图，
+        也不用序号伪造位置，直接登记即可。
+
+    干了三件事：
+        ① 每块切片深拷贝模板 + 登记自带的真实位置
+        ② 配置了子分隔符 → 父子切片模式（原文存 mom_with_weight，再切子块）
+        ③ 否则按普通切片 tokenize 分词入库
     """
     res = []
     for ck, pos in chunks_with_pos:
-        if not ck or not str(ck).strip():
+        if not ck or not str(ck).strip():  # 空切片直接跳过
             continue
-        d = copy.deepcopy(doc)
-        add_positions(d, [pos])
+        d = copy.deepcopy(doc)  # ① 每块切片复制一份模板
+        add_positions(d, [pos])  # ① 直接登记真实位置（来自 Excel 工作表/行号）
         if child_delimiters_pattern:
-            d["mom_with_weight"] = ck.removeprefix("\n")
+            d["mom_with_weight"] = ck.removeprefix("\n")  # ② 父子模式：整块原文作为母切片内容
             res.extend(split_with_pattern(d, child_delimiters_pattern, ck, eng, language=language))
             continue
-        tokenize(d, ck, eng, language=language)
+        tokenize(d, ck, eng, language=language)  # ③ 普通模式：分词后整块入库
         res.append(d)
     return res
 
 
 def doc_tokenize_chunks_with_images(chunks, doc, eng, child_delimiters_pattern=None, batch_size=10, language="English"):
+    """把 naive_merge_docx 产出的「文本/表格/图片三混切片」变成 ES 文档 —— docx 包装流水线。
+
+    输入数据的样子：
+        chunks —— [{"text": "...", "ck_type": "text"|"table"|"image",
+                    "image": <PIL 图或 None>, "context_above": "...", "context_below": "..."}, ...]
+                  （三混切片由 _build_cks/_merge_cks 生成，上下文由 _add_context 附上）
+
+    干了四件事：
+        ① 拼接「上文 + 正文 + 下文」作为最终入库文本（让表格/图片切片带上周边语境）
+        ② 图片/表格切片打上 doc_type_kwd 标记，检索时可按类型过滤
+        ③ 纯文本切片若配置了子分隔符 → 走父子切片模式；表格/图片切片不做父子切分
+        ④ 用序号伪造位置（docx 没有 PDF 那种页面坐标）
+    """
     res = []
     for ii, ck in enumerate(chunks):
-        text = ck.get("context_above", "") + ck.get("text") + ck.get("context_below", "")
-        if len(text.strip()) == 0:
+        text = ck.get("context_above", "") + ck.get("text") + ck.get("context_below", "")  # ① 拼上上下文的完整文本
+        if len(text.strip()) == 0:  # 纯空切片跳过
             continue
         logging.debug(f"-- {ck}")
         d = copy.deepcopy(doc)
         if ck.get("image"):
-            d["image"] = ck.get("image")
-        add_positions(d, [[ii] * 5])
+            d["image"] = ck.get("image")  # 图片/表格切片带上截图（后续由 image2id 存对象存储换 img_id）
+        add_positions(d, [[ii] * 5])  # ④ 用切片序号伪造位置
 
         if ck.get("ck_type") == "text":
-            if child_delimiters_pattern:
+            if child_delimiters_pattern:  # ③ 父子切片模式只对纯文本切片生效
                 d["mom_with_weight"] = text.removeprefix("\n")
                 res.extend(split_with_pattern(d, child_delimiters_pattern, text, eng, language=language))
                 continue
         elif ck.get("ck_type") == "image":
-            d["doc_type_kwd"] = "image"
+            d["doc_type_kwd"] = "image"  # ② 图片切片类型标记
         elif ck.get("ck_type") == "table":
-            d["doc_type_kwd"] = "table"
+            d["doc_type_kwd"] = "table"  # ② 表格切片类型标记
         tokenize(d, text, eng, language=language)
         res.append(d)
     return res
 
 
 def tokenize_chunks_with_images(chunks, doc, eng, images, child_delimiters_pattern=None, language="English"):
+    """把「文本与图片一一对应的切片对」变成 ES 文档 —— 带图通用包装流水线。
+
+    输入数据的样子：
+        chunks —— ["第一段...", "第二段..."]
+        images —— [<PIL 图>, None, ...]  与 chunks 等长、下标一一对应
+                  （图片由 naive_merge_with_images / markdown 分支合并段落时纵向拼接而来）
+        与 doc_tokenize_chunks_with_images 的区别：这里文本和图片是两个平行列表，
+        没有 ck_type 三混结构，用于 naive.py 的 markdown 分支和带图的通用分支。
+
+    干了四件事：
+        ① 每块切片深拷贝模板并带上自己的图片（后续由 image2id 存对象存储换 img_id）
+        ② 用序号伪造位置（非 PDF 没有真实坐标）
+        ③ 配置了子分隔符 → 父子切片模式（原文存 mom_with_weight，再切子块）
+        ④ 否则按普通切片 tokenize 分词入库
+    """
     res = []
-    # wrap up as es documents
-    for ii, (ck, image) in enumerate(zip(chunks, images)):
-        if len(ck.strip()) == 0:
+    for ii, (ck, image) in enumerate(zip(chunks, images)):  # 文本和图片按下标配对
+        if len(ck.strip()) == 0:  # 空切片直接跳过
             continue
         logging.debug(f"-- {ck}")
-        d = copy.deepcopy(doc)
-        d["image"] = image
-        add_positions(d, [[ii] * 5])
+        d = copy.deepcopy(doc)  # ① 每块切片复制一份模板
+        d["image"] = image  # ① 带上该切片对应的图片
+        add_positions(d, [[ii] * 5])  # ② 用切片序号伪造位置
         if child_delimiters_pattern:
-            d["mom_with_weight"] = ck.removeprefix("\n")
+            d["mom_with_weight"] = ck.removeprefix("\n")  # ③ 父子模式：整块原文作为母切片内容
             res.extend(split_with_pattern(d, child_delimiters_pattern, ck, eng, language=language))
             continue
-        tokenize(d, ck, eng, language=language)
+        tokenize(d, ck, eng, language=language)  # ④ 普通模式：分词后整块入库
         res.append(d)
     return res
 
 
 def tokenize_table(tbls, doc, eng, batch_size=10, language="English"):
+    """把解析器产出的「表格和图片」变成 ES 文档 —— 表格/图片包装流水线。
+
+    输入数据的样子：
+        tbls —— [((图片或 None, rows), 位置列表), ...]，其中：
+            rows 是字符串 → 这是一张「表格」（解析器把表格转成的 HTML/文本）
+            rows 是列表   → 这是一幅「图片」（图片描述/图注文本，一行一条）
+        这是上游解析器与这里的显式约定（字符串=表格、列表=图片），
+        不靠猜 HTML 标签来判断类型。
+
+    干了两件事：
+        ① rows 是字符串：整张表格作为一个切片，doc_type_kwd="table"，有截图就带上
+        ② rows 是列表：把图片描述按 batch_size 条一组打包（避免一行一切片），
+           doc_type_kwd="image"，图片本体带上（后续由 image2id 入库）
+    """
     res = []
-    # add tables
     for (img, rows), poss in tbls:
-        if not rows:
+        if not rows:  # 没有内容的表格/图片跳过
             continue
-        # Media producers use strings for tables and lists for figures. Keep
-        # that contract explicit instead of guessing the type from HTML tags.
+        # 约定：字符串 = 表格，列表 = 图片（由解析器决定，这里不猜）
         if isinstance(rows, str):
             d = copy.deepcopy(doc)
             tokenize(d, rows, eng, language=language)
-            d["content_with_weight"] = rows
-            d["doc_type_kwd"] = "table"
+            d["content_with_weight"] = rows  # 表格保留完整原文（含 HTML 标签）供展示
+            d["doc_type_kwd"] = "table"  # ① 表格类型标记
             if img is not None:
-                d["image"] = img
+                d["image"] = img  # ① 表格截图（有则带上）
             if poss:
                 add_positions(d, poss)
             res.append(d)
             continue
         lang_key = (language or "English").strip().lower()
-        de = "； " if lang_key in {"chinese", "japanese"} else "; "
-        for i in range(0, len(rows), batch_size):
+        de = "； " if lang_key in {"chinese", "japanese"} else "; "  # 按语言选择描述行的连接符
+        for i in range(0, len(rows), batch_size):  # ② 按 batch_size 条一组打包
             d = copy.deepcopy(doc)
             r = de.join(rows[i : i + batch_size])
             tokenize(d, r, eng, language=language)
-            d["doc_type_kwd"] = "image"
+            d["doc_type_kwd"] = "image"  # ② 图片类型标记
             if img is not None:
-                d["image"] = img
+                d["image"] = img  # ② 图片本体
             add_positions(d, poss)
             res.append(d)
     return res
 
 
 def attach_media_context(chunks, table_context_size=0, image_context_size=0):
-    """
-    Attach surrounding text chunk content to media chunks (table/image).
-    Best-effort ordering: if positional info exists on any chunk, use it to
-    order chunks before collecting context; otherwise keep original order.
+    """给「媒体切片」（表格/图片）附上前后的文本语境 —— 语境采集器。
+
+    用途：纯图片/表格切片本身没有可检索的文字，把前后若干 token 的正文
+    抄进 context_above / context_below，让检索命中与展示都有上下文。
+
+    排序策略（尽力而为）：
+        ① 任一切片带位置信息（position_int / page_num_int 等）→ 先按位置排序再采集语境，
+           保证「前后」是版面上的前后
+        ② 没有任何位置信息 → 保持列表原顺序
+    两个 size 参数单位都是 token 数，<=0 表示该类型不附语境；直接原样返回输入列表。
     """
     from . import rag_tokenizer
 
@@ -1237,14 +1406,18 @@ def _compute_overlap_prefix(prev_text, overlapped_percent):
 
 
 class MergeStrategy(Enum):
-    """How ``merge_paragraphs`` groups delimiter-split paragraphs into chunks.
+    """段落怎么被合并成分组 —— 两种合并策略的开关（配合 ``merge_paragraphs`` 使用）。
 
-    ``OVER_CAP`` (default) greedily accumulates adjacent paragraphs while the
-    projected total stays within ``token_size``; when the next paragraph would
-    exceed ``token_size``, it is still merged (one boundary overflow is allowed),
-    then the chunk is closed. ``UNDER_CAP`` only merges when the projected total
-    still fits the soft ``token_size`` target and never overflows. Switching
-    strategy is a single enum value — no logic change elsewhere.
+    输入数据的样子：``merge_paragraphs`` 把按分隔符切好的段落流，按策略攒成一个一个分组。
+
+    两种策略的区别：
+        OVER_CAP（默认）—— 贪心攒段：只要「当前组的累计 token 还没超过阈值」，
+            下一个段落来了就照样并进来（哪怕并完会超，这就是允许的那一次边界溢出），
+            等到再下一个段落到来时发现「当前组已经超了」，才关闭当前组、让新段落另起一组。
+        UNDER_CAP —— 严格控量：只有「当前组 + 下一个段落 ≤ token_size」才合并，
+            绝不溢出；想要旧版的严格行为就选它。
+
+    换策略只改这一个枚举值，其余代码一行都不用动。
     """
 
     UNDER_CAP = "under_cap"
@@ -1252,127 +1425,164 @@ class MergeStrategy(Enum):
 
 
 def _merge_paragraph_groups(paragraphs, token_size, strategy, size, overlapped_percent=0):
-    """Return index groups of ``paragraphs`` per ``strategy``.
+    """把段落按合并策略分组成「下标列表」—— 真正的分组引擎（``merge_paragraphs`` 调用它）。
 
-    ``paragraphs`` are already split on the delimiter and contain no delimiter
-    text. No atom-split is ever performed: a paragraph larger than ``token_size``
-    becomes its own chunk. ``size(paragraph)`` returns the token count.
+    输入数据的样子：
+        paragraphs —— 已经按分隔符切好的段落（文本里不含分隔符，分隔符在切分时就丢掉了）
+        token_size —— 单个切片的目标 token 上限（软目标）
+        strategy —— 用哪种合并策略（MergeStrategy.UNDER_CAP / OVER_CAP）
+        size —— 算一段话 token 数的函数，默认 num_tokens_from_string
+        overlapped_percent —— 重叠比例（0~100），>0 时分组要提前给「重叠前缀」留出余量
 
-    The OVER_CAP merge decision uses the overlap-scaled threshold
-    ``token_size * (100 - overlapped_percent) / 100`` so the grouping reserves
-    room for the unconditional overlap prefix (unified JSON strategy). At
-    ``overlapped_percent == 0`` the threshold equals ``token_size``, so grouping
-    is identical to the prior ``prev_t + cur_t <= token_size`` rule — including
-    the one-boundary-overflow close — keeping ``merge_paragraphs``/``txt_parser``
-    output unchanged.
+    这里的输出是「下标分组」而不是文本本身：
+        返回值 groups = [[0, 1], [2], [3, 4, 5], ...] —— 每个内层列表是一组段落的**下标**，
+        真正的文本拼装由调用方（_reconstruct_text_chunk / _reconstruct_image_chunk）完成，
+        这样带图/不带图两种拼装可以共用同一套分组结果。
+
+    三条铁律（refs #17799）：
+        ① 绝不原子切分 —— 段落比 token_size 大？整段独立成一块，截断交给模型层
+        ② OVER_CAP 用「放大缩小的阈值」做判断：threshold = token_size × (100 - overlapped_percent) / 100，
+            这是给「无条件重叠前缀」预留的余量（统一 JSON 策略）；
+            重叠比例为 0 时 threshold == token_size，分组结果和老的
+            「prev_t + cur_t <= token_size」规则完全一致（包括那一次边界溢出关闭），
+            所以 naive_merge / txt_parser 的输出保持不变
+        ③ 段落下标按原文顺序排列，合并不会打乱顺序
     """
     cap = token_size
+    # 用于判断「当前组该不该关闭」的阈值：overlapped_percent>0 时比 cap 小，
+    # 提前给无条件重叠前缀留出空间；=0 时阈值就是 cap 本身
     threshold = token_size * (100 - overlapped_percent) / 100.0
     n = len(paragraphs)
     groups = []
 
     if strategy == MergeStrategy.UNDER_CAP:
-        cur = []
-        cur_tokens = 0
+        # ===== UNDER_CAP：严格控量，绝不超 cap =====
+        cur = []  # 正在攒的这组段落的下标
+        cur_tokens = 0  # 当前组的累计 token 数
         for i in range(n):
             p = paragraphs[i]
             if not cur:
+                # 当前组为空：直接开新组，把这一个段落放进去
                 cur = [i]
                 cur_tokens = size(p)
                 if cur_tokens > cap:
+                    # 这一个段落本身就超 cap：不能和任何人合并，整段独立成组，
+                    # 立刻把组关掉（组内就它一个）
                     groups.append(cur)
                     cur = []
                     cur_tokens = 0
                 continue
+            # 当前组非空：试探性地看看「并进这个段落会不会超 cap」
             if cur_tokens + size(p) <= cap:
+                # 不超过 → 放心并入
                 cur.append(i)
                 cur_tokens += size(p)
             else:
+                # 会超 → 关闭当前组，让这个段落另起新组
                 groups.append(cur)
                 cur = [i]
                 cur_tokens = size(p)
                 if cur_tokens > cap:
+                    # 新组第一个段落本身又超 cap → 整段独立成组，立刻关掉
                     groups.append(cur)
                     cur = []
                     cur_tokens = 0
         if cur:
+            # 循环结束后手里还攥着一个没关闭的组 → 收尾补上
             groups.append(cur)
         return groups
 
-    # OVER_CAP (default): a new chunk starts when the current chunk's running
-    # token sum exceeds the (overlap-scaled) ``threshold``; an over-budget unit
-    # always stands alone (#17799). The scaled threshold reserves room for the
-    # unconditional overlap prefix (unified JSON strategy). At overlap=0 the
-    # threshold equals ``token_size``, so grouping is identical to the prior
-    # ``prev_t + cur_t <= token_size`` rule (incl. the one-boundary-overflow
-    # close).
-    cur, cur_t = [], 0
+    # ===== OVER_CAP（默认）：贪心攒段，允许一次边界溢出 =====
+    # 逻辑：一个段落来了，只要「当前组的累计 token 还没超过阈值」就照样并进来
+    # （哪怕并完会超 —— 这就是允许的那次溢出）；只有当前组已经超阈值时，
+    # 才关闭它、让新段落另起一组。一个段落本身超 cap → 整段独立成组（#17799）。
+    cur, cur_t = [], 0  # 当前组的段落下标 + 累计 token
     for i in range(n):
-        pt = size(paragraphs[i])
+        pt = size(paragraphs[i])  # 这个段落的 token 数
         if pt > cap:
+            # 这段太大，任何合并都会爆炸 → 先把手里的组关掉，再让它独立成组
             if cur:
                 groups.append(cur)
             groups.append([i])
             cur, cur_t = [], 0
             continue
         if not cur:
+            # 当前组为空：开新组
             cur, cur_t = [i], pt
             continue
+        # 当前组非空：看它的累计 token 是否已经越过了阈值
         if cur_t > threshold:
+            # 已经超了 → 关闭当前组，新段落另起一组
             groups.append(cur)
             cur, cur_t = [i], pt
         else:
+            # 还没超 → 无论并完会不会超 cap 都并进来（边界溢出的那一块就是这么来的）
             cur.append(i)
             cur_t += pt
     if cur:
-        groups.append(cur)
+        groups.append(cur)  # 收尾：最后一个没关闭的组补上
     return groups
 
 
 def merge_paragraphs(paragraphs, token_size, strategy=MergeStrategy.OVER_CAP, size=None, overlapped_percent=0):
-    """Group delimiter-split ``paragraphs`` into chunks using ``strategy``.
+    """把按分隔符切好的段落，按策略攒成一个个切片 —— 纯函数外壳（分组引擎是 ``_merge_paragraph_groups``）。
 
-    Pure function: no pos / PDF coordinate handling, no atom-split. Returns a
-    list of chunks, each a list of the original paragraph strings (order and
-    identity preserved). ``token_size`` is a soft target; see ``MergeStrategy``.
+    输入数据的样子：
+        paragraphs —— 已切好的段落列表：["第一段正文...", "第二段正文...", ...]
+        token_size —— 单个切片的软目标 token 上限
+        strategy —— MergeStrategy.OVER_CAP（默认，允许一次边界溢出）/ UNDER_CAP（严格不超）
+        size —— 计算段落 token 数的函数，默认 num_tokens_from_string
+        overlapped_percent —— 重叠比例，>0 时分组给重叠前缀预留余量
 
-    ``size`` defaults to ``num_tokens_from_string`` and is resolved at call
-    time (not captured at definition) so tests can monkeypatch the tokenizer
-    deterministically via ``rag.nlp.num_tokens_from_string``.
+    纯函数，不碰任何位置信息 / PDF 坐标 / 原子切分：
+        返回值是「切片列表」，每个切片是一个「原段落字符串列表」，
+        段落顺序与身份原样保留（把下标分组还原成真正的文本）。
 
-    Chunking contract (refs #17799)
-    --------------------------------
-    * **Delimiter is a chunk boundary.** The delimiter text specified by the
-      user never enters a chunk. ``naive_merge`` / ``naive_merge_with_images``
-      split every section on the delimiter (except the empty-delimiter
-      size-only mode) so boundary text cannot leak into a chunk.
-    * **``token_size`` is a soft target + merge strategy.** There is no
-      atom-split: a paragraph larger than ``token_size`` stands alone as its own
-      chunk and is truncated later by the model layer.
-    * **Default strategy is ``OVER_CAP``.** A migration that needs the old
-      strict behaviour can opt into ``UNDER_CAP``.
-    * **``OVER_CAP`` has no hard cap** (the model layer truncates oversize
-      units); **``UNDER_CAP`` enforces a strict cap** and never overflows
-      ``token_size``.
+    size 为什么在调用时才解析（而不是定义时捕获）：
+        因为默认值是 num_tokens_from_string，如果定义时就绑定，测试想
+        monkeypatch 掉 rag.nlp.num_tokens_from_string 就失效了；
+        调用时再查一次名字，测试就能确定性地换 tokenizer（refs #17799）。
+
+    切片契约（refs #17799）：
+        ① 分隔符就是切片边界 —— 用户指定的分隔符文本绝不进切片
+           （naive_merge / naive_merge_with_images 切段时就把分隔符丢掉了）
+        ② token_size 是软目标 + 合并策略说了算 —— 没有原子切分：
+           段落比 token_size 大就整段独立成块，截断交给模型层
+        ③ 默认 OVER_CAP —— 想要老版严格行为就显式选 UNDER_CAP
+        ④ OVER_CAP 没有硬上限（超大的块由模型层截断）；
+           UNDER_CAP 有严格上限，绝不溢出 token_size
     """
     if size is None:
-        size = num_tokens_from_string
+        size = num_tokens_from_string  # 延迟解析，让测试能 monkeypatch
     groups = _merge_paragraph_groups(paragraphs, token_size, strategy, size, overlapped_percent)
+    # 把下标分组还原成真正的段落文本：[[0,1],[2]] -> [[段0, 段1], [段2]]
     return [[paragraphs[i] for i in g] for g in groups]
 
 
 def _reconstruct_text_chunk(paragraphs, group):
-    """Rebuild a chunk string from a ``merge_paragraphs`` group, re-attaching
-    ``pos`` (PDF coordinate tag) per the historical caller convention: append
-    ``pos`` to a paragraph when it is not already present in the running text.
+    """把一组段落的「下标」还原成一段连续的切片文本 —— 文本切片拼装工。
+
+    输入数据的样子：
+        paragraphs —— [(文本, 位置), ...]，位置是 PDF 坐标标签（如 "@@0,1,2##"）
+        group —— 一个下标列表 [0, 2, 5]，指向 paragraphs 里要拼在一起的段落
+
+    和 ``_merge_paragraph_groups`` 是一对：
+        分组引擎只产出下标，这里（以及 _reconstruct_image_chunk）把下标还原成文本，
+        带图/不带图两种拼装共用同一套下标分组。
+
+    pos 标签的挂载规则（沿袭历史调用方的约定）：
+        按原文顺序把每个段落的文本累加进 text；
+        位置标签只在「段落文本里还没有它」且「拼完的整段里也还没有它」时才追加，
+        避免同一个 pos 标签在切片里重复出现。
     """
     text = ""
     for idx in group:
-        ptext, ppos = paragraphs[idx]
-        new_text = text + ptext
+        ptext, ppos = paragraphs[idx]  # 取出这一段的文本和位置标签
+        new_text = text + ptext  # 先试着把这段文本接上去
+        # 防重复挂 pos：段落里没有 pos、且拼好的整段里也没有 pos，才把 pos 追加到末尾
         if ppos and ptext.find(ppos) < 0 and new_text.find(ppos) < 0:
             new_text += ppos
-        text = new_text
+        text = new_text  # 更新累计文本，继续拼下一段
     return text
 
 
@@ -1416,79 +1626,100 @@ def _apply_overlap_unconditional(chunks, overlapped_percent):
 
 
 def naive_merge(sections: str | list, chunk_token_num=128, delimiter="\n。；！？", overlapped_percent=0, strategy=MergeStrategy.OVER_CAP):
-    """Split sections into chunks. Chunking contract: see ``merge_paragraphs`` (refs #17799)."""
+    """把「段落流」按分隔符切成切片 —— 通用合并切片机（切片契约见 ``merge_paragraphs``，refs #17799）。
+
+    输入数据的样子：
+        sections —— ["第一段正文...", "第二段正文...", ...] 或 [(文本, 位置), ...]
+        chunk_token_num —— 单个切片的 token 上限（如 512）
+        delimiter —— 分隔符字段，语法规则见 rag/nlp/delim.py：
+            反引号包裹的 = 自定义多字符分隔符（如 "`## 标题`"）；
+            没包裹的 = 一个个单字符分隔符（如 "。；！？"）
+
+    两条路径：
+        ① 自定义规则路径（字段里有反引号包裹的分隔符，即 has_custom）：
+           忽略 chunk_token_num —— 每被分隔符切开的一段就是一个独立切片，不做任何合并
+        ② 默认路径：先按分隔符切成段落（分隔符文本本身绝不混进切片），
+           再按合并策略把小段落攒到 chunk_token_num 以内；
+           超过上限的大段落不再原子切分，整段独立成块（截断交给模型层）
+        注意：只要配置了分隔符就一定切分 —— 哪怕整段没超限；
+        只有分隔符为空的「纯按大小」模式才跳过切分。
+    """
     if not sections:
         return []
     if isinstance(sections, str):
         sections = [sections]
     if isinstance(sections[0], str):
         sections = [(s, "") for s in sections]
-    # Normalize line endings so delimiter ``\n`` matches ``\r\n`` and standalone ``\r``.
+    # 统一换行符，让 \n 分隔符能同时匹配 \r\n 和孤立的 \r
     sections = [(normalize_text_newlines(s), pos) for s, pos in sections]
 
-    # Parse the delimiter field once, via the canonical helper (#17383).
-    # `has_custom` means the field contains a backtick-wrapped token — the
-    # historical signal that chunk_token_num should be bypassed: each segment is
-    # its own chunk.
+    # 用 delim.py 的统一解析器把分隔符字段解析一次（#17383）。
+    # has_custom = 字段里存在反引号包裹的分隔符 —— 这是「自定义规则」模式的
+    # 开关：绕过 chunk_token_num，每段各自独立成切片。
     parsed_dels = parse_delimiter_field(delimiter)
     has_custom = has_wrapped_delimiter(delimiter)
-    if has_custom:
-        # Custom delimiters ignore chunk_token_num: each segment is its own chunk.
+    if has_custom: #「自定义规则」
+        # ===== ① 自定义规则路径：每段一切，不合并 =====
         custom_pattern = compile_delimiter_pattern(parsed_dels)
         cks = []
         for sec, pos in sections:
+            # 捕获组切分：结果是「正文段、分隔符、正文段...」交替排列
             split_sec = re.split(r"(%s)" % custom_pattern, sec, flags=re.DOTALL) if custom_pattern else [sec]
             for sub_sec in split_sec:
                 if not sub_sec:
                     continue
                 if custom_pattern and re.fullmatch(custom_pattern, sub_sec):
-                    continue
+                    continue  # 纯分隔符片段丢弃，绝不混进切片
                 text = "\n" + sub_sec
                 local_pos = pos
                 if num_tokens_from_string(text) < 8:
-                    local_pos = ""
+                    local_pos = ""  # 太短的片段不携带位置（防止定位到无意义内容）
                 if local_pos and text.find(local_pos) < 0:
                     text += local_pos
                 cks.append(text)
         return cks
 
-    # Default path: split every section on the delimiter into paragraphs (no
-    # delimiter text), then group paragraphs with the chosen merge strategy.
-    # No atom-split is performed: a paragraph larger than ``chunk_token_num``
-    # becomes its own chunk; the model layer truncates oversize units.
-    #
-    # A section is split on the delimiter whenever one is present -- even when
-    # the whole section already fits ``chunk_token_num``. The delimiter is a
-    # chunk boundary and its text must never leak into a chunk; only the
-    # empty-delimiter (size-only) mode below skips splitting.
+    # ===== ② 默认路径：先按分隔符切段，再按策略合并 =====
+    # 不做原子切分：超过 chunk_token_num 的段落整段独立成块，截断交给模型层
     dels = compile_delimiter_pattern(parsed_dels)
-    paragraphs = []  # list of (text, pos)
+    paragraphs = []  # (文本, 位置) 列表
     for sec, pos in sections:
         if not dels:
-            paragraphs.append(("\n" + sec, pos))
+            paragraphs.append(("\n" + sec, pos))  # 空分隔符：整段就是一个段落单元
             continue
         for sub_sec in re.split(r"(%s)" % dels, sec, flags=re.DOTALL):
             if not sub_sec or re.fullmatch(dels, sub_sec):
-                continue
+                continue  # 空片段和纯分隔符片段都丢弃
             paragraphs.append(("\n" + sub_sec, pos))
 
+    # 如上，得到了所有最稀碎的 chunks
     groups = _merge_paragraph_groups([p[0] for p in paragraphs], chunk_token_num, strategy, num_tokens_from_string, overlapped_percent)
+    # 只是得到的分组的方式
     cks = [_reconstruct_text_chunk(paragraphs, g) for g in groups]
     logging.debug("naive_merge: %d sections -> %d chunks (delimiter=%r)", len(sections), len(cks), delimiter)
     return _apply_overlap_unconditional(cks, overlapped_percent)
 
 
 def naive_merge_with_images(texts, images, chunk_token_num=128, delimiter="\n。；！？", overlapped_percent=0, strategy=MergeStrategy.OVER_CAP):
-    """Split texts (with images) into chunks. Chunking contract: see ``merge_paragraphs`` (refs #17799)."""
+    """把「带图的段落流」切成切片（图文同步）—— 带图合并切片机（切片契约见 ``merge_paragraphs``，refs #17799）。
+
+    输入数据的样子：
+        texts  —— ["段落1...", ("段落2...", 位置), ...]（元素可能是纯文本，也可能是 (文本, 位置) 元组）
+        images —— [<PIL 图>, None, ...] 与 texts 等长、下标一一对应
+    与 naive_merge 完全相同的两条路径（自定义规则每段一切 / 默认先切段再合并），
+    唯一多出来的职责是「图片跟着文字走」：
+        ① 自定义规则路径：一段文字切开成多个切片时，每个子切片都复制挂上原段落的图片
+        ② 默认路径：多个段落合并成一个切片时，它们的图片用 concat_img 纵向拼成一张
+    """
     if not texts or len(texts) != len(images):
         return [], []
 
-    # Parse the delimiter field once, via the canonical helper (#17383).
-    # See ``naive_merge`` for the ``has_custom`` rationale.
+    # 用 delim.py 的统一解析器解析分隔符字段（#17383）。
+    # has_custom 的含义见 ``naive_merge``（有反引号包裹的分隔符 = 自定义规则模式）。
     parsed_dels = parse_delimiter_field(delimiter)
     has_custom = has_wrapped_delimiter(delimiter)
     if has_custom:
-        # Custom delimiters ignore chunk_token_num: each segment is its own chunk.
+        # ===== ① 自定义规则路径：每段一切，图片随每个子切片复制 =====
         custom_pattern = compile_delimiter_pattern(parsed_dels)
         cks, result_images = [], []
         for text, image in zip(texts, images):
@@ -1502,26 +1733,25 @@ def naive_merge_with_images(texts, images, chunk_token_num=128, delimiter="\n。
                 if not sub_sec:
                     continue
                 if custom_pattern and re.fullmatch(custom_pattern, sub_sec):
-                    continue
+                    continue  # 纯分隔符片段丢弃
                 text_seg = "\n" + sub_sec
                 local_pos = text_pos
                 if num_tokens_from_string(text_seg) < 8:
-                    local_pos = ""
+                    local_pos = ""  # 太短的片段不携带位置
                 if local_pos and text_seg.find(local_pos) < 0:
                     text_seg += local_pos
                 cks.append(text_seg)
-                result_images.append(image)
+                result_images.append(image)  # 每个子切片都挂原段落的图片
         return cks, result_images
 
-    # Default path: split every text on the delimiter into paragraphs (no
-    # delimiter text) carrying its image, then group with the merge strategy.
-    # Images of merged paragraphs are concatenated; no atom-split is performed.
-    # As in ``naive_merge``, a small text is still split on the delimiter so
-    # the boundary text never leaks into a chunk; only empty-delimiter skips.
+    # ===== ② 默认路径：先按分隔符切段（每段带自己的图），再按策略合并 =====
+    # 合并时图片用 concat_img 纵向拼接；不做原子切分。
+    # 与 ``naive_merge`` 一致：只要配置了分隔符就一定切分，分隔符文本绝不混进切片；
+    # 只有空分隔符模式跳过切分。
     dels = compile_delimiter_pattern(parsed_dels)
-    paragraphs = []  # list of (text, pos, image)
+    paragraphs = []  # (文本, 位置, 图片) 列表
     for text, image in zip(texts, images):
-        # if text is tuple, unpack it
+        # text 可能是元组 (文本, 位置)，也可能是纯文本，这里解包
         if isinstance(text, tuple):
             text_str = text[0] if text[0] is not None else ""
             text_pos = text[1] if len(text) > 1 else ""
@@ -1530,17 +1760,17 @@ def naive_merge_with_images(texts, images, chunk_token_num=128, delimiter="\n。
             text_pos = ""
         text_str = normalize_text_newlines(text_str)
         if not dels:
-            paragraphs.append(("\n" + text_str, text_pos, image))
+            paragraphs.append(("\n" + text_str, text_pos, image))  # 空分隔符：整段就是一个段落单元
             continue
         for sub_sec in re.split(r"(%s)" % dels, text_str, flags=re.DOTALL):
             if not sub_sec or re.fullmatch(dels, sub_sec):
-                continue
-            paragraphs.append(("\n" + sub_sec, text_pos, image))
+                continue  # 空片段和纯分隔符片段都丢弃
+            paragraphs.append(("\n" + sub_sec, text_pos, image))  # 切出的每个段落都继承原段落的图片
 
     groups = _merge_paragraph_groups([p[0] for p in paragraphs], chunk_token_num, strategy, num_tokens_from_string, overlapped_percent)
     cks, result_images = [], []
     for g in groups:
-        text, image = _reconstruct_image_chunk(paragraphs, g)
+        text, image = _reconstruct_image_chunk(paragraphs, g)  # 组内多张图片用 concat_img 纵向拼接
         cks.append(text)
         result_images.append(image)
     logging.debug("naive_merge_with_images: %d texts -> %d chunks (delimiter=%r)", len(texts), len(cks), delimiter)
@@ -1566,23 +1796,37 @@ def docx_question_level(p, bull=-1):
 
 
 def concat_img(img1, img2):
+    """把两张图片「上下叠放」拼成一张新图 —— 图片拼接工。
+
+    用途：段落合并成切片时，多个段落各自的图片要按原文顺序纵向拼在一起，
+    保证「一张切片图 ↔ 一段合并后的文字」的对应关系（被
+    naive_merge_with_images / naive.py 的 markdown 分支调用）。
+
+    三层防重复拼接：
+        ① 同一对象引用（img1 is img2）→ 原样返回
+           （否则会把自己的 blob 列表再拼一遍，越拼越长）
+        ② 有一边是 None → 返回另一边
+        ③ 两张图像素内容完全相同 → 原样返回
+    两张都是 LazyImage（懒加载图）时走 LazyImage.merge，避免立刻解码；
+    否则转成 PIL 图后建一张「宽取大、高相加」的新画布，先贴上、再贴下。
+    """
     from rag.utils.lazy_image import LazyImage, ensure_pil_image
 
-    # Same image must not stack with itself (the LazyImage branch would otherwise
-    # concatenate its blob list); mirrors the PIL branch's same-reference guard.
+    # ① 同一张图不能和自己叠（LazyImage 分支否则会把它的 blob 列表再拼一遍）
     if img1 is img2:
         return img1
 
     if (img1 is None or isinstance(img1, LazyImage)) and (img2 is None or isinstance(img2, LazyImage)):
+        # ② 空值短路：两张都是懒图/None 时，谁非空返回谁
         if img1 and not img2:
             return img1
         if not img1 and img2:
             return img2
         if not img1 and not img2:
             return None
-        return LazyImage.merge(img1, img2)
+        return LazyImage.merge(img1, img2)  # 懒图合并：只拼 blob 引用，不立刻解码像素
 
-    img1 = ensure_pil_image(img1) or img1
+    img1 = ensure_pil_image(img1) or img1  # 不是 PIL 图就先物化成 PIL 图
     img2 = ensure_pil_image(img2) or img2
     if img1 and not img2:
         return img1
@@ -1598,44 +1842,64 @@ def concat_img(img1, img2):
         pixel_data1 = img1.tobytes()
         pixel_data2 = img2.tobytes()
         if pixel_data1 == pixel_data2:
-            return img1
+            return img1  # ③ 像素完全相同 = 同一张图，不重复拼接
 
     width1, height1 = img1.size
     width2, height2 = img2.size
 
-    new_width = max(width1, width2)
-    new_height = height1 + height2
+    new_width = max(width1, width2)  # 新图宽 = 两图中较大者
+    new_height = height1 + height2  # 新图高 = 两图高相加
     new_image = Image.new("RGB", (new_width, new_height))
 
-    new_image.paste(img1, (0, 0))
-    new_image.paste(img2, (0, height1))
+    new_image.paste(img1, (0, 0))  # img1 贴在上面
+    new_image.paste(img2, (0, height1))  # img2 贴在下面
     return new_image
 
 
 def _build_cks(sections, delimiter):
+    """把 docx 解析出的「文本/图片/表格」三混段落流整理成带类型标记的切片雏形 —— 三混分类工。
+
+    输入数据的样子：
+        sections —— [(文本, 图片或 None, 表格或 None), ...]，来自 Docx() 解析：
+            有 table → 表格段落；有 image → 图片段落；都没有 → 纯文本段落
+        delimiter —— 分隔符字段（语法见 rag/nlp/delim.py）
+
+    输出（四个返回值）：
+        cks    —— 切片雏形列表，每个元素 {"text", "image", "ck_type": "text"|"table"|"image", "tk_nums"}
+        tables —— 表格切片在 cks 里的下标列表
+        images —— 图片切片在 cks 里的下标列表
+        has_custom —— 分隔符字段里是否有反引号包裹的自定义分隔符
+                     （它只决定 _merge_cks 是否绕过 chunk_token_num，
+                       而切分本身对所有解析出的分隔符都生效）
+
+    干了三件事：
+        ① 表格/图片段落各自独立成切片雏形（不参与文本合并）
+        ② 纯文本段落按分隔符切开：遇到分隔符或空行就「冲走」当前缓冲段，
+           普通文字继续往缓冲段里攒
+        ③ 循环结束后把最后一段缓冲冲走
+    """
     cks = []
     tables = []
     images = []
 
-    # Parse the delimiter field once, via the canonical helper (#17383).
-    # Split on every parsed delimiter (bare and wrapped). `has_custom`
-    # only controls whether _merge_cks bypasses chunk_token_num (wrapped
-    # token present in the original field).
+    # 用 delim.py 的统一解析器把分隔符字段解析一次（#17383）。
+    # 切分时使用所有解析出的分隔符（裸字符 + 反引号包裹的都算）；
+    # has_custom 只控制 _merge_cks 是否绕过 chunk_token_num。
     parsed_dels = parse_delimiter_field(delimiter)
     has_custom = has_wrapped_delimiter(delimiter)
     split_pattern = compile_delimiter_pattern(parsed_dels)
     pattern = r"(%s)" % split_pattern if split_pattern else ""
 
-    seg = ""
+    seg = ""  # 纯文本缓冲段：攒到分隔符/空行为止再整体入列
     for text, image, table in sections:
-        # normalize text: ensure string and prepend newline for continuity
+        # 规范化文本：保证是字符串，前置换行以保持段落间连贯
         if not text:
             text = ""
         else:
             text = "\n" + normalize_text_newlines(str(text))
 
         if table:
-            # table chunk
+            # ① 表格段落 → 独立成表格切片雏形
             ck_text = text + str(table)
             idx = len(cks)
             cks.append(
@@ -1650,7 +1914,7 @@ def _build_cks(sections, delimiter):
             continue
 
         if image:
-            # image chunk (text kept as-is for context)
+            # ① 图片段落 → 独立成图片切片雏形（文本原样保留作语境）
             idx = len(cks)
             cks.append(
                 {
@@ -1663,15 +1927,15 @@ def _build_cks(sections, delimiter):
             images.append(idx)
             continue
 
-        # pure text chunk(s) — split on every parsed delimiter when present
+        # ② 纯文本段落 → 有分隔符就按所有解析出的分隔符切开
         if split_pattern:
             split_sec = re.split(pattern, text)
             for sub_sec in split_sec:
                 if not sub_sec:
                     continue
 
-                # ① matched delimiter (exact capture; do not strip — wrapped
-                # whitespace delimiters such as `` ` ` `` or `\n` must match here)
+                # 命中分隔符（捕获组的精确匹配；不能 strip —— 反引号包裹的
+                # 空白类分隔符如 `` ` ` `` 或 `\n` 必须在这里被拦下）
                 if re.fullmatch(split_pattern, sub_sec):
                     if seg and seg.strip():
                         s = seg.strip()
@@ -1686,7 +1950,7 @@ def _build_cks(sections, delimiter):
                     seg = ""
                     continue
 
-                # ② empty or whitespace-only ordinary segment → flush current buffer
+                # 空或纯空白的普通段 → 同样冲走当前缓冲（空行视为边界）
                 if not sub_sec.strip():
                     if seg and seg.strip():
                         s = seg.strip()
@@ -1701,7 +1965,7 @@ def _build_cks(sections, delimiter):
                     seg = ""
                     continue
 
-                # ③ normal text content → accumulate
+                # 正常文本内容 → 继续攒进缓冲段
                 seg += sub_sec
         else:
             if text and text.strip():
@@ -1715,7 +1979,7 @@ def _build_cks(sections, delimiter):
                     }
                 )
 
-    # final flush after loop (only when delimiters were used for splitting)
+    # ③ 循环结束后的最后一次冲刷（只有用分隔符切过时缓冲里才可能有存货）
     if split_pattern and seg and seg.strip():
         s = seg.strip()
         cks.append(
@@ -1731,6 +1995,12 @@ def _build_cks(sections, delimiter):
 
 
 def _add_context(cks, idx, context_size):
+    """给 cks[idx] 这张「图片/表格切片」向前向后采集文字语境 —— 语境采集器（切片雏形版）。
+
+    从 idx 往前找文本切片，按「句子从尾部往前倒取」凑满 context_size 个 token，写入 context_above；
+    从 idx 往后找文本切片，按「句子从头部往后顺取」凑满，写入 context_below。
+    语境最终在 doc_tokenize_chunks_with_images 里被拼进入库文本。
+    """
     if cks[idx]["ck_type"] not in ("image", "table"):
         return
 
@@ -1807,24 +2077,34 @@ def _add_context(cks, idx, context_size):
 
 
 def _merge_cks(cks, chunk_token_num, has_custom):
+    """把 _build_cks 产出的切片雏形「合并」成最终切片 —— 文本攒、媒体不动。
+
+    合并规则（只对 ck_type == "text" 的雏形生效）：
+        ① 图片/表格雏形原样入列（图片下标记进 image_idxs），绝不与文本合并
+        ② 自定义规则模式（has_custom）→ 每段文本各自独立，不攒
+        ③ 否则：上一个文本切片没装满 chunk_token_num 就把当前文本追加进去；
+           装满了或还没有上一个 → 当前文本新开一个切片
+    返回 (合并后的切片列表, 图片切片下标列表)。
+    """
     merged = []
     image_idxs = []
-    prev_text_ck = -1
+    prev_text_ck = -1  # 上一个文本切片在 merged 里的下标（-1 = 还没有）
 
     for i in range(len(cks)):
         ck_type = cks[i]["ck_type"]
 
         if ck_type != "text":
-            merged.append(cks[i])
+            merged.append(cks[i])  # ① 图片/表格原样入列
             if ck_type == "image":
                 image_idxs.append(len(merged) - 1)
             continue
 
         if prev_text_ck < 0 or merged[prev_text_ck]["tk_nums"] >= chunk_token_num or has_custom:
-            merged.append(cks[i])
+            merged.append(cks[i])  # ②③ 装满 / 自定义模式 / 首个文本 → 新开切片
             prev_text_ck = len(merged) - 1
             continue
 
+        # ③ 没装满 → 追加进上一个文本切片（文字与 token 数都累加）
         merged[prev_text_ck]["text"] = (merged[prev_text_ck].get("text") or "") + (cks[i].get("text") or "")
         merged[prev_text_ck]["tk_nums"] = merged[prev_text_ck].get("tk_nums", 0) + cks[i].get("tk_nums", 0)
 
@@ -1838,20 +2118,31 @@ def naive_merge_docx(
     table_context_size=0,
     image_context_size=0,
 ):
+    """docx 专用切片机：把「文本/图片/表格」三混段落流变成最终切片 —— 三混总调度。
+
+    流水线三步：
+        ① _build_cks：按分隔符切段并给每段打上 text/table/image 类型标记
+        ② _add_context：按配置给表格/图片切片采集前后文字语境
+           （两个 size 参数单位是 token，0 表示不采集）
+        ③ _merge_cks：把相邻的小文本段攒到 chunk_token_num 以内，
+           图片/表格切片保持独立
+    返回 (最终切片列表, 图片切片下标列表)，交给
+    doc_tokenize_chunks_with_images 做最后包装。
+    """
     if not sections:
         return [], []
 
-    cks, tables, images, has_custom = _build_cks(sections, delimiter)
+    cks, tables, images, has_custom = _build_cks(sections, delimiter)  # ① 切段 + 打类型标记
 
     if table_context_size > 0:
         for i in tables:
-            _add_context(cks, i, table_context_size)
+            _add_context(cks, i, table_context_size)  # ② 给表格切片采语境
 
     if image_context_size > 0:
         for i in images:
-            _add_context(cks, i, image_context_size)
+            _add_context(cks, i, image_context_size)  # ② 给图片切片采语境
 
-    merged_cks, merged_image_idx = _merge_cks(cks, chunk_token_num, has_custom)
+    merged_cks, merged_image_idx = _merge_cks(cks, chunk_token_num, has_custom)  # ③ 合并小文本段
 
     return merged_cks, merged_image_idx
 

@@ -8,6 +8,11 @@ Use this file as the local operating guide for the current codebase. Prefer the 
 - Always determine whether the task belongs to the Python path (`api/` `rag/` `deepdoc/` `agent/`) or the Go path (`cmd/` `internal/`) before editing; they are parallel implementations and changing the wrong one has no effect.
 - If project structure changes significantly (new top-level dirs, backend convergence, port/service changes), update `CODEGRAPH.md` in the same change.
 
+## CodeGraph Index Sync (MANDATORY)
+- The local CodeGraph index lives in `.codegraph/` (machine-local, git-ignored). Whenever ANY code change has been made (edit, create, delete, rename), run `codegraph sync` at the repo root before the turn ends so the index stays current. This is mandatory after every change batch — do not skip it or defer it to the user.
+- A lefthook `post-commit` job (`codegraph-sync`) also runs `codegraph sync -q` automatically on every commit as a safety net; the manual sync above is still required because analysis happens between commits.
+- If `codegraph` is not on PATH (expected at `D:\Users\hongze01.zhang\AppData\Local\codegraph\current\bin\codegraph.cmd` on this machine), report it and continue; never block the task on a missing index.
+
 ## Git Workflow (MANDATORY)
 - **All work happens on the `study` branch.** If it does not exist locally, create it (`git checkout -b study`). Never commit directly to `main` or any other branch.
 - **Push only to `origin`** (https://github.com/Hz-186/ragflow.git), e.g. `git push origin study`. **Never push to `upstream`** (the infiniflow/ragflow source repo) or open PRs against it.

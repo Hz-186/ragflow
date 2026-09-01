@@ -49,6 +49,20 @@ VIDEO_EXTS = [".mp4", ".mov", ".avi", ".flv", ".mpeg", ".mpg", ".webm", ".wmv", 
 
 
 def chunk(filename, binary, tenant_id, lang, callback=None, **kwargs):
+    """把「独立图片/视频文件」变成一个切片 —— 图片入库总闸。
+
+    核心思路：图片本身不能被全文检索，要先变成文字。两条路线：
+        ① 先跑 OCR 识图里的文字；
+        ② 若 OCR 文本「长」（超过 32 字符）→ 说明图里文字足够多，
+           直接用 OCR 文本入库，不调视觉大模型
+           （代码里还有一个英文词数 >32 的条件，但超过 32 词必然超过 32 字符，
+             被字符数条件完全覆盖，实际所有语言都按「字符数 >32」判断）；
+        ③ 若 OCR 文本太短（截图没字、照片等）→ 调视觉大模型（cv_mdl.describe）
+           生成图片描述，和 OCR 文本拼在一起入库；
+        ④ 视觉模型挂了但 OCR 有文本 → 退而求其次，只入 OCR 文本。
+    无论哪条路线，原图本体都挂在 doc["image"] 上，最终由 image2id 存进对象存储。
+    视频扩展名走另一条路：直接让视觉大模型看视频生成描述。
+    """
     doc = {
         "docnm_kwd": filename,
         "title_tks": rag_tokenizer.tokenize(re.sub(r"\.[a-zA-Z]+$", "", filename)),
@@ -56,9 +70,10 @@ def chunk(filename, binary, tenant_id, lang, callback=None, **kwargs):
     eng = lang.lower() == "english"
 
     parser_config = kwargs.get("parser_config", {}) or {}
-    image_ctx = max(0, int(parser_config.get("image_context_size", 0) or 0))
+    image_ctx = max(0, int(parser_config.get("image_context_size", 0) or 0))  # 图片语境 token 数（独立图片通常没有周边语境）
 
     if any(filename.lower().endswith(ext) for ext in VIDEO_EXTS):
+        # ===== 视频分支：直接让视觉大模型「看」视频出描述 =====
         try:
             doc.update(
                 {
@@ -67,56 +82,63 @@ def chunk(filename, binary, tenant_id, lang, callback=None, **kwargs):
             )
             cv_model_config = get_tenant_default_model_by_type(tenant_id, LLMType.VISION)
             cv_mdl = LLMBundle(tenant_id, model_config=cv_model_config, lang=lang)
-            video_prompt = str(parser_config.get("video_prompt", "") or "")
+            video_prompt = str(parser_config.get("video_prompt", "") or "")  # 用户可自定义视频理解提示词
             ans = asyncio.run(cv_mdl.async_chat(system="", history=[], gen_conf={}, video_bytes=binary, filename=filename, video_prompt=video_prompt))
             callback(0.8, "CV LLM respond: %s ..." % ans[:32])
-            tokenize(doc, ans, eng, language=lang)
+            tokenize(doc, ans, eng, language=lang)  # 视频描述文本入库
             return [doc]
         except Exception as e:
             callback(prog=-1, msg=str(e))
     else:
+        # ===== 图片分支：OCR 优先，视觉大模型兜底 =====
         img = Image.open(io.BytesIO(binary)).convert("RGB")
         doc.update(
             {
-                "image": img,
+                "image": img,  # 原图本体挂上，后续由 image2id 存对象存储
                 "doc_type_kwd": "image",
             }
         )
 
-        # Try PaddleOCR if configured as layout_recognize
+        # ① 配置了 PaddleOCR 作布局识别器时优先用它
         txt = _try_paddleocr_image(filename, binary, tenant_id, parser_config, callback)
 
         if not txt:
-            # Fallback to local deepdoc OCR
+            # ① 没配 PaddleOCR → 退回本地 deepdoc OCR
             bxs = _get_ocr()(np.array(img))
             txt = "\n".join([t[0] for _, t in bxs if t[0]])
 
         txt = txt.strip()
         callback(0.4, "Finish OCR: (%s ...)" % txt[:12])
+        # ② OCR 文本门槛：超过 32 字符 → 直接用 OCR 文本，跳过视觉大模型。
+        #    注意：前半个条件（英文词数 >32）被后半个条件（字符数 >32）完全蕴含
+        #    （33 个词必然超过 32 个字符），实际生效的是「任何语言字符数 >32」。
+        #    文字足够多 → 图就是「文字载体」（如文档截图），省一次大模型调用
         if (eng and len(txt.split()) > 32) or len(txt) > 32:
             tokenize(doc, txt, eng, language=lang)
             callback(0.8, "OCR results is too long to use CV LLM.")
             return attach_media_context([doc], 0, image_ctx)
 
         try:
+            # ③ OCR 文本太短 → 调视觉大模型生成图片描述
             callback(0.4, "Use CV LLM to describe the picture.")
             cv_model_config = get_tenant_default_model_by_type(tenant_id, LLMType.VISION)
             cv_mdl = LLMBundle(tenant_id, model_config=cv_model_config, lang=lang)
             with io.BytesIO() as img_binary:
                 img.save(img_binary, format="JPEG")
                 img_binary.seek(0)
-                ans = cv_mdl.describe(img_binary.read())
+                ans = cv_mdl.describe(img_binary.read())  # 视觉大模型出图描述
             callback(0.8, "CV LLM respond: %s ..." % ans[:32])
-            txt += "\n" + ans
+            txt += "\n" + ans  # OCR 文本 + 图描述拼在一起入库（两路信息都保留）
             tokenize(doc, txt, eng, language=lang)
             return attach_media_context([doc], 0, image_ctx)
         except Exception as e:
+            # ④ 视觉模型不可用时的兜底：有 OCR 文本就只入 OCR 文本
             if txt:
                 logging.warning(f"CV LLM unavailable, indexing OCR text instead: {e}")
                 callback(msg=f"[WARN] CV LLM unavailable ({e}), indexing OCR text only.")
                 tokenize(doc, txt, eng, language=lang)
                 return attach_media_context([doc], 0, image_ctx)
-            callback(prog=-1, msg=str(e))
+            callback(prog=-1, msg=str(e))  # OCR 和大模型全失败 → 标记任务失败
 
     return []
 

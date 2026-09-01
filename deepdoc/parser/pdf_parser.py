@@ -1936,6 +1936,11 @@ class RAGFlowPdfParser:
 
     @staticmethod
     def extract_positions(txt):
+        """从切片文本里抽出所有 @@位置标签## —— 位置标签解码器。
+
+        标签格式：@@页号(可 1-3 连页)\\t左\\t右\\t上\\t下##（坐标是排版时的像素值）。
+        输出的页号减 1 转成 0 基，供 crop 按页裁图。
+        """
         poss = []
         for tag in re.findall(r"@@[0-9-]+\t[0-9.\t]+##", txt):
             pn, left, right, top, bottom = tag.strip("#").strip("@").split("\t")
@@ -1944,14 +1949,34 @@ class RAGFlowPdfParser:
         return poss
 
     def crop(self, text, ZM=3, need_position=False):
+        """按切片文本里埋的位置标签，从页面渲染图里「裁出」该切片对应的截图 —— 切片裁图师。
+
+        输入数据的样子：
+            text —— "第一段正文@@1\\t12.0\\t583.0\\t100.0\\t200.0##第二段@@2-3\\t..."
+                    （@@页\\t左\\t右\\t上\\t下## 标签由排版阶段埋入正文，可多段、可跨页）
+            ZM   —— 页面渲染图的放大倍数（默认 3 倍渲染保证清晰度），
+                    标签坐标是 1 倍坐标，裁图时要乘 ZM 换算
+        输出：
+            need_position=False → 一张拼接好的 PIL 图
+            need_position=True  → (拼接好的图, 中间段落的真实坐标列表)；无位置标签时 (None, None)
+
+        干了五件事：
+            ① 解码所有位置标签，过滤掉越界的页号
+            ② 在「第一段的上方」和「最后一段的下方」各补 120 像素的缓冲带
+               （让截图带一点上下文，边界不至于齐着文字切断）
+            ③ 逐段从对应页的渲染图裁出矩形（跨页段落逐页裁、高度累加）
+            ④ 所有裁剪条纵向拼进一张灰色画布（段间留 6 像素缝）
+            ⑤ 首、末两条（缓冲带部分）罩一层半透明遮罩，视觉上暗示「这是补出来的边」
+        """
         imgs = []
-        poss = self.extract_positions(text)
+        poss = self.extract_positions(text)  # ① 解码 @@...## 位置标签
         if not poss:
             if need_position:
                 return None, None
             return
 
         if not getattr(self, "page_images", None):
+            # 没有页面渲染图（比如没开启布局识别）就无法裁图，直接放弃
             logging.warning("crop called without page images; skipping image generation.")
             if need_position:
                 return None, None
@@ -1959,6 +1984,7 @@ class RAGFlowPdfParser:
 
         page_count = len(self.page_images)
 
+        # ① 过滤越界页号：标签里的页号必须在实际页面范围内才保留
         filtered_poss = []
         for pns, left, right, top, bottom in poss:
             if not pns:
@@ -1978,7 +2004,8 @@ class RAGFlowPdfParser:
             return
 
         max_width = max(np.max([right - left for (_, left, right, _, _) in poss]), 6)
-        GAP = 6
+        GAP = 6  # 拼接时裁剪条之间的缝隙宽度（像素）
+        # ② 头部缓冲带：在第一段上方补 120 像素（裁 [top-120, top-GAP] 这一段）
         pos = poss[0]
         first_page_idx = pos[0][0]
         poss.insert(0, ([first_page_idx], pos[1], pos[2], max(0, pos[3] - 120), max(pos[3] - GAP, 0)))
@@ -1990,6 +2017,7 @@ class RAGFlowPdfParser:
                 return None, None
             return
         last_page_height = self.page_images[last_page_idx].size[1] / ZM
+        # ② 尾部缓冲带：在最后一段下方补 120 像素（裁 [bottom+GAP, bottom+120]，不超出页底）
         poss.append(
             (
                 [last_page_idx],
@@ -2000,14 +2028,16 @@ class RAGFlowPdfParser:
             )
         )
 
+        # ③ 逐段裁图：标签坐标是 1 倍值，渲染图是 ZM 倍，统一乘 ZM 换算
         positions = []
         for ii, (pns, left, right, top, bottom) in enumerate(poss):
             if 0 < ii < len(poss) - 1:
-                right = max(left + 10, right)
+                right = max(left + 10, right)  # 中间段（正文段）按各自宽度裁
             else:
-                right = left + max_width
-            bottom *= ZM
+                right = left + max_width  # 首尾缓冲带裁满最大宽度，视觉上更整齐
+            bottom *= ZM  # 高度换算成 ZM 倍（后面要跨页累减整页像素高）
             for pn in pns[1:]:
+                # 跨页段落：总高度要加上前面每一页的整页像素高
                 if 0 <= pn - 1 < page_count:
                     bottom += self.page_images[pn - 1].size[1]
                 else:
@@ -2017,11 +2047,13 @@ class RAGFlowPdfParser:
                 logging.warning(f"Base page index {pns[0]} out of range for {page_count} pages during crop; skipping this segment.")
                 continue
 
+            # 首页从 top 裁到 bottom（不超过页底）
             imgs.append(self.page_images[pns[0]].crop((left * ZM, top * ZM, right * ZM, min(bottom, self.page_images[pns[0]].size[1]))))
             if 0 < ii < len(poss) - 1:
-                positions.append((pns[0] + self.page_from, left, right, top, min(bottom, self.page_images[pns[0]].size[1]) / ZM))
-            bottom -= self.page_images[pns[0]].size[1]
+                positions.append((pns[0] + self.page_from, left, right, top, min(bottom, self.page_images[pns[0]].size[1]) / ZM))  # 正文段记真实坐标（缓冲带不记）
+            bottom -= self.page_images[pns[0]].size[1]  # 减去已裁的首页高度，剩余高度留给后续页
             for pn in pns[1:]:
+                # 跨页段落：后续页从页顶（y=0）继续裁
                 if not (0 <= pn < page_count):
                     logging.warning(f"Page index {pn} out of range for {page_count} pages during crop; skipping this page.")
                     continue
@@ -2034,15 +2066,17 @@ class RAGFlowPdfParser:
             if need_position:
                 return None, None
             return
+        # ④ 拼接：所有裁剪条纵向贴进一张浅灰画布（宽取最大、条间留 GAP 像素缝）
         height = 0
         for img in imgs:
             height += img.size[1] + GAP
         height = int(height)
         width = int(np.max([i.size[0] for i in imgs]))
-        pic = Image.new("RGB", (width, height), (245, 245, 245))
+        pic = Image.new("RGB", (width, height), (245, 245, 245))  # 浅灰底画布
         height = 0
         for ii, img in enumerate(imgs):
             if ii == 0 or ii + 1 == len(imgs):
+                # ⑤ 首、末条（缓冲带）罩半透明遮罩：暗示「这是补出来的边，不是正文」
                 img = img.convert("RGBA")
                 overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
                 overlay.putalpha(128)

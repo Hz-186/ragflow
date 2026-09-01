@@ -83,7 +83,14 @@ pre-commit:
               fi
           - name: web-oxfmt
             glob: "web/**/*.{css,less,json,js,jsx,ts,tsx}"
-            exclude: ["web/**/*.min.js", "web/**/*.min.css", "web/node_modules/**", "web/.next/**", "web/dist/**"]
+            exclude:
+              [
+                "web/**/*.min.js",
+                "web/**/*.min.css",
+                "web/node_modules/**",
+                "web/.next/**",
+                "web/dist/**",
+              ]
             root: "web/"
             stage_fixed: true
             run: |
@@ -96,7 +103,13 @@ pre-commit:
               fi
           - name: web-oxlint
             glob: "web/**/*.{js,jsx,ts,tsx}"
-            exclude: ["web/**/*.min.js", "web/node_modules/**", "web/.next/**", "web/dist/**"]
+            exclude:
+              [
+                "web/**/*.min.js",
+                "web/node_modules/**",
+                "web/.next/**",
+                "web/dist/**",
+              ]
             root: "web/"
             stage_fixed: true
             run: |
@@ -117,3 +130,15 @@ pre-commit:
       run: python3 tools/hooks/check_files.py merge-conflict
     - name: check-symlinks
       run: python3 tools/hooks/check_files.py symlinks
+post-commit:
+  jobs:
+    # Keep the machine-local CodeGraph index (.codegraph/, git-ignored) in
+    # sync after every commit. `codegraph sync -q` is documented as
+    # git-hook-friendly (quiet mode). Missing binary must not block commits.
+    - name: codegraph-sync
+      run: |
+        if command -v codegraph >/dev/null 2>&1; then
+          codegraph sync -q || echo "codegraph sync failed (non-blocking)"
+        else
+          echo "codegraph not installed, skipping index sync"
+        fi

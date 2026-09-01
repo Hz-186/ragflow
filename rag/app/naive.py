@@ -1068,13 +1068,16 @@ def chunk(filename, binary=None, from_page=0, to_page=MAXIMUM_PAGE_NUMBER, lang=
     is_english = lang.lower() == "english"  # is_english(cks)
     parser_config = kwargs.get("parser_config", {"chunk_token_num": 512, "delimiter": "\n!?。；！？", "layout_recognize": "DeepDOC", "analyze_hyperlink": True})
 
+    # ===== 父子切片：解析 children_delimiter（子分隔符）=====
+    # ① 编码绕一圈：前端传来的 "\n" 是「反斜杠+n」两个字符，
+    #    经 unicode_escape 解码成真正的换行符；中间用 latin1 是为了逐字节保真
     child_deli = (parser_config.get("children_delimiter") or "").encode("utf-8").decode("unicode_escape").encode("latin1").decode("utf-8")
-    cust_child_deli = re.findall(r"`([^`]+)`", child_deli)
-    child_deli = "|".join(re.sub(r"`([^`]+)`", "", child_deli))
+    cust_child_deli = re.findall(r"`([^`]+)`", child_deli)  # ② 抽出所有反引号包裹的「多字符子分隔符」
+    child_deli = "|".join(re.sub(r"`([^`]+)`", "", child_deli))  # ③ 剩下的裸字符：每个字符各自是一个子分隔符，用 | 连成正则
     if cust_child_deli:
-        cust_child_deli = sorted(set(cust_child_deli), key=lambda x: -len(x))
+        cust_child_deli = sorted(set(cust_child_deli), key=lambda x: -len(x))  # ④ 去重 + 按长度降序（长的优先命中，与主分隔符规则一致）
         cust_child_deli = "|".join(re.escape(t) for t in cust_child_deli if t)
-        child_deli += cust_child_deli
+        child_deli += cust_child_deli  # ⑤ 拼成完整交替正则，随切片传给 split_with_pattern 做二次切分
 
     is_markdown = False
     table_context_size = max(0, int(parser_config.get("table_context_size", 0) or 0))
@@ -1086,22 +1089,27 @@ def chunk(filename, binary=None, from_page=0, to_page=MAXIMUM_PAGE_NUMBER, lang=
     pdf_parser = None
     section_images = None
 
+    # ===== 递归切片：内嵌文件只在「根调用」时挖一层 =====
+    # is_root 是递归防爆闸：最外层调用默认 True，递归子调用显式传 False，
+    # 保证「文件里内嵌的文件」只被挖一层，不会无限递归下去
     is_root = kwargs.get("is_root", True)
     embed_res = []
     if is_root:
-        # Only extract embedded files at the root call
+        # 只有根调用才挖内嵌文件（防止嵌套递归）
         embeds = []
         if binary is not None:
-            embeds = extract_embed_file(binary)
+            embeds = extract_embed_file(binary)  # 从 zip 结构（word/embeddings/ 等）和 OLE 结构（Ole10Native）里挖出内嵌的 docx/xlsx/图片等，按内容哈希去重
         else:
             raise Exception("Embedding extraction from file path is not supported.")
 
-        # Recursively chunk each embedded file and collect results
+        # 对每个内嵌文件递归调用 chunk()，把它们的切片并入主文档结果
         for embed_filename, embed_bytes in embeds:
             try:
+                # 注意 is_root=False：内嵌文件自己不再挖它的内嵌层
                 sub_res = chunk(embed_filename, binary=embed_bytes, lang=lang, callback=callback, is_root=False, **kwargs) or []
                 embed_res.extend(sub_res)
             except Exception as e:
+                # 单个内嵌文件解析失败不影响主文档，记日志后继续
                 error_msg = f"Failed to chunk embed {embed_filename}: {e}"
                 logging.error(error_msg)
                 if callback:
@@ -1110,18 +1118,21 @@ def chunk(filename, binary=None, from_page=0, to_page=MAXIMUM_PAGE_NUMBER, lang=
 
     if re.search(r"\.docx$", filename, re.IGNORECASE):
         callback(0.1, "Start to parse.")
+        # ===== 递归切片：docx 超链接也只在根调用时抓一层 =====
         if parser_config.get("analyze_hyperlink", False) and is_root:
-            urls = extract_links_from_docx(binary)
+            urls = extract_links_from_docx(binary)  # 从 docx 的 rels 里抽出所有外部超链接
             for index, url in enumerate(urls):
-                html_bytes, metadata = extract_html(url)
+                html_bytes, metadata = extract_html(url)  # 抓取链接内容（转成 HTML 字节）
                 if not html_bytes:
-                    continue
+                    continue  # 抓不到的链接直接跳过
                 try:
+                    # 优先用链接本身当文件名（按扩展名走对应解析器）
                     sub_url_res = chunk(url, html_bytes, callback=callback, lang=lang, is_root=False, **kwargs)
                 except Exception as e:
+                    # 链接文件名不被任何解析器认识时，退回按 .html 解析
                     logging.info(f"Failed to chunk url in registered file type {url}: {e}")
                     sub_url_res = chunk(f"{index}.html", html_bytes, callback=callback, lang=lang, is_root=False, **kwargs)
-                url_res.extend(sub_url_res)
+                url_res.extend(sub_url_res)  # 链接内容切片并入主文档结果
 
         # fix "There is no item named 'word/NULL' in the archive", referring to https://github.com/python-openxml/python-docx/issues/1105#issuecomment-1298075246
         _SerializedRelationships.load_from_xml = load_from_xml_v2
@@ -1174,8 +1185,10 @@ def chunk(filename, binary=None, from_page=0, to_page=MAXIMUM_PAGE_NUMBER, lang=
             layout_recognize_override=layout_recognize_raw,
         )
 
+        # ===== 递归切片：PDF 超链接同样只在根调用时抓一层 =====
+        # 这里只是先收集链接，真正抓取与切片在本函数末尾统一进行
         if parser_config.get("analyze_hyperlink", False) and is_root:
-            urls = extract_links_from_pdf(binary)
+            urls = extract_links_from_pdf(binary)  # 从 PDF 注释里抽出所有外部链接
         callback(0.1, "Start to parse.")
         if name == "mineru":
             kwargs["parse_method"] = "naive"
@@ -1374,77 +1387,94 @@ def chunk(filename, binary=None, from_page=0, to_page=MAXIMUM_PAGE_NUMBER, lang=
     st = timer()
     overlapped_percent = normalize_overlapped_percent(parser_config.get("overlapped_percent", 0))
 
+    # ===== markdown 分支：按标题节合并切片（图文同步）=====
+    # markdown 解析器已按标题把文档切成 section，这里把相邻小节攒到
+    # chunk_token_num 以内，并把各小节携带的图片用 concat_img 纵向拼接
     if is_markdown:
         merged_chunks = []
         merged_images = []
-        chunk_limit = max(0, int(parser_config.get("chunk_token_num", 128)))
+        chunk_limit = max(0, int(parser_config.get("chunk_token_num", 128)))  # 单切片 token 上限
 
-        current_text = ""
-        current_tokens = 0
-        current_image = None
+        current_text = ""  # 正在攒的切片文本
+        current_tokens = 0  # 正在攒的切片 token 数
+        current_image = None  # 正在攒的切片图片（多张小节图纵向拼接）
 
         for idx, sec in enumerate(sections):
             text = sec[0] if isinstance(sec, tuple) else sec
             sec_tokens = num_tokens_from_string(text)
             sec_image = section_images[idx] if section_images and idx < len(section_images) else None
 
-            # Don't finalize chunk if current_text is a short header (force merge with next section)
+            # 短标题不单独成片：当前攒着的若是短标题，强制与下一小节合并，
+            # 避免产生「只有一个标题」的孤零零切片
             if current_text and not _is_short_header(current_text) and current_tokens + sec_tokens > chunk_limit:
-                merged_chunks.append(current_text)
+                merged_chunks.append(current_text)  # 装满 → 当前切片封片
                 merged_images.append(current_image)
                 overlap_part = ""
                 if overlapped_percent > 0:
+                    # 重叠切片：把上一片尾部若干字符抄进下一片开头，避免跨片语义被切断
                     overlap_len = int(len(current_text) * overlapped_percent / 100)
                     if overlap_len > 0:
                         overlap_part = current_text[-overlap_len:]
                 current_text = overlap_part
                 current_tokens = num_tokens_from_string(current_text)
-                current_image = current_image if overlap_part else None
+                current_image = current_image if overlap_part else None  # 有重叠文本才保留旧图
 
             if current_text:
-                current_text += "\n" + text
+                current_text += "\n" + text  # 小节并入正在攒的切片
             else:
                 current_text = text
             current_tokens += sec_tokens
 
             if sec_image:
+                # 小节带图 → 与已攒图片纵向拼接，保持图文顺序一致
                 current_image = concat_img(current_image, sec_image) if current_image else sec_image
 
         if current_text:
-            merged_chunks.append(current_text)
+            merged_chunks.append(current_text)  # 最后一片收尾
             merged_images.append(current_image)
 
         chunks = merged_chunks
         has_images = merged_images and any(img is not None for img in merged_images)
 
         if has_images:
+            # 带图走「图文配对」包装流水线
             res.extend(tokenize_chunks_with_images(chunks, doc, is_english, merged_images, child_delimiters_pattern=child_deli, language=lang))
         else:
+            # 无图走主干包装流水线（配置了子分隔符时同样触发父子切片）
             res.extend(tokenize_chunks(chunks, doc, is_english, pdf_parser, child_delimiters_pattern=child_deli, language=lang))
     else:
+        # ===== 非 markdown 分支：按分隔符切段再合并 =====
         if section_images:
             if all(image is None for image in section_images):
-                section_images = None
+                section_images = None  # 所有小节都没图 → 按无图路径处理
 
         if section_images:
+            # 带图路径：段落流 + 图片列表一起进带图合并切片机（合并时图片纵向拼接）
             chunks, images = naive_merge_with_images(sections, section_images, int(parser_config.get("chunk_token_num", 128)), parser_config.get("delimiter", "\n!?。；！？"), overlapped_percent)
             res.extend(tokenize_chunks_with_images(chunks, doc, is_english, images, child_delimiters_pattern=child_deli, language=lang))
         else:
+            # 无图路径：通用合并切片机（配置了反引号分隔符时走自定义规则模式）
             chunks = naive_merge(sections, int(parser_config.get("chunk_token_num", 128)), parser_config.get("delimiter", "\n!?。；！？"), overlapped_percent)
 
             res.extend(tokenize_chunks(chunks, doc, is_english, pdf_parser, child_delimiters_pattern=child_deli, language=lang))
 
+    # ===== 递归切片收尾：把前面收集的超链接逐个抓取并切片 =====
+    # 注意：docx 分支在自己的分支里已经抓取并 return 了，走不到这里；
+    # 这段收尾实际服务 PDF / markdown / txt 等一路走到底的路径。
+    # 同样受 is_root 保护：链接内容递归进来时 is_root=False，不会再抓它的链接
     if urls and parser_config.get("analyze_hyperlink", False) and is_root:
         for index, url in enumerate(urls):
-            html_bytes, metadata = extract_html(url)
+            html_bytes, metadata = extract_html(url)  # 抓取链接内容（转成 HTML 字节）
             if not html_bytes:
-                continue
+                continue  # 抓不到的链接直接跳过
             try:
+                # 优先用链接本身当文件名（按扩展名走对应解析器）
                 sub_url_res = chunk(url, html_bytes, callback=callback, lang=lang, is_root=False, **kwargs)
             except Exception as e:
+                # 链接文件名不被任何解析器认识时，退回按 .html 解析
                 logging.info(f"Failed to chunk url in registered file type {url}: {e}")
                 sub_url_res = chunk(f"{index}.html", html_bytes, callback=callback, lang=lang, is_root=False, **kwargs)
-            url_res.extend(sub_url_res)
+            url_res.extend(sub_url_res)  # 链接内容切片并入主文档结果
 
     logging.info("naive_merge({}): {}".format(filename, timer() - st))
 

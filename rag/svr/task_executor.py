@@ -401,23 +401,31 @@ async def build_chunks(task, progress_callback, on_chunking_start=None):
 
     @timeout(60)
     async def upload_to_minio(document, chunk):
+        """给一个切片生成 id，并把切片附带的图片存进对象存储 —— 切片图片入库。
+
+        干了三件事：
+            ① 切片 id = xxh64(正文 + 文档id) —— 同一文档里正文相同的切片 id 相同（幂等）
+            ② 已有 img_id（上游已存过图）→ 直接收工
+            ③ 有 image 对象 → 交给 image2id：编码成 JPEG 存对象存储，
+               用「桶名-对象名」换出 img_id，image 字段随之被弹出（ES 里只存引用不存图）
+        """
         try:
             d = copy.deepcopy(document)
             d.update(chunk)
-            d["id"] = xxhash.xxh64((chunk["content_with_weight"] + str(d["doc_id"])).encode("utf-8", "surrogatepass")).hexdigest()
+            d["id"] = xxhash.xxh64((chunk["content_with_weight"] + str(d["doc_id"])).encode("utf-8", "surrogatepass")).hexdigest()  # ① 内容哈希作切片 id
             d["create_time"] = str(datetime.now()).replace("T", " ")[:19]
             d["create_timestamp_flt"] = datetime.now().timestamp()
 
             if d.get("img_id"):
-                docs.append(d)
+                docs.append(d)  # ② 上游已存过图，直接收工
                 return
 
             if not d.get("image"):
                 _ = d.pop("image", None)
-                d["img_id"] = ""
+                d["img_id"] = ""  # 没有图片的切片：img_id 置空
                 docs.append(d)
                 return
-            await image2id(d, partial(settings.STORAGE_IMPL.put, tenant_id=task["tenant_id"]), d["id"], task["kb_id"])
+            await image2id(d, partial(settings.STORAGE_IMPL.put, tenant_id=task["tenant_id"]), d["id"], task["kb_id"])  # ③ 图片编码后存对象存储，换出 img_id
             docs.append(d)
         except Exception:
             logging.exception("Saving image of chunk {}/{}/{} got exception".format(task["location"], task["name"], d["id"]))
@@ -1290,8 +1298,7 @@ async def delete_image(kb_id, chunk_id):
 
 @timed_with_recording
 async def insert_chunks(task_id, task_tenant_id, task_dataset_id, chunks, progress_callback):
-    """
-    Insert chunks into document store (Elasticsearch OR Infinity).
+    """把切片写进文档存储（Elasticsearch 或 Infinity）—— 切片入库。
 
     Args:
         task_id: Task identifier
@@ -1299,32 +1306,41 @@ async def insert_chunks(task_id, task_tenant_id, task_dataset_id, chunks, progre
         task_dataset_id: Dataset/knowledge base ID
         chunks: List of chunk dictionaries to insert
         progress_callback: Callback function for progress updates
+
+    写入顺序：先插「母切片」（父切片），再插子切片本体，保证检索时
+    子切片的 mom_id 一定指向已存在的母切片。
     """
     from rag.svr.task_executor_refactor.chunk_service import apply_source_chunks_document_availability
 
     apply_source_chunks_document_availability(chunks)
 
+    # ===== 父子切片的落库：从子切片的 mom_with_weight 反推出母切片 =====
+    # 每个子切片都带着 mom_with_weight（母切片的完整原文），这里把原文
+    # 哈希成母切片 id，同原文的多个子切片共享同一个母切片（去重）
     mothers = []
     mother_ids = set([])
     for ck in chunks:
-        mom = ck.get("mom") or ck.get("mom_with_weight") or ""
+        mom = ck.get("mom") or ck.get("mom_with_weight") or ""  # 取母切片原文（两个字段兼容不同上游）
         if not mom:
-            continue
-        id = xxhash.xxh64(mom.encode("utf-8")).hexdigest()
-        ck["mom_id"] = id
+            continue  # 没有母切片内容的普通切片跳过
+        id = xxhash.xxh64(mom.encode("utf-8")).hexdigest()  # 母切片 id = 原文内容哈希（同原文天然去重）
+        ck["mom_id"] = id  # 子切片回写 mom_id，检索命中后可据此回查母切片
         if id in mother_ids:
-            continue
+            continue  # 这个母切片已经造过，不重复造
         mother_ids.add(id)
         mom_ck = copy.deepcopy(ck)
         mom_ck["id"] = id
-        mom_ck["content_with_weight"] = mom
-        mom_ck["available_int"] = 0
+        mom_ck["content_with_weight"] = mom  # 母切片正文 = 完整原文
+        mom_ck["available_int"] = 0  # 关键：母切片对检索不可见（检索侧按 available_int 过滤）
         flds = list(mom_ck.keys())
         for fld in flds:
+            # 白名单清洗：母切片只留 id/正文/定位类字段，删掉分词字段（content_ltks 等）、
+            # 向量、img 等 —— 即使没有 available_int 过滤，母切片也不会被向量/全文检索命中
             if fld not in ["id", "content_with_weight", "doc_id", "docnm_kwd", "kb_id", "available_int", "position_int", "create_timestamp_flt", "page_num_int", "top_int"]:
                 del mom_ck[fld]
         mothers.append(mom_ck)
 
+    # 母切片先行批量入库（先有母、后有子）
     for b in range(0, len(mothers), settings.DOC_BULK_SIZE):
         ret = await thread_pool_exec(
             settings.docStoreConn.insert,

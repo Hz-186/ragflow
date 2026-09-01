@@ -30,6 +30,22 @@ test_image = base64.b64decode(test_image_base64)
 
 
 async def image2id(d: dict, storage_put_func: partial, objname: str, bucket: str = "imagetemps"):
+    """把切片上的图片对象「存进对象存储、换成一个字符串引用」—— 图片入库换票员。
+
+    输入数据的样子：
+        d —— 切片文档 {"id": "a1b2...", "content_with_weight": "...", "image": <PIL 图>}
+        objname —— 存储对象名（主路径 task_executor 传切片 id，图与切片同名同命；
+                   另有少量调用方传随机 UUID）
+        bucket —— 存储桶名（主路径传知识库 id；本函数默认值 "imagetemps"）
+    输出（原地修改 d）：
+        image 字段被弹出（PIL 对象没法进 ES），换成
+        d["img_id"] = "桶名-对象名"（检索端展示图片时凭它回读）
+
+    干了三件事：
+        ① 把图片物化后编码成 JPEG 二进制（RGBA/P 模式先转 RGB，因为 JPEG 不支持透明通道）
+        ② 经限流器把二进制存进对象存储（MinIO 等）
+        ③ 在切片上写 img_id 引用，image 字段从此消失
+    """
     import logging
     from io import BytesIO
     from rag.svr.task_executor_limiter import minio_limiter
@@ -40,9 +56,10 @@ async def image2id(d: dict, storage_put_func: partial, objname: str, bucket: str
         del d["image"]
         return
 
-    image = d.pop("image")
+    image = d.pop("image")  # 先把图片从切片上弹出（处理完只在切片上留 img_id 引用）
 
     def encode_image():
+        # ① 把图片（可能是 PIL 图 / LazyImage）物化成可编码的图像对象
         img, close_after = open_image_for_processing(image, allow_bytes=False)
 
         if isinstance(img, bytes):
@@ -55,12 +72,12 @@ async def image2id(d: dict, storage_put_func: partial, objname: str, bucket: str
         try:
             img.load()
             if img.mode in ("RGBA", "P"):
-                converted = img.convert("RGB")
+                converted = img.convert("RGB")  # JPEG 不支持透明/调色板模式，先转 RGB
                 owned_images.append(converted)
                 img = converted
 
             with BytesIO() as buf:
-                img.save(buf, format="JPEG")
+                img.save(buf, format="JPEG")  # ① 统一编码成 JPEG
                 return buf.getvalue()
         except (OSError, ValueError) as e:
             logging.warning(f"Saving image exception: {e}")
@@ -72,21 +89,22 @@ async def image2id(d: dict, storage_put_func: partial, objname: str, bucket: str
                 except Exception:
                     pass
 
-    jpeg_binary = await thread_pool_exec(encode_image)
+    jpeg_binary = await thread_pool_exec(encode_image)  # 编码是 CPU 密集活，丢线程池避免卡事件循环
     if jpeg_binary is None:
         return
 
     async with minio_limiter:
+        # ② 经限流器上传对象存储（防止并发写爆 MinIO 连接）
         await thread_pool_exec(lambda: storage_put_func(bucket=bucket, fnm=objname, binary=jpeg_binary))
 
-    d["img_id"] = f"{bucket}-{objname}"
+    d["img_id"] = f"{bucket}-{objname}"  # ③ 写回「桶名-对象名」复合引用
 
 
 def parse_storage_composite_id(composite_id: str) -> tuple[str, str] | None:
-    """Split a ``{bucket}-{object_key}`` storage ID on the first hyphen only.
+    """把 ``{桶名}-{对象名}`` 复合 id 拆回 (桶名, 对象名) —— img_id 解码器。
 
-    ``image2id`` stores ``img_id`` as ``f"{bucket}-{objname}"``. The object key
-    may contain additional hyphens (e.g. ``page-1.jpg``).
+    只在第一个连字符处切分：对象名里可能还带连字符（如 ``page-1.jpg``）。
+    ``image2id`` 存入的 img_id 形如 ``f"{bucket}-{objname}"``。
 
     Args:
         composite_id: Composite storage identifier.
@@ -101,7 +119,10 @@ def parse_storage_composite_id(composite_id: str) -> tuple[str, str] | None:
 
 
 def id2image(image_id: str | None, storage_get_func: partial):
-    """Load a PIL image from storage using a composite ``img_id``.
+    """凭 img_id 从对象存储里「换回」图片 —— 图片出库取件员（image2id 的逆操作）。
+
+    检索命中后前端要展示切片图：用 img_id 拆出桶名/对象名，读回字节流再打开成 PIL 图。
+    id 不合法或读取失败时返回 None。
 
     Args:
         image_id: Value produced by ``image2id`` (``{bucket}-{object_key}``).
