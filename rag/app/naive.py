@@ -68,50 +68,80 @@ from rag.nlp import (
 
 def _is_short_header(text, max_tokens=50):
     """
-    Check if text is a short markdown header.
+    检查指定文本是否为较短的 Markdown 标题。
+
+    该函数用于 Markdown 分块（Chunking）阶段。当文本匹配 Markdown 标题格式（如 `# 标题`）
+    且其 Token 数量低于设定阈值时，将其识别为短标题，防止短标题被单独切分成孤立的切片，
+    以便后续逻辑强制将其与下方正文内容进行合并。
 
     Args:
-        text: The text to check
-        max_tokens: Maximum tokens for a header to be considered "short"
+        text (str): 待检查的文本内容。
+        max_tokens (int, optional): 判断标题是否为“短标题”的最大 Token 数量上限。默认值为 50。
 
     Returns:
-        bool: True if text is a short markdown header, False otherwise
+        bool: 如果文本是符合长度限制的 Markdown 标题则返回 True，否则返回 False。
     """
+    # 1. 基础判空：如果文本为 None、空字符串或全空白字符，直接返回 False
     if not text or not text.strip():
         return False
 
-    # Check if it matches markdown header pattern: 1-6 # followed by space
+    # 2. 正则匹配 Markdown 标题语法：去除前后空白后，匹配以 1 到 6 个 '#' 开头且后接至少一个空白字符
     if not re.match(r"^#{1,6}\s+", text.strip()):
         return False
 
-    # Check if token count is below threshold
+    # 3. Token 计数检查：计算文本的 Token 数量，判断是否严格小于设定的最大阈值
     return num_tokens_from_string(text) < max_tokens
 
 
 def _normalize_section_text_for_rtl_presentation_forms(sections):
+    """
+    规范化章节（sections）数据中的 RTL（从右到左）文本，统一阿拉伯语字形表达形式。
+
+    在各种文档格式（DOCX、PDF、Markdown、TXT、HTML、EPUB、JSON 等）的解析过程中，
+    阿拉伯语等 RTL 文本可能包含 Unicode 阿拉伯语表达形式（Arabic Presentation Forms），
+    这会导致后续分词、向量化以及全文检索匹配不准确。该函数遍历各章节数据，
+    提取文本部分通过 NFKC 规范化为标准 Unicode 字符，并保持章节原有的数据容器结构（元组/列表/字符串及附加元数据）不变。
+
+    Args:
+        sections (list | tuple | None): 待规范化的章节列表或元组。每个章节元素可以是：
+            - tuple: 如 (text, image, ...) 等包含文本及其他元数据的元组
+            - list: 如 [text, ...] 等包含文本及其他元数据的列表
+            - str: 纯文本字符串
+
+    Returns:
+        list | tuple | None: 文本部分已被规范化后的章节结构；若传入空数据则直接原样返回。
+    """
+    # 1. 基础判空：若传入的 sections 为空或 None，直接原样返回
     if not sections:
         return sections
 
     normalized_sections = []
+    # 2. 遍历每个章节元素，根据其具体的数据容器类型进行针对性处理
     for section in sections:
+        # 2.1 处理元组类型的章节（例如：(text, image_info)）
         if isinstance(section, tuple):
             if not section:
-                normalized_sections.append(section)
+                normalized_sections.append(section)  # 空元组原样保留
                 continue
-            text = section[0]
-            normalized_text = normalize_arabic_presentation_forms(text)
-            normalized_sections.append((normalized_text, *section[1:]))
+            text = section[0]  # 提取元组首项的文本内容
+            normalized_text = normalize_arabic_presentation_forms(text)  # 规范化阿拉伯语/RTL 文本
+            normalized_sections.append((normalized_text, *section[1:]))  # 保持元组结构及后续附加数据不变
             continue
+
+        # 2.2 处理列表类型的章节（例如：[text, ...]）
         if isinstance(section, list):
             if not section:
-                normalized_sections.append(section)
+                normalized_sections.append(section)  # 空列表原样保留
                 continue
-            text = section[0]
-            normalized_text = normalize_arabic_presentation_forms(text)
-            normalized_sections.append([normalized_text, *section[1:]])
+            text = section[0]  # 提取列表首项的文本内容
+            normalized_text = normalize_arabic_presentation_forms(text)  # 规范化阿拉伯语/RTL 文本
+            normalized_sections.append([normalized_text, *section[1:]])  # 保持列表结构及后续附加数据不变
             continue
+
+        # 2.3 处理纯字符串或其他标量类型的章节
         normalized_sections.append(normalize_arabic_presentation_forms(section))
 
+    # 3. 返回规范化处理完成的所有章节列表
     return normalized_sections
 
 

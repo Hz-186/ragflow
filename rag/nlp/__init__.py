@@ -476,8 +476,8 @@ def tokenize(d, txt, eng, language="English"):
 def split_with_pattern(d, pattern: str, content: str, eng, language="English") -> list:
     """按「子分隔符正则」把一块文本再切成更小的块 —— 子切块器。
 
-    背景：RAGFlow 支持「多级切分」。第一级按段落/标题切出 chunks，
-    每个 chunk 若配置了 child_delimiters_pattern（子分隔符），
+    背景：RAGFlow 支持「多级切分」。
+    第一级按段落/标题切出 chunks，每个 chunk 若配置了 child_delimiters_pattern（子分隔符），
     还要再按它切成更小的子块（parent 文档 + child 文档，实现父子检索）。
 
     输入数据的样子：
@@ -524,8 +524,12 @@ def tokenize_chunks(chunks, doc, eng, pdf_parser=None, child_delimiters_pattern=
     """把一批「纯文本切片」变成「可检索的 ES 文档列表」—— 主干包装流水线。
 
     输入数据的样子：
-        chunks —— ["第一段正文@@1\\t0\\t595\\t100\\t200##...", "第二段正文..."]
-                    （@@...## 是 PDF 解析时埋进去的位置标签，见 pdf_parser.crop）
+        chunks —— [
+            "第一段正文@@1\\t0\\t595\\t100\\t200##...",
+            "第二段正文...",
+        ]
+        （@@...## 是 PDF 解析时埋进去的位置标签，见 pdf_parser.crop）
+
         doc    —— 模板文档 {"docnm_kwd": "报告.docx", "title_tks": "..."}（所有切片共享的文档级字段）
         pdf_parser —— PDF 解析器对象（能按位置标签裁图），非 PDF 格式传 None
         child_delimiters_pattern —— 子分隔符正则（如 "；|。"），为空表示不启用父子切片
@@ -583,15 +587,33 @@ def tokenize_chunks_with_positions(chunks_with_pos, doc, eng, child_delimiters_p
     """
     res = []
     for ck, pos in chunks_with_pos:
-        if not ck or not str(ck).strip():  # 空切片直接跳过
-            continue
-        d = copy.deepcopy(doc)  # ① 每块切片复制一份模板
-        add_positions(d, [pos])  # ① 直接登记真实位置（来自 Excel 工作表/行号）
+        # ① 防御性过滤：如果是空单元格或全空格，直接丢弃，不污染索引库
+        if not ck or not str(ck).strip(): continue
+        # ② 深拷贝模板：每个切片都必须是独立的 dict。
+        # 如果不用 deepcopy，修改 d 的分词和坐标时，会把所有切片的数据全改串！
+        d = copy.deepcopy(doc)
+
+        # ③ 登记真实坐标：
+        # 把 Excel 的坐标 (0, left, right, top, bottom) 写入 d["position_int"] 等字段。
+        # 作用：前端用户搜索到这段话时，UI 可以根据这个坐标精准定位并高亮高标原文件里的表格行！
+        add_positions(d, [pos])
+
+        # ④ 分支 A：父子切片模式（如果配置了子切片正则）
         if child_delimiters_pattern:
-            d["mom_with_weight"] = ck.removeprefix("\n")  # ② 父子模式：整块原文作为母切片内容
+            # 记录母切片（完整的一大块表格内容）
+            d["mom_with_weight"] = ck.removeprefix("\n")
+            # 把母切片再细切成多个子块，每个子块独立分词，并展平追加到 res 列表
             res.extend(split_with_pattern(d, child_delimiters_pattern, ck, eng, language=language))
             continue
-        tokenize(d, ck, eng, language=language)  # ③ 普通模式：分词后整块入库
+
+        # ⑤ 分支 B：普通切片模式（没有配置子切片正则）
+        # 调用 C++ 分词器，向 d 内部填充：
+        # d["content_with_weight"] (原文)
+        # d["content_ltks"] (粗粒度分词，用于 BM25 检索)
+        # d["content_sm_ltks"] (细粒度分词，用于精确匹配)
+        tokenize(d, ck, eng, language=language)
+
+        # ⑥ 把组装好的单个切片文档加入结果列表
         res.append(d)
     return res
 
@@ -685,8 +707,18 @@ def tokenize_table(tbls, doc, eng, batch_size=10, language="English"):
 
     输入数据的样子：
         tbls —— [((图片或 None, rows), 位置列表), ...]，其中：
-            rows 是字符串 → 这是一张「表格」（解析器把表格转成的 HTML/文本）
-            rows 是列表   → 这是一幅「图片」（图片描述/图注文本，一行一条）
+
+        tbls = [
+            # 元素 1：这是一张表格（rows 是 str 字符串，通常是 HTML 代码）
+            ( (table_img, "<table><tr><td>营收</td><td>100万</td></tr></table>"), [pos1] ),
+
+            # 元素 2：这是一张图片（rows 是 list 列表，由 OCR 识别出的一行行文字/图注组成）
+            ( (figure_img, ["图1: 系统架构图", "左侧为网关", "右侧为数据库"]), [pos2] )
+        ]
+
+        rows 是字符串 → 这是一张「表格」（解析器把表格转成的 HTML/文本）
+        rows 是列表   → 这是一幅「图片」（图片描述/图注文本，一行一条）
+
         这是上游解析器与这里的显式约定（字符串=表格、列表=图片），
         不靠猜 HTML 标签来判断类型。
 
@@ -706,22 +738,27 @@ def tokenize_table(tbls, doc, eng, batch_size=10, language="English"):
             d["content_with_weight"] = rows  # 表格保留完整原文（含 HTML 标签）供展示
             d["doc_type_kwd"] = "table"  # ① 表格类型标记
             if img is not None:
-                d["image"] = img  # ① 表格截图（有则带上）
+                d["image"] = img                   # 5. 带上表格的原图截图
             if poss:
-                add_positions(d, poss)
+                add_positions(d, poss)             # 6. 登记表格在 PDF/文件中的物理坐标
             res.append(d)
             continue
+
         lang_key = (language or "English").strip().lower()
         de = "； " if lang_key in {"chinese", "japanese"} else "; "  # 按语言选择描述行的连接符
         for i in range(0, len(rows), batch_size):  # ② 按 batch_size 条一组打包
             d = copy.deepcopy(doc)
+            # 例如 rows = ["图1 架构图", "网关模块", "鉴权模块"]
+            # 拼接成: "图1 架构图； 网关模块； 鉴权模块"
             r = de.join(rows[i : i + batch_size])
+
             tokenize(d, r, eng, language=language)
             d["doc_type_kwd"] = "image"  # ② 图片类型标记
             if img is not None:
                 d["image"] = img  # ② 图片本体
             add_positions(d, poss)
             res.append(d)
+
     return res
 
 

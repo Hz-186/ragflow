@@ -105,5 +105,44 @@ class TestIsShortHeader:
         assert result is True
 
 
+class TestNormalizeSectionTextForRtlPresentationForms:
+    """Test cases for _normalize_section_text_for_rtl_presentation_forms() function."""
+
+    @pytest.fixture(autouse=True)
+    def _lazy_import(self):
+        sys.path.insert(0, str(_REPO))
+        from rag.app.naive import _normalize_section_text_for_rtl_presentation_forms
+
+        self._normalize = _normalize_section_text_for_rtl_presentation_forms
+
+    def test_empty_or_none(self):
+        assert self._normalize(None) is None
+        assert self._normalize([]) == []
+
+    def test_tuple_sections(self):
+        # \uFE8D is ARABIC LETTER ALEF ISOLATED FORM -> \u0627
+        # \uFE91 is ARABIC LETTER BEH INITIAL FORM -> \u0628
+        # \uFEEC is ARABIC LETTER HEH INITIAL FORM -> \u0647
+        sections = [("\uFE8D\uFE91\uFEEC", "extra_meta_1", 123), ()]
+        res = self._normalize(sections)
+        assert len(res) == 2
+        assert res[0][0] == "\u0627\u0628\u0647"
+        assert res[0][1:] == ("extra_meta_1", 123)
+        assert res[1] == ()
+
+    def test_list_sections(self):
+        sections = [["\uFE8D\uFE91", "meta_a"], []]
+        res = self._normalize(sections)
+        assert len(res) == 2
+        assert res[0][0] == "\u0627\u0628"
+        assert res[0][1:] == ["meta_a"]
+        assert res[1] == []
+
+    def test_string_sections(self):
+        sections = ["\uFE8D\uFE91", "Normal text"]
+        res = self._normalize(sections)
+        assert res == ["\u0627\u0628", "Normal text"]
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
