@@ -8,6 +8,11 @@ Use this file as the local operating guide for the current codebase. Prefer the 
 - Always determine whether the task belongs to the Python path (`api/` `rag/` `deepdoc/` `agent/`) or the Go path (`cmd/` `internal/`) before editing; they are parallel implementations and changing the wrong one has no effect.
 - If project structure changes significantly (new top-level dirs, backend convergence, port/service changes), update `CODEGRAPH.md` in the same change.
 
+## Git Workflow (MANDATORY)
+- **All work happens on the `study` branch.** If it does not exist locally, create it (`git checkout -b study`). Never commit directly to `main` or any other branch.
+- **Push only to `origin`** (https://github.com/Hz-186/ragflow.git), e.g. `git push origin study`. **Never push to `upstream`** (the infiniflow/ragflow source repo) or open PRs against it.
+- Do not rebase/force-push shared branches without explicit user instruction.
+
 ## Core Stance
 - Treat legacy code as liability, not as a compatibility target.
 - Prefer deletion over shims, deprecated branches, wrapper APIs, and dual-track migration notes.
