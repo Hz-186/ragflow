@@ -600,9 +600,17 @@ def doc_tokenize_chunks_with_images(chunks, doc, eng, child_delimiters_pattern=N
     """把 naive_merge_docx 产出的「文本/表格/图片三混切片」变成 ES 文档 —— docx 包装流水线。
 
     输入数据的样子：
-        chunks —— [{"text": "...", "ck_type": "text"|"table"|"image",
-                    "image": <PIL 图或 None>, "context_above": "...", "context_below": "..."}, ...]
-                  （三混切片由 _build_cks/_merge_cks 生成，上下文由 _add_context 附上）
+        chunks —— [
+            {
+                "text": "...", 
+                "ck_type": "text"|"table"|"image",
+                "image": <PIL 图或 None>, 
+                "context_above": "...", 
+                "context_below": "...",
+            }, 
+            ...
+        ]
+        （三混切片由 _build_cks/_merge_cks 生成，上下文由 _add_context 附上）
 
     干了四件事：
         ① 拼接「上文 + 正文 + 下文」作为最终入库文本（让表格/图片切片带上周边语境）
@@ -639,9 +647,13 @@ def tokenize_chunks_with_images(chunks, doc, eng, images, child_delimiters_patte
     """把「文本与图片一一对应的切片对」变成 ES 文档 —— 带图通用包装流水线。
 
     输入数据的样子：
-        chunks —— ["第一段...", "第二段..."]
-        images —— [<PIL 图>, None, ...]  与 chunks 等长、下标一一对应
-                  （图片由 naive_merge_with_images / markdown 分支合并段落时纵向拼接而来）
+
+        chunks —— ["第一段...", "第二段...", ...]
+        images —— [<PIL 图>,     None,      ...]  
+        
+        与 chunks 等长、下标一一对应
+        （图片由 naive_merge_with_images / markdown 分支合并段落时纵向拼接而来）
+
         与 doc_tokenize_chunks_with_images 的区别：这里文本和图片是两个平行列表，
         没有 ck_type 三混结构，用于 naive.py 的 markdown 分支和带图的通用分支。
 
@@ -714,37 +726,87 @@ def tokenize_table(tbls, doc, eng, batch_size=10, language="English"):
 
 
 def attach_media_context(chunks, table_context_size=0, image_context_size=0):
-    """给「媒体切片」（表格/图片）附上前后的文本语境 —— 语境采集器。
+    """给「表格/图片切片」就地拼上周边正文语境 —— 媒体语境合并器（ES 切片版）。
 
-    用途：纯图片/表格切片本身没有可检索的文字，把前后若干 token 的正文
-    抄进 context_above / context_below，让检索命中与展示都有上下文。
+    用途：表格/图片切片本身可检索的文字很少（表格是 HTML、图片只有图注），
+    从旁边最相关的文本切片里借一段正文拼进去，让检索命中和答案展示都有上下文。
 
-    排序策略（尽力而为）：
-        ① 任一切片带位置信息（position_int / page_num_int 等）→ 先按位置排序再采集语境，
-           保证「前后」是版面上的前后
-        ② 没有任何位置信息 → 保持列表原顺序
-    两个 size 参数单位都是 token 数，<=0 表示该类型不附语境；直接原样返回输入列表。
+    与 docx 路径 _add_context 的区别（容易混淆，注意）：
+        _add_context（见本文件同名函数）把语境单独存进
+            context_above / context_below 两个字段，入库前才由
+            doc_tokenize_chunks_with_images 拼接；
+        本函数直接把语境拼进 content_with_weight（或 text 字段）并重新分词，
+            就地改写，不产生 context_above / context_below 字段。
+
+    输入数据的样子（tokenize_table / tokenize_chunks 产出、尚未入库的
+    ES（Elasticsearch）切片字典列表，下文简称切片）：
+        chunks = [
+            {   # 0 普通文本切片 —— 只会被借正文当语境，本身不会被改写
+                "content_with_weight": "产品概述\\n本公司主营智能家居设备。",
+                "content_ltks": "产品 概述 本公司 主营 智能 家居 设备 。",
+                "page_num_int": [1], "top_int": [120],
+                "position_int": [(1, 50, 545, 120, 260)],  # (页,左,右,上,下)，页号 1 基
+            },
+            {   # 1 表格切片
+                "content_with_weight": "<table><tr>...</tr></table>",
+                "doc_type_kwd": "table", "image": <PIL 截图或 None>,
+                "content_ltks": "...",
+                "page_num_int": [1], "top_int": [300],
+                "position_int": [(1, 50, 545, 300, 520)],
+            },
+            {   # 2 图片切片（正文只有图注/描述）
+                "content_with_weight": "图 1 系统架构",
+                "doc_type_kwd": "image", "image": <PIL>,
+                "page_num_int": [1], "top_int": [560],
+                "position_int": [(1, 80, 500, 560, 700)],
+            },
+        ]
+        table_context_size / image_context_size —— 语境预算（单位 token），
+        <=0 表示该类型不附语境；两个都 <=0 时原样返回。
+
+    处理后的样子（假设两个 size 都配了 30）：
+        chunks[1]["content_with_weight"] 变成
+            "产品概述\\n本公司主营智能家居设备。\\n<table>...</table>\\n安装步骤\\n第一步 取出主机。"
+            = 邻居文本切片「中点句」之前 ≤30 token + 自身原文 + 中点句之后 ≤30 token，\\n 连接；
+        content_ltks / content_sm_ltks 同步按新文本重新分词；
+        整个列表还会按 (页, 上, 左) 重排（有位置的切片在前，没位置的按原序殿后）。
+
+    语境来源怎么找（重点）：
+        ① 首选「几何就近」：在与本切片同页、且纵向范围有交叠的文本切片里，
+           选「垂直中线距离最近」的那一块
+        ② 没有几何交叠、但本切片恰好是该页阅读序的第一个/最后一个
+           → 取该页阅读序上最近的文本邻居
+        ③ 都找不到 → 不附语境，该切片保持原样
+        选中的邻居文本按句子切开，找到「累计 token 约占一半」的中点句：
+        中点句及之前归「上文」预算、之后归「下文」预算，两侧各自凑满自己的 budget。
+        （这是启发式：单个文本切片内部与媒体的上下关系未知，用中点对半分来近似。）
+
+    调用方：rag/app/paper.py、book.py、manual.py、picture.py —— 都在
+    tokenize_table + tokenize_chunks 之后、返回入库之前调用。
     """
-    from . import rag_tokenizer
+    from . import rag_tokenizer  # 延迟导入：与本文件其他函数（如 tokenize）的既有写法一致，避免模块加载期拉入重依赖
 
     if not chunks or (table_context_size <= 0 and image_context_size <= 0):
-        return chunks
+        return chunks  # 没有切片或两类预算都没开 → 直接原样返回
 
+    # —— 切片分类器：文本 / 表格 / 图片 三分类（语境只附给表格和图片） ——
     def is_image_chunk(ck):
-        if ck.get("doc_type_kwd") == "image":
+        if ck.get("doc_type_kwd") == "image":  # tokenize_table 打的显式标记
             return True
 
+        # 没有显式标记时的兜底判断：带了图片、但正文是空的 → 也当图片切片
         text_val = ck.get("content_with_weight") if isinstance(ck.get("content_with_weight"), str) else ck.get("text")
         has_text = isinstance(text_val, str) and text_val.strip()
         return bool(ck.get("image")) and not has_text
 
     def is_table_chunk(ck):
-        return ck.get("doc_type_kwd") == "table"
+        return ck.get("doc_type_kwd") == "table"  # tokenize_table 打的显式标记
 
     def is_text_chunk(ck):
-        return not is_image_chunk(ck) and not is_table_chunk(ck)
+        return not is_image_chunk(ck) and not is_table_chunk(ck)  # 剩下的都是普通文本切片
 
     def get_text(ck):
+        # 取切片正文：优先 content_with_weight（入库字段），退回 text（中间形态字段）
         if isinstance(ck.get("content_with_weight"), str):
             return ck["content_with_weight"]
         if isinstance(ck.get("text"), str):
@@ -752,6 +814,8 @@ def attach_media_context(chunks, table_context_size=0, image_context_size=0):
         return ""
 
     def split_sentences(text):
+        # 按句读把文本切成句子，标点保留在前一句末尾：
+        # "第一句。第二句！尾巴" → ["第一句。", "第二句！", "尾巴"]
         pattern = r"([.。！？!?；;：:\n])"
         parts = re.split(pattern, text)
         sentences = []
@@ -759,36 +823,43 @@ def attach_media_context(chunks, table_context_size=0, image_context_size=0):
         for p in parts:
             if not p:
                 continue
-            if re.fullmatch(pattern, p):
+            if re.fullmatch(pattern, p):  # 这块是标点本身 → 并入前文，一句结束
                 buf += p
                 sentences.append(buf)
                 buf = ""
             else:
-                buf += p
-        if buf:
+                buf += p  # 普通文字 → 继续累积
+        if buf:  # 结尾没有标点的残句也要收进来
             sentences.append(buf)
         return sentences
 
     def get_bounds_by_page(ck):
+        """算出这个切片在每一页上占的纵向范围 → {页号: (最小 top, 最大 bottom)}。
+
+        两个来源（优先前者）：
+            position_int —— [(页,左,右,上,下), ...]，一段一行，同页多行要合并取外包
+            page_num_int + top_int + bottom —— 退化来源，只有单页一个范围
+        """
         bounds = {}
         try:
             if ck.get("position_int"):
                 for pos in ck["position_int"]:
-                    if not pos or len(pos) < 5:
+                    if not pos or len(pos) < 5:  # 形状不对的位置行直接跳过
                         continue
                     pn, _, _, top, bottom = pos
                     if pn is None or top is None:
                         continue
                     top_val = float(top)
                     bottom_val = float(bottom) if bottom is not None else top_val
-                    if bottom_val < top_val:
+                    if bottom_val < top_val:  # 防御上下颠倒的数据
                         top_val, bottom_val = bottom_val, top_val
                     pn = int(pn)
-                    if pn in bounds:
+                    if pn in bounds:  # 同页已有一条 → 取并集（最小 top、最大 bottom）
                         bounds[pn] = (min(bounds[pn][0], top_val), max(bounds[pn][1], bottom_val))
                     else:
                         bounds[pn] = (top_val, bottom_val)
             else:
+                # 退化来源：页号/上边距优先取 _int 版本，退回无后缀版本
                 pn = None
                 if ck.get("page_num_int"):
                     pn = ck["page_num_int"][0]
@@ -803,18 +874,24 @@ def attach_media_context(chunks, table_context_size=0, image_context_size=0):
                     top = ck.get("top")
                 if top is None:
                     return bounds
-                bottom = ck.get("bottom")
+                bottom = ck.get("bottom")  # bottom 可缺省，缺省时退化成一条细线
                 pn = int(pn)
                 top_val = float(top)
                 bottom_val = float(bottom) if bottom is not None else top_val
                 if bottom_val < top_val:
                     top_val, bottom_val = bottom_val, top_val
                 bounds[pn] = (top_val, bottom_val)
-        except Exception:
+        except Exception:  # 位置数据脏了就当作「没有位置」，不影响主流程
             return {}
         return bounds
 
     def trim_to_tokens(text, token_budget, from_tail=False):
+        """把一段文字按句子裁剪到约 token_budget 个 token。
+
+        from_tail=False 从头往后顺取；True 从尾往前倒取（取完再翻回正序）。
+        注意：某句单句就超预算时，仍然整句收下再停 —— 允许最后一句溢出，
+        保证裁出来的语境至少有一句完整的话。
+        """
         if token_budget <= 0 or not text:
             return ""
         sentences = split_sentences(text)
@@ -826,23 +903,25 @@ def attach_media_context(chunks, table_context_size=0, image_context_size=0):
         seq = reversed(sentences) if from_tail else sentences
         for s in seq:
             tks = num_tokens_from_string(s)
-            if tks <= 0:
+            if tks <= 0:  # 纯空白句跳过，不占预算
                 continue
-            if tks > remaining:
+            if tks > remaining:  # 这句放不下 → 整句收下后停止（允许这一次溢出）
                 collected.append(s)
                 break
             collected.append(s)
             remaining -= tks
 
-        if from_tail:
+        if from_tail:  # 倒取的结果翻回正序
             collected = list(reversed(collected))
         return "".join(collected)
 
     def find_mid_sentence_index(sentences):
+        # 找「中点句」：累计 token 数最接近全文一半的那句的下标。
+        # 用它把邻居文本一分为二：之前算上文、之后算下文。
         if not sentences:
             return 0
         total = sum(max(0, num_tokens_from_string(s)) for s in sentences)
-        if total <= 0:
+        if total <= 0:  # 全文无有效 token → 用句数对半兜底
             return max(0, len(sentences) // 2)
         target = total / 2.0
         best_idx = 0
@@ -850,37 +929,43 @@ def attach_media_context(chunks, table_context_size=0, image_context_size=0):
         cum = 0
         for i, s in enumerate(sentences):
             cum += max(0, num_tokens_from_string(s))
-            diff = abs(cum - target)
+            diff = abs(cum - target)  # 累计值与一半的差距
             if best_diff is None or diff < best_diff:
                 best_diff = diff
                 best_idx = i
         return best_idx
 
     def collect_context_from_sentences(sentences, boundary_idx, token_budget):
+        """以中点句 boundary_idx 为界，向前、向后各凑至多 token_budget 个 token。
+
+        返回 (上文句子列表, 下文句子列表)，都按原文顺序排好。
+        上文从「中点句」开始倒着收（中点句本身算上文），凑不满的最后一句按句内裁剪；
+        下文从中点句的下一句开始顺着收，同理。
+        """
         prev_ctx = []
         remaining_prev = token_budget
-        for s in reversed(sentences[: boundary_idx + 1]):
+        for s in reversed(sentences[: boundary_idx + 1]):  # 中点句 → 文首，倒序收
             if remaining_prev <= 0:
                 break
             tks = num_tokens_from_string(s)
             if tks <= 0:
                 continue
-            if tks > remaining_prev:
+            if tks > remaining_prev:  # 单句超预算 → 只留这句的尾部若干句子
                 s = trim_to_tokens(s, remaining_prev, from_tail=True)
                 tks = num_tokens_from_string(s)
             prev_ctx.append(s)
             remaining_prev -= tks
-        prev_ctx.reverse()
+        prev_ctx.reverse()  # 翻回正序
 
         next_ctx = []
         remaining_next = token_budget
-        for s in sentences[boundary_idx + 1 :]:
+        for s in sentences[boundary_idx + 1 :]:  # 中点句之后 → 文末，顺收
             if remaining_next <= 0:
                 break
             tks = num_tokens_from_string(s)
             if tks <= 0:
                 continue
-            if tks > remaining_next:
+            if tks > remaining_next:  # 单句超预算 → 只留这句的头部若干句子
                 s = trim_to_tokens(s, remaining_next, from_tail=False)
                 tks = num_tokens_from_string(s)
             next_ctx.append(s)
@@ -888,6 +973,8 @@ def attach_media_context(chunks, table_context_size=0, image_context_size=0):
         return prev_ctx, next_ctx
 
     def extract_position(ck):
+        # 提取切片的排序坐标 (页号, 上边距, 左边距)，供「按版面重排」用。
+        # 页号/上边距优先 _int 版本；左边距从 position_int 第一行的第 2 列或 x0 取。
         pn = None
         top = None
         left = None
@@ -906,16 +993,17 @@ def attach_media_context(chunks, table_context_size=0, image_context_size=0):
                 left = ck["position_int"][0][1]
             elif ck.get("x0") is not None:
                 left = ck.get("x0")
-        except Exception:
+        except Exception:  # 取不到就全部置 None，该切片归入「无位置」组
             pn = top = left = None
         return pn, top, left
 
+    # —— ① 按版面位置给切片排序：有位置的按 (页, 上, 左, 原下标) 排，无位置的按原序殿后 ——
     indexed = list(enumerate(chunks))
     positioned_indices = []
     unpositioned_indices = []
     for idx, ck in indexed:
         pn, top, left = extract_position(ck)
-        if pn is not None and top is not None:
+        if pn is not None and top is not None:  # 页号和上边距都有才算「有位置」
             positioned_indices.append((idx, pn, top, left if left is not None else 0))
         else:
             unpositioned_indices.append(idx)
@@ -924,8 +1012,9 @@ def attach_media_context(chunks, table_context_size=0, image_context_size=0):
         positioned_indices.sort(key=lambda x: (int(x[1]), int(x[2]), int(x[3]), x[0]))
         ordered_indices = [i for i, _, _, _ in positioned_indices] + unpositioned_indices
     else:
-        ordered_indices = [idx for idx, _ in indexed]
+        ordered_indices = [idx for idx, _ in indexed]  # 全员无位置 → 保持原顺序
 
+    # —— ② 收集所有「文本切片」的版面范围，作为语境候选池 ——
     text_bounds = []
     for idx, ck in indexed:
         if not is_text_chunk(ck):
@@ -934,8 +1023,10 @@ def attach_media_context(chunks, table_context_size=0, image_context_size=0):
         if bounds:
             text_bounds.append((idx, bounds))
 
+    # —— ③ 逐个处理表格/图片切片：找语境来源 → 切句 → 前后各凑预算 ——
     for sorted_pos, idx in enumerate(ordered_indices):
         ck = chunks[idx]
+        # 文本切片预算为 0 → 跳过，只处理媒体切片
         token_budget = image_context_size if is_image_chunk(ck) else table_context_size if is_table_chunk(ck) else 0
         if token_budget <= 0:
             continue
@@ -943,25 +1034,28 @@ def attach_media_context(chunks, table_context_size=0, image_context_size=0):
         prev_ctx = []
         next_ctx = []
         media_bounds = get_bounds_by_page(ck)
-        best_idx = None
+        best_idx = None  # 选中的语境来源（文本切片）下标
         best_dist = None
         candidate_count = 0
         if media_bounds and text_bounds:
+            # 首选「几何就近」：同页且纵向有交叠的文本切片里，选中线距离最近的
             for text_idx, bounds in text_bounds:
                 for pn, (t_top, t_bottom) in bounds.items():
-                    if pn not in media_bounds:
+                    if pn not in media_bounds:  # 不在同一页 → 不可比
                         continue
                     m_top, m_bottom = media_bounds[pn]
-                    if m_bottom < t_top or m_top > t_bottom:
+                    if m_bottom < t_top or m_top > t_bottom:  # 纵向完全不相交 → 跳过
                         continue
                     candidate_count += 1
-                    m_mid = (m_top + m_bottom) / 2.0
-                    t_mid = (t_top + t_bottom) / 2.0
+                    m_mid = (m_top + m_bottom) / 2.0  # 媒体中线
+                    t_mid = (t_top + t_bottom) / 2.0  # 文本块中线
                     dist = abs(m_mid - t_mid)
                     if best_dist is None or dist < best_dist:
                         best_dist = dist
                         best_idx = text_idx
         if best_idx is None and media_bounds:
+            # 兜底：没有几何交叠时，若本切片是该页阅读序的第一个/最后一个，
+            # 取该页最近的文本邻居（第一个 → 往后找；最后一个 → 往前找）
             media_page = min(media_bounds.keys())
             page_order = []
             for ordered_idx in ordered_indices:
@@ -970,46 +1064,50 @@ def attach_media_context(chunks, table_context_size=0, image_context_size=0):
                     page_order.append(ordered_idx)
             if page_order and idx in page_order:
                 pos_in_page = page_order.index(idx)
-                if pos_in_page == 0:
+                if pos_in_page == 0:  # 页首媒体 → 向后找第一个文本邻居
                     for neighbor in page_order[pos_in_page + 1 :]:
                         if is_text_chunk(chunks[neighbor]):
                             best_idx = neighbor
                             break
-                elif pos_in_page == len(page_order) - 1:
+                elif pos_in_page == len(page_order) - 1:  # 页尾媒体 → 向前找第一个文本邻居
                     for neighbor in reversed(page_order[:pos_in_page]):
                         if is_text_chunk(chunks[neighbor]):
                             best_idx = neighbor
                             break
         if best_idx is not None:
+            # 把选中的邻居文本切句，以「中点句」为界前后各凑至多 token_budget
             base_text = get_text(chunks[best_idx])
             sentences = split_sentences(base_text)
             if sentences:
                 boundary_idx = find_mid_sentence_index(sentences)
                 prev_ctx, next_ctx = collect_context_from_sentences(sentences, boundary_idx, token_budget)
 
-        if not prev_ctx and not next_ctx:
+        if not prev_ctx and not next_ctx:  # 一句语境都没凑到 → 该切片保持原样
             continue
 
+        # —— ④ 拼合「上文 + 自身原文 + 下文」，就地写回正文 ——
         self_text = get_text(ck)
         pieces = [*prev_ctx]
-        if self_text:
+        if self_text:  # 表格 HTML / 图注放在中间
             pieces.append(self_text)
         pieces.extend(next_ctx)
         combined = "\n".join(pieces)
 
         original = ck.get("content_with_weight")
-        if "content_with_weight" in ck:
+        if "content_with_weight" in ck:  # 优先写入库字段
             ck["content_with_weight"] = combined
-        elif "text" in ck:
+        elif "text" in ck:  # 只有中间形态字段时写 text
             original = ck.get("text")
             ck["text"] = combined
 
+        # —— ⑤ 正文变了 → 同步重建分词字段（只重建已有的键，不凭空新增） ——
         if combined != original:
             if "content_ltks" in ck:
                 ck["content_ltks"] = rag_tokenizer.tokenize(combined)
             if "content_sm_ltks" in ck:
                 ck["content_sm_ltks"] = rag_tokenizer.fine_grained_tokenize(ck.get("content_ltks", rag_tokenizer.tokenize(combined)))
 
+    # —— ⑥ 有位置信息时，把整个列表就地重排成版面顺序（调用方看到的顺序也变了） ——
     if positioned_indices:
         chunks[:] = [chunks[i] for i in ordered_indices]
 
@@ -1017,25 +1115,78 @@ def attach_media_context(chunks, table_context_size=0, image_context_size=0):
 
 
 def append_context2table_image4pdf(sections: list, tabls: list, table_context_size=0, return_context=False, section_page_offset: int = 0):
+    """给 PDF 的「表格/图片」在解析阶段就拼上前后正文 —— 媒体语境合并器（解析器原始数据版）。
+
+    与 attach_media_context 的分工（两条并行的媒体语境通道，别混淆）：
+        本函数 —— 工作在「解析器原始产物」层面（入库前很早）：
+            输入是 sections（正文段落流）+ tabls（表格/图片原始元组），
+            返回一个新列表，其中表格/图片的文本被替换为拼合语境后的版本
+            （不改动传入的 tabls 本身）；
+        attach_media_context —— 工作在「ES 切片」层面（入库前最后一步）：
+            是真正的就地改写，直接修改 tokenize 之后的切片字典。
+        rag/app/naive.py 的 PDF 分支用本函数（1217 行附近），
+        paper/book/manual 分支用 attach_media_context。
+
+    输入数据的样子：
+        sections —— 正文段落流，三种形态混装（解析器不同，形态不同）：
+            [
+                ("第一段正文@@1\\t12.0\\t583.0\\t100.0\\t200.0##", "text"),  # naive/paper：
+                    #   二元组。@@位置标签## 可能在文本里，也可能在第二个元素里
+                ("代码段正文", "code", "@@2\\t12.0\\t583.0\\t300.0\\t400.0##"),  # MinerU manual：
+                    #   三元组 (文本, 段落类型, 位置标签串)
+                "纯文本段落",  # 兜底：裸字符串（无位置）。现存解析器都产出元组，
+                    #   此分支只是防御性兼容
+            ]
+            位置标签格式：@@页\\t左\\t右\\t上\\t下##，页号 1 基（由
+            PdfParser.extract_positions 解码成 0 基，可 "2-3" 连页）
+        tabls —— 解析器产出的表格/图片列表：
+            [
+                ((<PIL 截图或 None>, "<table>...</table>"),  # rows 是字符串 → 表格
+                 [(0, 12.0, 583.0, 300.0, 500.0)]),          # 位置：[(页,左,右,上,下)] 0 基
+                ((<PIL>, ["图 1 系统架构", "数据来源：..."]),  # rows 是列表 → 图片
+                 [(2, 50.0, 500.0, 120.0, 400.0)]),
+            ]
+            （「字符串=表格、列表=图片」是解析器与下游 tokenize_table 的显式约定）
+        table_context_size —— 前后语境预算（单位 token）；<=0 直接原样返回
+        section_page_offset —— 正文页号补偿：MinerU 的正文页号相对解析起点
+            （从 0 数），而表格/图片位置是全论文档页号，两者相加才能对齐；
+            其他解析器两侧天然对齐，传 0（见 rag/app/naive.py 的调用处）
+
+    处理后的样子（return_context=False，即默认）：
+        tabls[0] 的表格 HTML 变成 "上文正文...<table>...</table>下文正文..."；
+        tabls[1] 的图片仍是列表形态，但变成 ["上文正文...图 1 系统架构\\n数据来源：...下文正文..."]
+            （整包成单元素列表 —— 保住「列表=图片」的类型约定，见下方 ⑤ 注释）
+        return_context=True 时不改数据，返回 [(上文, 下文), ...] 与 tabls 一一对应
+            （供 deepdoc/parser/figure_parser.py 喂给视觉大模型当提示词用）
+
+    干了四件事：
+        ① 把 sections 按页分桶：{页号: [((左,右,上,下), 纯文本), ...]}（剥掉 @@标签）
+        ② 对每张表/图，用它的纵向范围在所在页的文字块里找到「卡位」：
+           哪两个文字块之间是它的位置
+        ③ 从卡位处向前（可跨页）倒着凑上语境、向后顺着凑下语境，各凑满预算
+        ④ 拼回表格/图片文本；找不到卡位时兜底取「上一页末尾 + 下一页开头」
+    """
     from deepdoc.parser import PdfParser
 
     if table_context_size <= 0:
-        return [] if return_context else tabls
+        return [] if return_context else tabls  # 没配语境预算 → 原样返回
 
+    # —— ① 正文按页分桶：先把三种形态的 sections 统一成 (纯文本, 位置列表) ——
     page_bucket = defaultdict(list)
     for i, item in enumerate(sections):
         if isinstance(item, (tuple, list)):
-            if len(item) > 2:
+            if len(item) > 2:  # 三元组 (文本, 段落类型, 位置) —— MinerU manual/pipeline
                 txt, _sec_id, poss = item[0], item[1], item[2]
             else:
                 txt = item[0] if item else ""
                 poss = item[1] if len(item) > 1 else ""
-        else:
+        else:  # 裸字符串段落（无位置）
             txt = item
             poss = ""
-        # Normal: (text, "@@...##") from naive parser -> poss is a position tag string.
-        # Manual: (text, sec_id, poss_list) -> poss is a list of (page, left, right, top, bottom).
-        # Paper: (text_with_@@tag, layoutno) -> poss is layoutno; parse from txt when it contains @@ tags.
+        # poss 归一成 [(页,左,右,上,下), ...]（0 基页号）：
+        #   已是列表 → 直接用；
+        #   是字符串 → 按 @@标签串 解码（标签不在 poss 里、却埋在 txt 里时从 txt 解）；
+        #   其他类型 → 只能指望 txt 里埋着 @@标签，没有就放弃位置。
         if isinstance(poss, list):
             poss = poss
         elif isinstance(poss, str):
@@ -1047,96 +1198,111 @@ def append_context2table_image4pdf(sections: list, tabls: list, table_context_si
                 poss = PdfParser.extract_positions(txt)
             else:
                 poss = []
-        if isinstance(txt, str) and "@@" in txt:
+        if isinstance(txt, str) and "@@" in txt:  # 文本里的位置标签用完即剥，只留纯正文
             txt = re.sub(r"@@[0-9-]+\t[0-9.\t]+##", "", txt).strip()
         for page, left, right, top, bottom in poss:
-            if isinstance(page, list):
+            if isinstance(page, list):  # 连页标签 "2-3" 解码出页号列表 → 只取首页
                 page = page[0] if page else 0
-            page += section_page_offset
+            page += section_page_offset  # MinerU：正文页号补到全文档域，与媒体位置对齐
             page_bucket[page].append(((left, right, top, bottom), txt))
 
     def upper_context(page, i):
+        """从「第 page 页的第 i 块」开始向前（倒着、可跨页）凑至多预算的上语境。"""
         txt = ""
-        if page not in page_bucket:
+        if page not in page_bucket:  # 该页没有正文 → 直接从上一页末尾找起
             i = -1
         while num_tokens_from_string(txt) < table_context_size:
-            if i < 0:
+            if i < 0:  # 本页块用完 → 翻到上一页的最后一块
                 page -= 1
-                if page < 0 or page not in page_bucket:
+                if page < 0 or page not in page_bucket:  # 翻到头了 → 有多少算多少
                     break
                 i = len(page_bucket[page]) - 1
             blks = page_bucket[page]
             (_, _, _, _), cnt = blks[i]
+            # 按句读切开再整体倒转：倒着遍历就等价于「从句尾往句首」逐句收。
+            # re.split 带捕获组 → 奇数下标是标点；[::-1] 后 (标点, 前文) 成对出现，
+            # 每步取 txts[j+1]+txts[j] 前置拼进结果。注意这是「跑完整体才还原
+            # 原文」的拼法：每步前置的标点其实属于再前一句，若预算在中途截断，
+            # 返回值开头可能带一个孤立标点（上游固有行为，此处不改）。
             txts = re.split(r"([。!?？；！\n]|\. )", cnt, flags=re.DOTALL)[::-1]
             for j in range(0, len(txts), 2):
                 txt = (txts[j + 1] if j + 1 < len(txts) else "") + txts[j] + txt
-                if num_tokens_from_string(txt) > table_context_size:
+                if num_tokens_from_string(txt) > table_context_size:  # 凑满即停（允许最后一句溢出）
                     break
-            i -= 1
+            i -= 1  # 本块收完 → 向前一块
         return txt
 
     def lower_context(page, i):
+        """从「第 page 页的第 i 块」开始向后（顺着、可跨页）凑至多预算的下语境。"""
         txt = ""
         if page not in page_bucket:
             return txt
         while num_tokens_from_string(txt) < table_context_size:
-            if i >= len(page_bucket[page]):
+            if i >= len(page_bucket[page]):  # 本页块用完 → 翻到下一页的第一块
                 page += 1
                 if page not in page_bucket:
                     break
                 i = 0
             blks = page_bucket[page]
             (_, _, _, _), cnt = blks[i]
+            # 与 upper_context 对称：顺向切句，(前文, 标点) 成对追加
             txts = re.split(r"([。!?？；！\n]|\. )", cnt, flags=re.DOTALL)
             for j in range(0, len(txts), 2):
                 txt += txts[j] + (txts[j + 1] if j + 1 < len(txts) else "")
                 if num_tokens_from_string(txt) > table_context_size:
                     break
-            i += 1
+            i += 1  # 本块收完 → 向后一块
         return txt
 
+    # —— ② 逐张表格/图片：找到版面卡位，前后各凑语境 ——
     res = []
     contexts = []
     for (img, tb), poss in tabls:
-        # MinerU is expected to provide page_idx and bbox, but production
-        # fallbacks may still yield media without positions. Preserve it.
+        # 没有位置信息的媒体（MinerU 正常会给 page_idx+bbox，但兜底路径可能没有）
+        # → 不附语境，原样保留，不能弄丢
         if not poss:
             res.append(((img, tb), poss))
             if return_context:
                 contexts.append(("", ""))
             continue
 
-        page, left, right, top, bott = poss[0]
-        _page, _left, _right, _top, _bott = poss[-1]
-        # Context extraction needs text, but list payloads identify images for
-        # tokenize_table; restore that shape before returning the media block.
+        page, left, right, top, bott = poss[0]  # 媒体的首页坐标（定位用首页）
+        _page, _left, _right, _top, _bott = poss[-1]  # 媒体的末页坐标（跨页媒体用）
+        # 图片的 rows 是列表（「列表=图片」类型约定），但凑语境要按文本处理：
+        # 先临时拼成字符串，返回前再还原形态（见 ⑤）
         image_rows = tb if isinstance(tb, list) else None
         if image_rows is not None:
             tb = "\n".join(image_rows)
 
+        # 卡位扫描：在本页文字块里找「第 i 块整体在媒体上方、第 i+1 块整体在媒体下方」的缝。
+        # 循环退出时若 tb 没变（_tb == tb），说明没找到缝 → 走末尾兜底。
         i = 0
         blks = page_bucket.get(page, [])
         _tb = tb
         while i < len(blks):
-            if i + 1 >= len(blks):
-                if _page > page:
+            if i + 1 >= len(blks):  # 已比到本页最后一块
+                if _page > page:  # 媒体跨页 → 去下一页继续找缝
                     page += 1
                     i = 0
                     blks = page_bucket.get(page, [])
                     continue
+                # 媒体压在本页末尾之后：上文取到本页第 i 块为止，下文从下一页开头取
                 upper = upper_context(page, i)
                 lower = lower_context(page + 1, 0)
                 tb = upper + tb + lower
                 contexts.append((upper.strip(), lower.strip()))
                 break
             (_, _, t, b), txt = blks[i]
-            if b > top:
+            if b > top:  # 第 i 块的底边已低于媒体顶边 → 媒体嵌进了文字里，找不到干净的缝
                 break
             (_, _, _t, _b), _txt = blks[i + 1]
-            if _t < _bott:
+            if _t < _bott:  # 第 i+1 块的顶边还高于媒体底边 → 媒体还没过去，继续往后比
                 i += 1
                 continue
 
+            # 找到缝了：上文从第 i 块往前倒收，下文也从第 i 块往后顺收。
+            # 注意上游固有行为：两侧都从 blks[i] 出发，若第 i 块很短、单独填不满
+            # 预算，它的文字会同时出现在上、下语境里（重复一份），这里保持原样不改
             upper = upper_context(page, i)
             lower = lower_context(page, i)
             tb = upper + tb + lower
@@ -1144,12 +1310,16 @@ def append_context2table_image4pdf(sections: list, tabls: list, table_context_si
             break
 
         if _tb == tb:
+            # 兜底：没找到卡位（本页无正文 / 媒体嵌进文字块里）
+            # → 上文取「上一页末尾」、下文取「下一页开头」，宁可粗一点也要给语境
             upper = upper_context(page, -1)
             lower = lower_context(page + 1, 0)
             tb = upper + tb + lower
             contexts.append((upper.strip(), lower.strip()))
-        if len(contexts) < len(res) + 1:
+        if len(contexts) < len(res) + 1:  # 保险丝：保证 contexts 与 res 一一对应
             contexts.append(("", ""))
+        # —— ⑤ 还原图片的列表形态：附上语境的图片整包成单元素列表 [拼合文本]，
+        # 让下游 tokenize_table 仍按「列表=图片」识别；没附语境的原样不动 ——
         if image_rows is not None:
             tb = image_rows if tb == _tb else [tb]
         res.append(((img, tb), poss))
@@ -1157,13 +1327,29 @@ def append_context2table_image4pdf(sections: list, tabls: list, table_context_si
 
 
 def add_positions(d, poss):
+    """把切片的位置信息写进 ES 文档的三个整型字段 —— 位置登记器。
+
+    输入数据的样子：
+        d    —— ES 切片字典（会被就地修改）
+        poss —— [(页, 左, 右, 上, 下), ...]，一个切片可能由多段拼成（跨页），
+                页号 0 基。非 PDF 文档没有真实坐标，调用方用 [[序号]*5] 伪造
+                （见 tokenize_chunks 等），五位都填切片序号。
+
+    写入的三个字段（供检索高亮、按页过滤、裁图定位用）：
+        page_num_int —— [1, 3, ...]   每段的页号，+1 存成 1 基
+        position_int —— [(1,左,右,上,下), ...]  每段完整五元组，同样 1 基页号
+        top_int      —— [120, ...]    每段的上边距（排序用，取第一段时即整块顶部）
+
+    注意页号约定：输入 0 基 → 存储 1 基（int(pn + 1)）。attach_media_context、
+    前端高亮等所有读取方都按 1 基理解这三个字段。
+    """
     if not poss:
         return
     page_num_int = []
     position_int = []
     top_int = []
     for pn, left, right, top, bottom in poss:
-        page_num_int.append(int(pn + 1))
+        page_num_int.append(int(pn + 1))  # 0 基 → 1 基
         top_int.append(int(top))
         position_int.append((int(pn + 1), int(left), int(right), int(top), int(bottom)))
     d["page_num_int"] = page_num_int
@@ -1172,28 +1358,58 @@ def add_positions(d, poss):
 
 
 def remove_contents_table(sections, eng=False):
+    """就地删掉正文里混进的「目录页」文字 —— 目录清除器（book/laws/flow 解析器的预处理）。
+
+    为什么需要：书/法规类 PDF 的目录页是普通文字，解析出来会混进 sections，
+    目录条目（"第一章 总则 ... 1"）若当正文切片会污染检索，要整块删掉。
+
+    输入数据的样子：
+        sections —— [(行文本, 版面类型), ...] 或 [行文本, ...]（就地修改）
+        eng —— 是否英文（决定目录条目前缀怎么取，见下）
+
+    删除启发式（举例，中文书）：
+        处理前：["目 录", "第一章 总则 ... 1", "第二章 责任 ... 5", "第一章 总则", "正文..."]
+        ① 某行去掉空格后整行匹配 (目录|目次|contents|table of contents|致谢|...)
+           → 判定为目录标题行，pop 掉
+        ② 取紧跟的第一条目录条目作「样本」：中文取前 3 字（"第一章"），
+           英文取前 2 个单词；跳过并 pop 空行
+        ③ pop 掉样本行本身，然后向后最多扫 128 行，找下一个以同样前缀开头的行
+           —— 认定那是正文里真正的同名章节（目录条目各章前缀不同，正文第一章
+           会再次以 "第一章" 开头），把它之前的行全部当作目录条目删掉
+        ④ 外层 while 继续向后扫，允许一篇文档有多处目录块
+        处理后：["第一章 总则", "正文..."]
+
+    注意：这是脆弱的启发式 —— 前缀没做正则转义（"1. " 里的点按通配匹配）、
+    依赖「正文会再次出现同名标题」的假设；对不满足假设的文档可能少删/不动。
+    调用方：rag/app/book.py、laws.py、rag/flow/parser/utils.py。
+    """
     i = 0
     while i < len(sections):
 
         def get(i):
+            # 统一取值：元素可能是裸字符串或 (文本, 版面类型) 元组
             nonlocal sections
             return (sections[i] if isinstance(sections[i], str) else sections[i][0]).strip()
 
+        # ① 目录标题行判定：去掉所有空格/全角空格后整行精确匹配（@@位置标签先剥掉）
         if not re.match(r"(contents|目录|目次|table of contents|致谢|acknowledge)$", re.sub(r"( | |\u3000)+", "", get(i).split("@@")[0], flags=re.IGNORECASE)):
             i += 1
             continue
-        sections.pop(i)
+        sections.pop(i)  # 删掉目录标题行
         if i >= len(sections):
             break
+        # ② 取第一条目录条目当样本前缀：中文前 3 字 / 英文前 2 词
         prefix = get(i)[:3] if not eng else " ".join(get(i).split()[:2])
-        while not prefix:
+        while not prefix:  # 样本行是空的 → 删掉换下一行，直到取到非空前缀
             sections.pop(i)
             if i >= len(sections):
                 break
             prefix = get(i)[:3] if not eng else " ".join(get(i).split()[:2])
-        sections.pop(i)
+        sections.pop(i)  # ③ 样本行本身也是目录条目，删掉
         if i >= len(sections) or not prefix:
             break
+        # ④ 向后最多 128 行内找第一个同前缀行 → 认定为正文真章节，
+        # 把它之前的全部行（即剩余目录条目）删掉
         for j in range(i, min(i + 128, len(sections))):
             if not re.match(prefix, get(j)):
                 continue
@@ -1203,6 +1419,22 @@ def remove_contents_table(sections, eng=False):
 
 
 def make_colon_as_title(sections):
+    """把「以冒号结尾的长句尾巴」提升为标题行 —— 冒号标题生成器。
+
+    意图：正文里形如 "...安装步骤如下：" 这种以冒号收尾的句子，冒号后面的
+    内容往往是一节列表的开始，把冒号前的短语单独提成一行标题，
+    让后面的层级合并（hierarchical_merge 等）能挂住它。
+
+    输入数据的样子：
+        sections —— [(行文本, 版面类型), ...]（就地插入新标题行）；
+                    纯字符串列表不处理，原样返回
+
+    ⚠️ 现状提醒（读代码时别被意图误导）：下面 `len(arr[1]) < 32` 的判断里，
+    arr[1] 是 re.split 捕获组切出的「标点本身」（长度恒为 1~2），
+    条件恒成立 → 永远 continue，插入语句实际不可达。
+    即本函数在当前代码里是「空转」的（疑似上游笔误，本意或为判断 arr[0]）。
+    book.py / laws.py 仍在调用它，但实际不会产生任何标题。
+    """
     if not sections:
         return []
     if isinstance(sections[0], str):
@@ -1211,33 +1443,57 @@ def make_colon_as_title(sections):
     while i < len(sections):
         txt, layout = sections[i]
         i += 1
-        txt = txt.split("@")[0].strip()
+        txt = txt.split("@")[0].strip()  # 剥掉 @@位置标签 只看纯文本
         if not txt:
             continue
-        if txt[-1] not in ":：":
+        if txt[-1] not in ":：":  # 不以冒号结尾 → 不是目标句
             continue
-        txt = txt[::-1]
+        txt = txt[::-1]  # 反转后从头切句 = 从原句尾部往前找第一个句读
         arr = re.split(r"([。？！!?;；]| \.)", txt)
-        if len(arr) < 2 or len(arr[1]) < 32:
+        if len(arr) < 2 or len(arr[1]) < 32:  # arr[0]=冒号前的尾巴短语(反转), arr[1]=标点
             continue
+        # 不可达：arr[1] 是标点，长度恒 < 32 —— 见函数 docstring 的现状提醒
         sections.insert(i - 1, (arr[0][::-1], "title"))
         i += 1
 
 
 def title_frequency(bull, sections):
+    """统计每个 section 的标题层级，并找出出现最多的「标题层级」 —— 标题普查员。
+
+    输入数据的样子：
+        bull —— bullets_category 投票选出的标题风格编号（0~4，见 BULLET_PATTERN；
+                -1 表示文档没有任何可识别的标题风格）
+        sections —— [(行文本, 版面类型), ...]
+
+    返回 (most_level, levels)：
+        levels —— 与 sections 等长的层级列表，每个 section 一个值：
+            j (0 ~ bullets_size-1) —— 命中 BULLET_PATTERN[bull] 第 j 套模板
+                                      （j 越小层级越高，如 第X编 > 第X章 > 第X节）
+            bullets_size           —— 没命中模板，但版面类型含 title/head
+                                      且通过了 not_title 检查（版面判定标题）
+            bullets_size + 1       —— 普通正文（默认值）
+        most_level —— levels 里出现次数最多、且 ≤ bullets_size 的层级
+                      （平票时取在 levels 中最先出现的那个）。
+                      全是正文没有标题时返回 bullets_size + 1。
+
+    用途：rag/app/paper.py 用 most_level 当「切块枢轴」—— 层级 ≤ most_level
+    的 section 被视为章节分界，前后两个分界之间的正文合并成一个切片。
+    """
     bullets_size = len(BULLET_PATTERN[bull])
-    levels = [bullets_size + 1 for _ in range(len(sections))]
+    levels = [bullets_size + 1 for _ in range(len(sections))]  # 默认全员正文层级
     if not sections or bull < 0:
         return bullets_size + 1, levels
 
     for i, (txt, layout) in enumerate(sections):
         for j, p in enumerate(BULLET_PATTERN[bull]):
-            if re.match(p, txt.strip()) and not not_bullet(txt):
+            if re.match(p, txt.strip()) and not not_bullet(txt):  # 模板命中且不在误判黑名单
                 levels[i] = j
                 break
         else:
+            # 模板全不中 → 看版面：类型含 title/head 且长得像标题 → 版面标题层级
             if re.search(r"(title|head)", layout) and not not_title(txt.split("@")[0]):
                 levels[i] = bullets_size
+    # 找出现最多的标题层级：按次数降序排，取第一个 ≤ bullets_size 的
     most_level = bullets_size + 1
     for level, c in sorted(Counter(levels).items(), key=lambda x: x[1] * -1):
         if level <= bullets_size:
@@ -1247,6 +1503,15 @@ def title_frequency(bull, sections):
 
 
 def not_title(txt):
+    """判断一行文字「长得不够标题」—— 标题相面师（返回真值 = 不是标题）。
+
+    规则（按顺序）：
+        ① "第X条" 开头（法规条款）→ 一律视为标题（返回 False）
+        ② 英文超过 12 个词，或无空格的文字（中文）≥ 32 字 → 太长，不是标题
+        ③ 含逗号/分号/句号/叹号 → 是句子不是标题（返回 match 对象，按真值用）
+    被 title_frequency / hierarchical_merge / tree_merge 用来过滤「版面说是标题、
+    内容却不像标题」的行。
+    """
     if re.match(r"第[零一二三四五六七八九十百0-9]+条", txt):
         return False
     if len(txt.split()) > 12 or (txt.find(" ") < 0 and len(txt) >= 32):
@@ -1255,17 +1520,47 @@ def not_title(txt):
 
 
 def tree_merge(bull, sections, depth):
+    """按标题层级把 section 流建成章节树，输出「带标题路径」的切片 —— 树形合并器。
+
+    与 hierarchical_merge 的分工：两者都按标题层级切块，
+        本函数走 Node 章节树（见本文件末尾的 Node 类），每个切片带完整标题路径；
+        hierarchical_merge 走「正文向上找标题面包屑」的索引拼装。
+        当前只有 laws.py 用本函数（depth=2）。
+
+    输入数据的样子：
+        bull —— 标题风格编号（-1 时原样返回）
+        sections —— [(行文本, 版面类型), ...] 或 [行文本, ...]
+        depth —— 保留几层标题进切片路径。laws 传 2：若投票选中的是
+                 编/章/节/条 模板（bull=0），即 编/章 两级标题进路径；
+                 更深的层级和正文当内容
+
+    层级编号（get_level 的返回值，比 title_frequency 的整体右移了 1）：
+        1 ~ bullets_size           —— 命中第 (i-1) 套 BULLET_PATTERN 模板
+        bullets_size + 1           —— 版面 title/head 标题
+        bullets_size + 2           —— 正文
+
+    处理步骤：
+        ① 过滤：丢掉空行、可见文字 ≤1 字的行、纯数字行（页码噪声）
+        ② 逐行打层级，收集实际出现过的层级集合
+        ③ 取「第 depth 浅」的层级作为建树深度上限；若选中层级是正文层
+           （说明标题层级不足 depth 种），退一档用次深层级
+        ④ Node.build_tree 建树、get_tree 输出：每个切片 = 标题路径 + 叶子正文
+
+    输出：["第一章 总则\\n第一条 为了...\\n...", ...]（字符串列表，
+    交给 tokenize_chunks 入库）
+    """
     if not sections or bull < 0:
         return sections
     if isinstance(sections[0], str):
         sections = [(s, "") for s in sections]
 
-    # filter out position information in pdf sections
+    # ① 过滤噪声行：@@位置标签 前的可见文字 >1 字，且不是纯数字（页码）
     sections = [(t, o) for t, o in sections if t and len(t.split("@")[0].strip()) > 1 and not re.match(r"[0-9]+$", t.split("@")[0].strip())]
 
     def get_level(bull, section):
+        # 单行打层级：模板命中 > 版面标题 > 正文（规则见函数 docstring）
         text, layout = section
-        text = re.sub(r"\u3000", " ", text).strip()
+        text = re.sub(r"\u3000", " ", text).strip()  # 全角空格归一
 
         for i, title in enumerate(BULLET_PATTERN[bull]):
             if re.match(title, text.strip()) and not not_bullet(text):
@@ -1275,6 +1570,7 @@ def tree_merge(bull, sections, depth):
         else:
             return len(BULLET_PATTERN[bull]) + 2, text
 
+    # ② 逐行打层级，同时记录文档里实际出现过哪些层级
     level_set = set()
     lines = []
     for section in sections:
@@ -1287,14 +1583,18 @@ def tree_merge(bull, sections, depth):
 
     sorted_levels = sorted(list(level_set))
 
+    # ③ 建树深度 = 第 depth 浅的实有层级；层级种类不够时取最深那档
     if depth <= len(sorted_levels):
         target_level = sorted_levels[depth - 1]
     else:
         target_level = sorted_levels[-1]
 
+    # 选中的竟是正文层（第 depth 浅的实有层级已是正文，标题层级不够多）
+    # → 退一档用次深层级，避免把正文当标题
     if target_level == len(BULLET_PATTERN[bull]) + 2:
         target_level = sorted_levels[-2] if len(sorted_levels) > 1 else sorted_levels[0]
 
+    # ④ 建树并收割：超过 target_level 的行当叶子正文，之内的行当标题节点
     root = Node(level=0, depth=target_level, texts=[])
     root.build_tree(lines)
 
@@ -1302,17 +1602,55 @@ def tree_merge(bull, sections, depth):
 
 
 def hierarchical_merge(bull, sections, depth):
+    """按标题层级给每段正文「向上找齐标题面包屑」，拼成带层级路径的切片组 —— 层级合并器。
+
+    与 tree_merge 的分工：两者都按标题切块。本函数是索引拼装路线
+    （不建树，靠二分查找逐级找父标题），当前只有 book.py 用（bull >= 0 分支，
+    depth=5）；laws.py 走 tree_merge。
+
+    输入数据的样子：
+        bull —— bullets_category 选出的标题风格编号（-1 → 返回空列表）
+        sections —— [(行文本, 版面类型), ...] 或 [行文本, ...]
+        depth —— 从「正文层」往上数，允许多少层当切片的种子层
+                 （book 传 5：正文 + 版面标题 + 最低三档模板标题可当种子，
+                 更高的标题只做面包屑、不会单独成块）
+
+    走一遍例子（bull=0，模板 = 编/章/节/条/(一)，bullets_size=5）：
+        sections = [
+            ("第一章 总则", "title"),   # 0 → 命中模板第 2 套（章，模板下标 1）
+            ("本法适用于...", ""),       # 1 → 没命中任何模板 → 正文层
+            ("第二章 责任", "title"),   # 2 → 章
+            ("责任划分如下...", ""),     # 3 → 正文层
+        ]
+        ① 分桶（levels，下标即层级）：
+            [[], [0,2], [], [], [], [], [1,3]]
+             编   章    节   条  (一) 版面  正文
+        ② 反转 levels（正文变第 0 层）后，从正文层往上扫未读的行：
+            正文 1 → 面包屑：章层里 <1 的最近下标 = 0 → 组 [1, 0]
+            正文 3 → 面包屑：章层里 <3 的最近下标 = 2 → 组 [3, 2]
+        ③ 每组翻转回文档顺序、换成文本：
+            [["第一章 总则", "本法适用于..."], ["第二章 责任", "责任划分如下..."]]
+        ④ 打包：单行孤儿组往上一组里攒（累计 <218 token 才合并，218 是上游
+            经验常量），多行组独占一组 —— 最终输出这个「行的列表的列表」。
+        注意：打包以空组起步（res=[[]]），本例第一组就是多行组，所以真实输出
+        开头会带一个空列表：[[], ["第一章 总则", ...], ["第二章 责任", ...]]。
+        book.py 随后对每组 "\\n".join 成一个切片（空组 join 出空串，会被
+        tokenize_chunks 跳过，不影响入库）。
+    """
     if not sections or bull < 0:
         return []
     if isinstance(sections[0], str):
         sections = [(s, "") for s in sections]
+    # 过滤噪声行：可见文字（@@标签之前）>1 字、且不是纯数字（页码）
     sections = [(t, o) for t, o in sections if t and len(t.split("@")[0].strip()) > 1 and not re.match(r"[0-9]+$", t.split("@")[0].strip())]
     bullets_size = len(BULLET_PATTERN[bull])
+    # 层级桶：0 ~ bullets_size-1 = 各档模板标题，bullets_size = 版面标题，
+    # bullets_size+1 = 正文；桶里存的是 section 下标（文档顺序天然递增）
     levels = [[] for _ in range(bullets_size + 2)]
 
     for i, (txt, layout) in enumerate(sections):
         for j, p in enumerate(BULLET_PATTERN[bull]):
-            if re.match(p, txt.strip()):
+            if re.match(p, txt.strip()):  # 注意：此处不过滤 not_bullet（与 title_frequency 不同）
                 levels[j].append(i)
                 break
         else:
@@ -1320,11 +1658,12 @@ def hierarchical_merge(bull, sections, depth):
                 levels[bullets_size].append(i)
             else:
                 levels[bullets_size + 1].append(i)
-    sections = [t for t, _ in sections]
-
-    # for s in sections: print("--", s)
+    sections = [t for t, _ in sections]  # 只留文本，版面类型用完即弃
 
     def binary_search(arr, target):
+        # 在升序的下标数组里找「严格小于 target 的最大元素」的下标；
+        # 找不到（target 比全部元素都小）返回 -1。
+        # 用途：给正文 j 找某一层级里「出现在它之前、离它最近」的那个标题。
         if not arr:
             return -1
         if target > arr[-1]:
@@ -1341,66 +1680,86 @@ def hierarchical_merge(bull, sections, depth):
                 e = i
                 continue
             else:
-                assert False
+                assert False  # target 不可能在桶里：每个 section 只进一个桶
         return s
 
+    # —— 主循环：反转后从正文层往上，给每个未读 section 组一条「标题面包屑链」 ——
     cks = []
     readed = [False] * len(sections)
-    levels = levels[::-1]
-    for i, arr in enumerate(levels[:depth]):
+    levels = levels[::-1]  # 反转：levels[0]=正文, levels[1]=版面标题, 越往后层级越高
+    for i, arr in enumerate(levels[:depth]):  # 只处理最低的 depth 层（种子层）
         for j in arr:
-            if readed[j]:
+            if readed[j]:  # 已被别的组当面包屑吃掉 → 不再单独成组
                 continue
             readed[j] = True
-            cks.append([j])
+            cks.append([j])  # 新组：种子自己
+            # 遍历到「全部层级的倒数第二层」时不再向上挂父标题
+            # （depth 很大才会走到；防止次高层标题个个再挂顶层父标题）
             if i + 1 == len(levels) - 1:
                 continue
-            for ii in range(i + 1, len(levels)):
+            for ii in range(i + 1, len(levels)):  # 逐层向上找父标题
                 jj = binary_search(levels[ii], j)
-                if jj < 0:
+                if jj < 0:  # 这层没有出现在 j 之前的标题 → 跳过这层
                     continue
+                # 新找到的父标题在文中比已挂的面包屑更靠后（更接近 j）
+                # → 弹掉最后挂的那一个再挂新父标题，尽量让面包屑按文档顺序排列。
+                # 注意每次只弹一层，极端层级交错的文档里不保证整条链严格有序
                 if levels[ii][jj] > cks[-1][-1]:
                     cks[-1].pop(-1)
                 cks[-1].append(levels[ii][jj])
-            for ii in cks[-1]:
+            for ii in cks[-1]:  # 组内所有成员（种子+面包屑）都标记已读
                 readed[ii] = True
 
     if not cks:
         return cks
 
+    # 每组翻转回文档顺序（最高标题在前），下标换成文本
     for i in range(len(cks)):
         cks[i] = [sections[j] for j in cks[i][::-1]]
         logging.debug("\n* ".join(cks[i]))
 
+    # —— 打包：把「单行孤儿组」攒进相邻组，控制碎片数量 ——
     res = [[]]
-    num = [0]
+    num = [0]  # num[k] = res[k] 组已累计的 token 数
     for ck in cks:
-        if len(ck) == 1:
-            n = num_tokens_from_string(re.sub(r"@@[0-9]+.*", "", ck[0]))
-            if n + num[-1] < 218:
+        if len(ck) == 1:  # 孤儿组（标题行没挂到任何正文）
+            n = num_tokens_from_string(re.sub(r"@@[0-9]+.*", "", ck[0]))  # 剥掉 @@位置标签 再计长
+            if n + num[-1] < 218:  # 218 token 以内 → 攒进当前组
                 res[-1].append(ck[0])
                 num[-1] += n
                 continue
             res.append(ck)
             num.append(n)
             continue
-        res.append(ck)
+        res.append(ck)  # 多行组独占一组，按满额 218 记账（后续孤儿不会再并进来）
         num.append(218)
 
     return res
 
 
 def _compute_overlap_prefix(prev_text, overlapped_percent):
-    """Return (overlap_text, overlap_token_count) carved from the tail of ``prev_text``.
+    """从上一个切片的尾部切出「重叠前缀」—— 切片重叠计算器。
 
-    ``prev_text`` is treated as if HTML/PDF markup has been stripped, so the carve
-    index is computed against the visible characters, matching the existing
-    behaviour of ``RAGFlowPdfParser.remove_tag`` callers above.
+    用途：配置了重叠百分比后，每个新切片的开头都拼上一小段前一个切片的尾巴，
+    让跨切片的句子在检索时不断链。由 _apply_overlap_unconditional 调用，
+    返回 (重叠文本, 重叠部分的 token 数)。
+
+    输入数据的样子：
+        prev_text —— 上一个切片的原始文本，可能嵌着 @@位置标签##：
+            "第一段正文@@1\\t12.0\\t583.0\\t100.0\\t200.0##第二段正文..."
+        overlapped_percent —— 重叠百分比（按可见字符数比例切，不是按 token）
+
+    处理步骤：
+        ① 剥掉 @@位置标签## 得到可见文本（标签是排版坐标，不该进重叠内容）
+        ② 从「可见文本长度 × (100-百分比)%」处切到末尾
+           例：可见文本 200 字、百分比 10 → 从第 180 字处切，取最后 20 字
+        ③ 返回 (重叠文本, 其 token 数) —— token 数只作返回值供调用方参考，
+           切割本身按字符比例进行
     """
-    visible = re.sub(r"@@[\t0-9.-]+?##", "", prev_text or "")
+    visible = re.sub(r"@@[\t0-9.-]+?##", "", prev_text or "")  # ① 剥位置标签
     if not visible:
         return "", 0
-    overlap_start = int(len(visible) * (100 - overlapped_percent) / 100.0)
+    overlap_start = int(len(visible) * (100 - overlapped_percent) / 100.0)  # ② 切割点
     overlap_text = visible[overlap_start:]
     return overlap_text, num_tokens_from_string(overlap_text)
 
@@ -1778,12 +2137,28 @@ def naive_merge_with_images(texts, images, chunk_token_num=128, delimiter="\n。
 
 
 def docx_question_level(p, bull=-1):
+    """判断 docx 里一个段落是「第几层标题」还是「正文」，并顺带清理文本 —— 段落身份识别员。
+
+    给一个 python-docx 的段落对象 p，返回 (层级, 清理后的文本)：
+        层级 = 0   ：正文（不是标题），由调用方当「答案」累积
+        层级 >= 1  ：标题，数字越大层级越深，由调用方当「问题」入栈或建树
+
+    识别顺序（样式优先，编号次之，兜底最深）：
+        ① 样式名以 "Heading" 开头 → 从样式名里抠数字当层级（"Heading 2" → 2），
+           抠不到数字（如基础样式 "Heading"、自定义 "HeadingTitle"）就回退最顶层 1；
+        ② 否则若 bull < 0（调用方没给编号风格）→ 一律算正文 0；
+        ③ 否则按 BULLET_PATTERN[bull] 这套编号模板逐个 re.match 开头，
+           命中第 j 个模板就返回 j + 1（第 0 个模板对应层级 1）；
+        ④ 全都没命中 → 返回 len(BULLET_PATTERN[bull]) + 1，比最深标题还深一层，
+           当「挂在最近标题底下的正文叶子」。
+    """
     txt = re.sub(r"\u3000", " ", p.text).strip()
     if hasattr(p.style, "name") and p.style.name and p.style.name.startswith("Heading"):
-        # Heading styles are usually "Heading N", but the base "Heading" style,
-        # custom "Heading"-prefixed styles, or "HeadingN" (no space) have no
-        # space-separated trailing integer. Extract the level digits safely and
-        # fall back to the top heading level instead of raising ValueError (#16163).
+        # 样式名一般是 "Heading N"（如 "Heading 1"），但有两种情况没有空格加数字：
+        # ① 基础样式就叫 "Heading"；② 自定义样式以 "Heading" 开头但后面没跟数字
+        # （如 "HeadingTitle"、"Heading Title"、"Heading1"）。
+        # 所以这里用正则安全地抠出第一个数字当层级；抠不到就回退成最顶层 1，
+        # 避免旧写法 int() 直接抛 ValueError 导致整份文档解析失败（#16163）。
         m = re.search(r"\d+", p.style.name)
         return (int(m.group()) if m else 1), txt
     else:
@@ -1858,6 +2233,16 @@ def concat_img(img1, img2):
 
 def _build_cks(sections, delimiter):
     """把 docx 解析出的「文本/图片/表格」三混段落流整理成带类型标记的切片雏形 —— 三混分类工。
+
+    sections = [
+        ("产品概述", None, None),                          # 0: 纯文本
+        ("本公司主营智能家居设备。", None, None),            # 1: 纯文本
+        ("", None, <Table 对象>)                          # 2: 表格段落（text 空、table 有值）
+        ("", <PIL Image>, None)                           # 3: 图片段落（text 空、image 有值）
+        ("安装步骤", None, None),                          # 4: 纯文本
+        ("第一步 取出主机。第二步 连接电源。", None, None),   # 5: 纯文本
+    ]
+    delimiter = "\n。；！？"        # 配置的分隔符：换行 + 四个中文标点
 
     输入数据的样子：
         sections —— [(文本, 图片或 None, 表格或 None), ...]，来自 Docx() 解析：
@@ -1936,7 +2321,7 @@ def _build_cks(sections, delimiter):
 
                 # 命中分隔符（捕获组的精确匹配；不能 strip —— 反引号包裹的
                 # 空白类分隔符如 `` ` ` `` 或 `\n` 必须在这里被拦下）
-                if re.fullmatch(split_pattern, sub_sec):
+                if re.fullmatch(split_pattern, sub_sec):  # 命中分隔符 → 冲走缓冲
                     if seg and seg.strip():
                         s = seg.strip()
                         cks.append(
@@ -2044,12 +2429,14 @@ def _add_context(cks, idx, context_size):
         if cks[prev]["ck_type"] == "text":
             tk = cks[prev]["tk_nums"]
             if tk >= remain_above:
+                # 剩下的空位不够了
                 piece = take_sentences_from_end(cks[prev]["text"], remain_above)
                 parts_above.insert(0, piece)
                 picked_above.append((prev, "tail", remain_above, tk, piece[:80]))
                 remain_above = 0
                 break
             else:
+                # 剩下的空位还可以放下整个
                 parts_above.insert(0, cks[prev]["text"])
                 picked_above.append((prev, "full", remain_above, tk, (cks[prev]["text"] or "")[:80]))
                 remain_above -= tk
@@ -2076,7 +2463,42 @@ def _add_context(cks, idx, context_size):
     cks[idx]["context_below"] = "".join(parts_below) if parts_below else ""
 
 
-def _merge_cks(cks, chunk_token_num, has_custom):
+"""
+cks = [
+    {
+        "text": "产品概述\n本公司主营智能家居设备。", 
+        "ck_type": "text",  
+        "tk_nums": 12
+    },  # 0
+    {   
+        "text": "<table>...</table>",  
+        "ck_type": "table", 
+        "tk_nums": 30,
+        "context_above": "产品概述…", 
+        "context_below": "安装步骤…"
+    },  # 1
+    {   
+        "text": "", 
+        "image": <PIL>,    
+        "ck_type": "image", 
+        "tk_nums": 0,
+        "context_above": "…", 
+        "context_below": "…"
+    },  # 2
+    {
+        "text": "安装步骤\n第一步 取出主机。", 
+        "ck_type": "text", 
+        "tk_nums": 10,
+    },  # 3
+    {   
+        "text": "第二步 连接电源。",          
+        "ck_type": "text", 
+        "tk_nums": 6,
+    },  # 4
+]
+"""
+
+def _merge_cks(cks, chunk_token_num, has_custom):  # -> []merged
     """把 _build_cks 产出的切片雏形「合并」成最终切片 —— 文本攒、媒体不动。
 
     合并规则（只对 ck_type == "text" 的雏形生效）：
@@ -2086,8 +2508,8 @@ def _merge_cks(cks, chunk_token_num, has_custom):
            装满了或还没有上一个 → 当前文本新开一个切片
     返回 (合并后的切片列表, 图片切片下标列表)。
     """
-    merged = []
-    image_idxs = []
+    merged = []   # 也就是最终的结果
+    image_idxs = []  # 记录图片切片在结果里的下标
     prev_text_ck = -1  # 上一个文本切片在 merged 里的下标（-1 = 还没有）
 
     for i in range(len(cks)):
@@ -2099,6 +2521,7 @@ def _merge_cks(cks, chunk_token_num, has_custom):
                 image_idxs.append(len(merged) - 1)
             continue
 
+        # 首个文本切片 → 新开
         if prev_text_ck < 0 or merged[prev_text_ck]["tk_nums"] >= chunk_token_num or has_custom:
             merged.append(cks[i])  # ②③ 装满 / 自定义模式 / 首个文本 → 新开切片
             prev_text_ck = len(merged) - 1
@@ -2144,20 +2567,44 @@ def naive_merge_docx(
 
     merged_cks, merged_image_idx = _merge_cks(cks, chunk_token_num, has_custom)  # ③ 合并小文本段
 
+    # 返回两个东西给 doc_tokenize_chunks_with_images 做最后包装：
+    #   merged_cks       —— 最终切片列表，每个元素 {"text", "image", "ck_type", "tk_nums", (context_above/below)}
+    #   merged_image_idx —— 图片切片在 merged_cks 里的下标列表（前端展示/检索时按图定位用）
     return merged_cks, merged_image_idx
 
 
 def extract_between(text: str, start_tag: str, end_tag: str) -> list[str]:
+    """提取 start_tag 和 end_tag 之间夹着的所有内容 —— 区间提取工。
+
+    用 re.findall 在 text 里找所有「以 start_tag 开头、以 end_tag 结尾」的非重叠区间，
+    返回每个区间里夹在中间的文本列表（不含两个 tag 本身）。
+    两个 tag 都会先 re.escape 转义，所以即使 tag 里有正则特殊字符（如 . [ ] 等）也按字面匹配。
+    例子：extract_between("【a】和【b】", "【", "】") -> ["a", "b"]
+    """
     pattern = re.escape(start_tag) + r"(.*?)" + re.escape(end_tag)
     return re.findall(pattern, text, flags=re.DOTALL)
 
 
 class Node:
+    """文档章节树节点 —— 树形结构工（给「(层级, 文本)」流建树，再按树输出带标题路径的切片）。
+
+    用途：把 docx/PDF 解析出的「(标题层级, 段落文本)」列表，按层级关系组织成一棵树。
+    树的根是 level=0 的虚拟根节点；每个真实节点带 level（层级）、texts（该层级的文本）、
+    children（子节点）。depth 是「保留标题的深度上限」：depth 内的标题累积成标题路径，
+    depth 外的正文作为叶子内容挂在最近的标题下。
+
+    典型调用链：
+        tree_merge（本文件）或 rag/app/laws.py 的 chunk()
+        → root = Node(level=0, depth=目标深度, texts=[])
+        → root.build_tree(lines)   # lines 是 [(level, text), ...]
+        → root.get_tree()          # 输出切片列表
+    """
+
     def __init__(self, level, depth=-1, texts=None):
-        self.level = level
-        self.depth = depth
-        self.texts = texts or []
-        self.children = []
+        self.level = level          # 本节点所在层级（0 = 虚拟根节点，1+ = 真实标题层级）
+        self.depth = depth          # 标题深度上限：depth 内的层级当标题，超过的当正文叶子
+        self.texts = texts or []    # 本节点累积的文本（标题或正文）
+        self.children = []          # 子节点列表（比本节点层级深的节点挂这里）
 
     def add_child(self, child_node):
         self.children.append(child_node)
@@ -2184,6 +2631,13 @@ class Node:
         return f"Node(level={self.level}, texts={self.texts}, children={len(self.children)})"
 
     def build_tree(self, lines):
+        """把 [(level, text), ...] 列表建成树 —— 建树工。
+
+        lines 是「按文档顺序排列的 (层级, 文本)」列表。用栈模拟「最近祖先」：
+        新节点的层级比栈顶大 → 是栈顶的子节点，入栈；
+        新节点的层级 <= 栈顶 → 不断弹栈直到栈顶层级严格更小，再挂为它的子节点。
+        超过 self.depth 深度的行不建节点，直接累积进当前叶子的 texts。
+        """
         stack = [self]
         for level, text in lines:
             if self.depth != -1 and level > self.depth:
@@ -2203,6 +2657,7 @@ class Node:
         return self
 
     def get_tree(self):
+        """遍历树，输出最终切片列表 —— 收果工。"""
         tree_list = []
         self._dfs(self, tree_list, [])
         return tree_list
