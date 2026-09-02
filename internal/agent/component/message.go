@@ -1,33 +1,15 @@
+// Package component —— Message 组件（T3）。
 //
-//  Copyright 2026 The InfiniFlow Authors. All Rights Reserved.
+// Message 是画布终点输出节点。把 Jinja2 风格的 {{...}} 模板对着当前
+// *CanvasState 解析，并（可选）把结果作为单个 SSE chunk 发出。
 //
-//  Licensed under the Apache License, Version 2.0 (the "License");
-//  you may not use this file except in compliance with the License.
-//  You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-//  Unless required by applicable law or agreed to in writing, software
-//  distributed under the License is distributed on an "AS IS" BASIS,
-//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-//  See the License for the specific language governing permissions and
-//  limitations under the License.
-//
-
-// Package component — Message component (T3).
-//
-// Message is the canvas terminal output node. It resolves a
-// Jinja2-style {{...}} template against the current *CanvasState
-// and (optionally) emits the result as a single SSE chunk.
-//
-// Capabilities:
-//   - output_format rendering (html / Markdown / plain) via render.go
-//   - auto_play → TTS engine dispatch via internal/agent/audio
-//   - download extraction from inputs (the {doc_id, filename,
-//     mime_type} walk from Python's _extract_downloads)
-//   - memory_save persistence via the registered MemorySaver
-//     (default stub returns ErrMemoryServiceMissing until a real
-//     implementation is wired at boot)
+// 能力：
+//   - output_format 渲染（html / Markdown / 纯文本），经 render.go；
+//   - auto_play → 经 internal/agent/audio 分发 TTS 引擎；
+//   - 从输入抽 downloads（Python _extract_downloads 的
+//     {doc_id, filename, mime_type} 遍历）；
+//   - memory_save 经已注册的 MemorySaver 持久化（默认 stub 返回
+//     ErrMemoryServiceMissing，启动时接入真实现）。
 package component
 
 import (
@@ -44,13 +26,12 @@ import (
 
 const componentNameMessage = "Message"
 
-// MessageComponent is the canvas terminal output node. It owns
-// the resolved text template as a per-instance field — the factory
-// sets it from the DSL params at build time, and Invoke falls back
-// to it when the input map does not carry a fresh "text" override.
+// MessageComponent 画布终点输出节点。它把解析后的文本模板作为实例级
+// 字段持有——工厂在构建期从 DSL params 设入；输入 map 不带新的 "text"
+// 覆盖时 Invoke 回退到它。
 //
-// Per-instance format / TTS / memory config lets the build-time
-// DSL declarations take effect without input-map plumbing.
+// 实例级 format/TTS/memory 配置让构建期的 DSL 声明生效，不需要输入
+// map另行接线。
 type MessageComponent struct {
 	name         string
 	text         string
@@ -62,23 +43,20 @@ type MessageComponent struct {
 	userID       string
 }
 
-// NewMessageComponent constructs a Message component. The params map
-// may carry:
+// NewMessageComponent 构造 Message 组件。params map 可携带：
 //
-//   - "text"          (string) — the canonical v2 name
-//   - "content"       (string | []string | []any) — the v1 name
-//   - "output_format" (string) — "html" | "markdown" | "plain"
-//   - "auto_play"     (bool | string) — TTS engine toggle
-//     (true → "gtts", string → that engine name)
-//   - "voice"         (string) — TTS voice hint
-//   - "lang"          (string) — TTS language tag
-//   - "memory_ids"    ([]string | []any) — list of memory
-//     stores to persist into when memory_save=true
+//   - "text"          (string) —— v2 标准名
+//   - "content"      (string | []string | []any) —— v1 名
+//   - "output_format" (string) —— "html" | "markdown" | "plain"
+//   - "auto_play"    (bool | string) —— TTS 引擎开关
+//     （true → "gtts"；字符串 → 该引擎名）
+//   - "voice"        (string) —— TTS 音色提示
+//   - "lang"         (string) —— TTS 语言标签
+//   - "memory_ids"   ([]string | []any) —— memory_save=true 时
+//     要持久化的记忆库列表
 //
-// At least one of text/content must produce a non-empty string;
-// otherwise the node emits an empty content (it is the canvas
-// terminal, so a runtime error would be louder than a missing
-// template).
+// text/content 至少一个得产出非空串；否则节点发空内容（它是画布终点，
+// 运行时错误比缺模板更响）。
 func NewMessageComponent(params map[string]any) (Component, error) {
 	tpl := extractMessageText(params)
 	format := OutputFormatPlain
@@ -100,10 +78,9 @@ func NewMessageComponent(params map[string]any) (Component, error) {
 	}, nil
 }
 
-// extractAudioConfig reads auto_play / voice / lang from the
-// params map. auto_play=true → EngineGTTS; auto_play="edge-tts"
-// → EngineEdge; false/missing → EngineEmpty. The string form
-// is preferred when the user typed a specific engine name.
+// extractAudioConfig 从 params 读 auto_play / voice / lang。
+// auto_play=true → EngineGTTS；auto_play="edge-tts" → EngineEdge；
+// false/缺省 → EngineEmpty。用户写了具体引擎名时优先字符串形式。
 func extractAudioConfig(params map[string]any) (audio.Engine, string, string) {
 	var engine audio.Engine
 	if v, ok := params["auto_play"]; ok {
@@ -121,10 +98,8 @@ func extractAudioConfig(params map[string]any) (audio.Engine, string, string) {
 	return engine, voice, lang
 }
 
-// extractMessageText reads text / content from params in the v1 / v2
-// order documented on NewMessageComponent. Returns the empty string
-// when neither key is present or the value is not a string-shaped
-// scalar.
+// extractMessageText 按 NewMessageComponent 注释里的 v1/v2 顺序从
+// params 读 text/content。两键都不在、或值不是字符串形标量时返回空串。
 func extractMessageText(params map[string]any) string {
 	if v, ok := params["text"].(string); ok {
 		return v
@@ -148,29 +123,24 @@ func extractMessageText(params map[string]any) string {
 	return ""
 }
 
-// Name returns the registered component name.
+// Name 返回注册的组件名。
 func (m *MessageComponent) Name() string { return m.name }
 
-// Invoke resolves inputs["text"] (or the per-instance text seeded
-// from params at build time) as a template against the current
-// *CanvasState and returns the resolved string at outputs["content"].
+// Invoke 把 inputs["text"]（或构建期从 params 种下的实例级 text）
+// 当模板对着当前 *CanvasState 解析，把结果串返到 outputs["content"]。
 //
-// Message Invoke behaviour:
-//   - input-format override: inputs["output_format"] wins over the
-//     per-instance format so an orchestrator can re-render
-//     downstream
-//   - downloads: walks inputs for {doc_id, filename, mime_type}
-//     entries; sets outputs["downloads"] when any are present
-//   - auto_play: when m.autoPlay is non-empty, dispatches the
-//     resolved content through the registered audio.Synthesizer
-//     and surfaces base64 audio under outputs["audio"]
-//   - memory_save: when true, calls the registered MemorySaver
-//     with the resolved content (errors are surfaced but not fatal
-//     so a missing memory service does not break the message)
+// 行为要点：
+//   - 输入格式覆盖：inputs["output_format"] 赢过实例级格式——编排器可
+//     向下游重渲染；
+//   - downloads：遍历输入找 {doc_id, filename, mime_type} 条目，有则
+//     设 outputs["downloads"]；
+//   - auto_play：m.autoPlay 非空时，把解析后内容分发进已注册的
+//     audio.Synthesizer，base64 音频浮在 outputs["audio"]；
+//   - memory_save：为 true 时把解析后内容交给已注册的 MemorySaver
+//     （错误浮出但不致命——缺记忆服务不能坏消息）。
 //
-// inputs["text"] takes precedence over the per-instance text so the
-// same node can be reused with different templates at run time when
-// the orchestrator wants to override the DSL-declared value.
+// inputs["text"] 优先于实例级 text——编排器想覆盖 DSL 声明的值时，同一
+// 节点运行期能复用不同模板。
 func (m *MessageComponent) Invoke(ctx context.Context, db *gorm.DB, inputs map[string]any) (map[string]any, error) {
 	state, _, err := runtime.GetStateFromContext[*runtime.CanvasState](ctx)
 	if err != nil {
@@ -188,17 +158,17 @@ func (m *MessageComponent) Invoke(ctx context.Context, db *gorm.DB, inputs map[s
 		text = fallbackMessageText(inputs)
 	}
 
-	// A direct Agent→Message edge stores a lazy DeferredStream in the Agent
-	// output. Message is the owner of that stream: opening it here preserves
-	// Python's partial(async_generator) execution order and makes this node the
-	// only visible SSE producer.
+	// ★Agent→Message 直连边：Agent 输出里存的是惰性 DeferredStream。
+	// Message 是这条流的持有者：在这里打开它，保持 Python
+	// partial(async_generator) 的执行顺序，也让本节点成为唯一可见的
+	// SSE 生产者。
 	resolved, streamed, streamErr := m.resolveDeferredTemplate(ctx, text, state)
 	if streamErr != nil {
 		return nil, streamErr
 	}
 
-	// Extract downloads. Walks inputs for download-info maps so
-	// callers can attach binaries to the message body.
+	// 抽取下载项。遍历输入找下载信息 map，调用方由此把二进制附件挂到
+	// 消息体上。
 	downloads := ExtractDownloads(resolved)
 	if downloads == nil {
 		downloads = make([]DownloadInfo, 0)
@@ -213,9 +183,8 @@ func (m *MessageComponent) Invoke(ctx context.Context, db *gorm.DB, inputs map[s
 		downloads = appendUniqueDownloads(downloads, ExtractDownloads(v))
 	}
 
-	// Pick the effective output format. inputs["output_format"]
-	// overrides the per-instance declaration so the orchestrator can
-	// re-render downstream.
+	// 选生效的输出格式。inputs["output_format"] 覆盖实例级声明——
+	// 编排器可向下游重渲染。
 	format := m.outputFormat
 	if v, ok := inputs["output_format"].(string); ok {
 		format = OutputFormat(v)
@@ -228,24 +197,21 @@ func (m *MessageComponent) Invoke(ctx context.Context, db *gorm.DB, inputs map[s
 			Text:   resolved,
 		})
 	}
-	// The runtime emitter owns Agent-to-Message de-duplication. It suppresses
-	// only an exact copy of content already streamed by an upstream Agent, so a
-	// Message node that intentionally transforms the answer is still visible.
+	// 运行期发射器负责 Agent→Message 去重：只抑制与上游 Agent 已流式
+	// 发出的内容完全相同的拷贝——有意变换过答案的 Message 节点仍可见。
 	if rendered != "" && !streamed {
 		runtime.EmitCanvasMessage(ctx, rendered)
 	}
 
-	// Python's Message output schema always contains downloads, including an
-	// empty list. Keeping the key is also important for the full terminal
-	// output recorded in Canvas history between conversation turns.
+	// Python 的 Message 输出 schema 恒含 downloads（含空列表）。保留该键
+	// 也重要——对话轮间记录进 Canvas 历史的完整终点输出依赖它。
 	out := map[string]any{
 		"content":   rendered,
 		"downloads": downloads,
 	}
 
-	// auto_play TTS dispatch. The audio bytes are returned under
-	// outputs["audio"] as a structured envelope; the SSE layer
-	// can choose to forward them on a separate event channel.
+	// auto_play TTS 分发。音频字节以结构化信封返在 outputs["audio"]；
+	// SSE 层可选择经独立事件通道转发。
 	if m.autoPlay != audio.EngineEmpty {
 		engine := m.autoPlay
 		if v, ok := inputs["auto_play"]; ok {
@@ -274,29 +240,23 @@ func (m *MessageComponent) Invoke(ctx context.Context, db *gorm.DB, inputs map[s
 			Lang:   lang,
 		})
 		if ttsErr != nil {
-			// TTS failures are non-fatal — the textual content is
-			// already in `content`. Surface the error under a
-			// dedicated key so callers can decide whether to retry.
+			// TTS 失败不致命——文本内容已在 `content` 里。错误浮在专门
+			// 键下，调用方自行决定是否重试。
 			out["audio_error"] = ttsErr.Error()
 		} else if resp != nil && len(resp.Audio) > 0 {
 			out["audio"] = map[string]any{
 				"media_type": resp.MediaType,
-				// Base64 is the standard SSE wire shape for
-				// binary payloads.
+				// Base64 是二进制载荷的标准 SSE 线上形状。
 				"data_b64": resp.Audio,
 			}
 		}
 	}
 
-	// Memory persistence. The call is best-effort: a missing
-	// memory service returns ErrMemoryServiceMissing which we
-	// surface under outputs["memory_error"] so the message still
-	// flows.
+	// ★记忆持久化。尽力而为：缺记忆服务返回 ErrMemoryServiceMissing，
+	// 浮在 outputs["memory_error"] 下，消息照常流动。
 	//
-	// The effective memory IDs come from inputs (runtime override)
-	// or fall back to the DSL-declared m.memoryIDs. This matches
-	// the Python Message component, which saves whenever
-	// memory_ids is non-empty.
+	// 生效的记忆 ID 来自 inputs（运行期覆盖），回退 DSL 声明的
+	// m.memoryIDs。对齐 Python Message 组件——memory_ids 非空就保存。
 	memIDs := extractMemoryIDs(inputs)
 	if len(memIDs) == 0 {
 		memIDs = m.memoryIDs
@@ -306,9 +266,8 @@ func (m *MessageComponent) Invoke(ctx context.Context, db *gorm.DB, inputs map[s
 		if userID == "" {
 			userID = m.userID
 		}
-		// If userID is a canvas variable reference (e.g. "{cpn@user_id}"),
-		// resolve it against the current state. Mirrors Python's
-		// agent/component/message.py:569-571.
+		// userID 若是画布变量引用（如 "{cpn@user_id}"），对着当前状态
+		// 解析。对齐 Python agent/component/message.py:569-571。
 		if userID != "" && runtime.VarRefPattern.MatchString(userID) {
 			userID = runtime.ResolveTemplateForDisplay(userID, state)
 		}
@@ -353,19 +312,17 @@ func memorySessionID(state *runtime.CanvasState) string {
 	return state.RunID
 }
 
-// resolveDeferredTemplate resolves a Message template while consuming any
-// lazy Agent stream it references. It returns the complete visible text and a
-// flag indicating whether a DeferredStream was opened.
+// resolveDeferredTemplate ★解析 Message 模板，同时消费它引用的惰性
+// Agent 流。返回完整可见文本 + 是否打开了 DeferredStream 的标志。
 func (m *MessageComponent) resolveDeferredTemplate(ctx context.Context, text string, state *runtime.CanvasState) (string, bool, error) {
 	matches := runtime.VarRefPattern.FindAllStringSubmatchIndex(text, -1)
 	if len(matches) == 0 {
 		return text, false, nil
 	}
-	// Ordinary Message templates are rendered and emitted once by Invoke.
-	// Only templates that actually reference a DeferredStream belong to the
-	// incremental presentation path below.  Emitting literals/normal variable
-	// values here and then emitting the fully rendered string in Invoke would
-	// produce duplicate SSE message events for every non-deferred template.
+	// 普通 Message 模板由 Invoke 一次性渲染发出。只有真正引用了
+	// DeferredStream 的模板才走下面的增量呈现路径——在这里发射字面量/
+	// 普通变量值、又在 Invoke 里发射完整渲染串，每个非延迟模板都会
+	// 产生重复的 SSE message 事件。
 	hasDeferred := false
 	for _, match := range matches {
 		ref := text[match[2]:match[3]]
@@ -401,6 +358,9 @@ func (m *MessageComponent) resolveDeferredTemplate(ctx context.Context, text str
 		}
 
 		streamed = true
+		// 思考段与内容段交织：首个思考增量前发 start_to_think；切回内容
+		// 前发 end_to_think；前端用它们括 <think> 块。可见文本只收内容
+		// 增量，思考增量不进最终 content。
 		inThinking := false
 		visible := strings.Builder{}
 		result, err := deferred.Open(ctx, func(contentDelta, reasoningDelta string) {
@@ -426,6 +386,9 @@ func (m *MessageComponent) resolveDeferredTemplate(ctx context.Context, text str
 		if err != nil {
 			return "", true, fmt.Errorf("Message: consume deferred Agent stream: %w", err)
 		}
+		// Agent 流结束后，用完整结果里的 content 覆盖拼出来的可见文本
+		//（引用落地后最终版本更权威）；引用形如 cpn@key，把最终文本写回
+		// 黑板并通知延迟节点完成（node_finished 此时才发）。
 		finalText := visible.String()
 		if result != nil {
 			if completedContent, ok := result["content"].(string); ok {
@@ -448,15 +411,14 @@ func (m *MessageComponent) resolveDeferredTemplate(ctx context.Context, text str
 	return out.String(), streamed, nil
 }
 
-// extractMemoryIDs normalises a memory_ids value from inputs /
-// params. Accepts []string and []any[string].
+// extractMemoryIDs 规范化 inputs/params 里的 memory_ids 值。
+// 接受 []string 和 []any[string]。
 func extractMemoryIDs(inputs map[string]any) []string {
 	return extractMemoryIDsFromAny(inputs["memory_ids"])
 }
 
-// extractMemoryIDsFromAny normalises a memory_ids value from any
-// source (DSL params or runtime inputs). Accepts []string and
-// []any[string].
+// extractMemoryIDsFromAny 规范化任意来源（DSL params 或运行期输入）的
+// memory_ids 值。接受 []string 和 []any[string]。
 func extractMemoryIDsFromAny(v any) []string {
 	switch x := v.(type) {
 	case []string:
@@ -513,9 +475,8 @@ func isMessageInfraInput(key string) bool {
 	}
 }
 
-// stringFromStateSys reads a sys-level state value. Returns ""
-// when state or the key is missing. Used by the memory-save path
-// to pull the user's original query.
+// stringFromStateSys 读 sys 级状态值；状态或键缺失时返回 ""。
+// 记忆保存路径用它取用户原始 query。
 func stringFromStateSys(state *runtime.CanvasState, key string) string {
 	if state == nil {
 		return ""
@@ -528,9 +489,8 @@ func stringFromStateSys(state *runtime.CanvasState, key string) string {
 	return ""
 }
 
-// Stream resolves the message and emits the content chunk. The outer
-// Agent SSE handler owns the final [DONE] frame, matching Python's
-// agent_api.py rather than leaking a component-local done marker.
+// Stream 解析消息并发内容 chunk。最终 [DONE] 帧由外层 Agent SSE
+// handler 拥有——对齐 Python agent_api.py，不泄漏组件局部 done 标记。
 func (m *MessageComponent) Stream(ctx context.Context, db *gorm.DB, inputs map[string]any) (<-chan map[string]any, error) {
 	ch := make(chan map[string]any, 16)
 	go func() {
@@ -552,9 +512,8 @@ func (m *MessageComponent) Stream(ctx context.Context, db *gorm.DB, inputs map[s
 	return ch, nil
 }
 
-// Inputs returns the public parameter surface. Field types match
-// the Python DSL contract (text template, stream toggle,
-// memory_save toggle).
+// Inputs 返回公开参数面。字段类型对齐 Python DSL 契约（文本模板、
+// 流式开关、记忆保存开关）。
 func (m *MessageComponent) Inputs() map[string]string {
 	return map[string]string{
 		"text":          "Template string with {{...}} references; resolved against the canvas state.",
@@ -568,7 +527,7 @@ func (m *MessageComponent) Inputs() map[string]string {
 	}
 }
 
-// Outputs returns the resolved template plus optional side-channel outputs.
+// Outputs 返回解析后的模板及可选的侧信道输出。
 func (m *MessageComponent) Outputs() map[string]string {
 	return map[string]string{
 		"content":      "Resolved and rendered message body.",

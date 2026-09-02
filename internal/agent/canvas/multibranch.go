@@ -1,47 +1,22 @@
+// multibranch.go —— Switch / Categorize 的运行时分支接线。
 //
-//  Copyright 2026 The InfiniFlow Authors. All Rights Reserved.
+// Switch 和 Categorize 是控制流组件：产出标识"运行时该走哪个下游子节点"
+// 的 `_next` 输出。父到每个声明子节点的静态 AddInput 边承载数据路径；
+// 本文件加 eino MultiBranch 接线做控制门控，只有被选中的子节点执行：
 //
-//  Licensed under the Apache License, Version 2.0 (the "License");
-//  you may not use this file except in compliance with the License.
-//  You may obtain a copy of the License at
+//  1. 静态 AddInput 边保持接线（被选中子节点能收到父输出作为输入数据）；
+//  2. 对每个有 >= 2 个下游子节点的 Switch / Categorize 父节点，注册
+//     wf.AddBranch(parent, NewGraphBranch(cond, endNodes))；
+//  3. 分支条件从父输出 map 读 in["_next"]，返回被选中的 cpn_id
+//     （无匹配则返回 ""——eino 视为"没有分支被选中，穿过"）。
 //
-//      http://www.apache.org/licenses/LICENSE-2.0
+// ★ eino v0.9.5（compose/workflow.go:413-419）：Workflow 分支只管控制——
+// 被选中的终点节点不会自动收到分支源输出。静态 AddInput 边供数据，
+// 分支供控制门。
 //
-//  Unless required by applicable law or agreed to in writing, software
-//  distributed under the License is distributed on an "AS IS" BASIS,
-//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-//  See the License for the specific language governing permissions and
-//  limitations under the License.
-//
-
-// multibranch.go — runtime branch wiring for Switch / Categorize.
-//
-// Switch and Categorize are control-flow components that produce a
-// `_next` output identifying which downstream child should run at
-// runtime. The static AddInput edges from a parent to every declared
-// child carry the data path; this file adds the eino MultiBranch
-// wiring that gates control so only the chosen child executes:
-//
-//   1. The static AddInput edges stay wired (so the chosen child
-//      receives the parent's output as its input data).
-//   2. For every Switch / Categorize parent with >= 2 downstream
-//      children, we register
-//      wf.AddBranch(parent, NewGraphBranch(cond, endNodes)).
-//   3. The branch's condition reads in["_next"] from the parent's
-//      output map and returns the chosen cpn_id (or "" if no match —
-//      which eino interprets as "no branch chosen, fall through").
-//
-// Per eino v0.9.5 (compose/workflow.go:413-419), Workflow branches
-// are control-only: the chosen end-node does NOT auto-receive the
-// branch source's output. The static AddInput edges supply the data
-// path; the branch supplies the control gate.
-//
-// Categorize is included for symmetry even though its current
-// outputs["_next"] is an empty slice (the chosen category name lives
-// at outputs["category"] and the downstream-routing glue between
-// "category" and "cpn_id" is tracked at the DSL layer). When the
-// glue lands, the existing branch wiring picks it up with no further
-// change here.
+// Categorize 出于对称性被包含，尽管其当前 outputs["_next"] 是空切片
+// （选中类目名在 outputs["category"]，"category" 到 "cpn_id" 的下游路由
+// 胶水在 DSL 层跟踪）。胶水落地后，现有分支接线无需改动即可承接。
 
 package canvas
 
@@ -53,42 +28,35 @@ import (
 	"github.com/cloudwego/eino/compose"
 )
 
-// branchableControlNames is the case-insensitive set of component
-// names that produce a runtime `_next` field and therefore qualify
-// for MultiBranch wiring. Switch emits _next as a single cpn_id
-// string; Categorize emits it as a list (see the package comment
-// above for the current status). The set is small on purpose: adding
-// a new entry requires the component body to emit outputs["_next"]
-// in a shape wireMultiBranches can consume.
+// branchableControlNames 能产出运行时 `_next` 字段、因此符合
+// MultiBranch 接线条件的组件名集合（大小写不敏感）。Switch 的 _next 是
+// 单个 cpn_id 字符串；Categorize 是列表（现状见上面包注释）。集合
+// 有意保持小：新增条目要求组件函数体按 wireMultiBranches 能消费的形状
+// 产出 outputs["_next"]。
 var branchableControlNames = map[string]bool{
 	"switch":     true,
 	"categorize": true,
 }
 
-// isBranchableControl reports whether the component name is one of
-// the runtime-control components that should get a MultiBranch edge
-// from BuildWorkflow. The lookup is case-insensitive to match the
-// rest of the package's name handling (see canvas.go:92).
+// isBranchableControl 判断组件名是否属于应从 BuildWorkflow 获得
+// MultiBranch 边的运行时控制组件。查找大小写不敏感，与包内其他
+// 名字处理一致（见 canvas.go:92）。
 func isBranchableControl(name string) bool {
 	return branchableControlNames[strings.ToLower(name)]
 }
 
-// wireMultiBranches registers an eino MultiBranch on every
-// branchable parent that has at least two declared downstream
-// children. Pass-2 already wired AddInput edges from parent to each
-// child; the branch adds the control-only gating so only the
-// chosen child fires at runtime.
+// wireMultiBranches 给每个"至少有两个声明下游子节点"的可分支父节点
+// 注册 eino MultiBranch。Pass-2 已接好父到每个子节点的 AddInput 边；
+// 分支补上"只管控制"的门，运行时只有被选中的子节点触发。
 //
-// The function is a no-op for:
-//   - parents with < 2 downstreams (a single-child "switch" is
-//     degenerate — no branching needed, AddInput is enough)
-//   - parents inside loop subgraphs (their children live in the
-//     loop's sub-workflow; the outer graph can't see them)
-//   - Loop cpns themselves (their children are inside the loop
-//     body; same reason)
+// 以下情况是空操作：
+//   - 下游 < 2 的父节点（单子节点 "switch" 是退化形态——无需分支，
+//     AddInput 足够）；
+//   - loop 子图内的父节点（其子节点活在 loop 的子工作流里；外层图
+//     看不见它们）；
+//   - Loop 组件自身（其子节点在 loop 体内；同理）。
 //
-// Returns the list of registered (parent cpn_id → end-nodes set)
-// pairs so tests can assert which branches were installed.
+// 返回已注册的 (父 cpn_id → 终点节点集合) 列表，测试可断言装了哪些分支。
 func wireMultiBranches(
 	wf *compose.Workflow[map[string]any, map[string]any],
 	c *Canvas,
@@ -99,19 +67,16 @@ func wireMultiBranches(
 	}
 	var out []branchRegistration
 	for cpnID, comp := range c.Components {
-		// Skip loop body members — they live in a sub-workflow
-		// whose branches must be wired separately by the loop
-		// expansion code, not here.
+		// 跳过 loop 体内成员——它们活在子工作流里，其分支必须由
+		// loop 展开代码单独接线，不在这。
 		if loopMembers[cpnID] {
 			continue
 		}
 		if !isBranchableControl(comp.Obj.ComponentName) {
 			continue
 		}
-		// Filter downstreams: keep only nodes that exist in the
-		// outer graph (i.e. not loop members). A Switch whose
-		// children are all inside a loop body has no
-		// outer-graph routing to install.
+		// 过滤下游：只留外层图里存在的节点（即非 loop 成员）。
+		// 子节点全在 loop 体内的 Switch 无外层路由可装。
 		endNodes := make(map[string]bool, len(comp.Downstream))
 		for _, child := range comp.Downstream {
 			if loopMembers[child] {
@@ -123,12 +88,9 @@ func wireMultiBranches(
 			endNodes[child] = true
 		}
 		if len(endNodes) < 2 {
-			// Either no outer-graph children, or fewer than
-			// two — a MultiBranch with < 2 end-nodes is
-			// either meaningless (0/1 end-nodes) or
-			// equivalent to plain AddInput. Skip it so we
-			// don't pay the branch-evaluation cost when the
-			// DSL doesn't actually branch.
+			// 外层子节点为零或少于两个——< 2 个终点节点的 MultiBranch
+			// 要么无意义（0/1 个终点），要么等价于普通 AddInput。
+			// 跳过，DSL 实际不分叉时不付分支求值开销。
 			continue
 		}
 		endNodesList := make([]string, 0, len(endNodes))
@@ -145,33 +107,25 @@ func wireMultiBranches(
 	return out
 }
 
-// branchRegistration is the public record of a MultiBranch that was
-// installed. Returned by wireMultiBranches for test introspection;
-// the scheduler does not consume it.
+// branchRegistration 已安装 MultiBranch 的公开记录。由
+// wireMultiBranches 返回供测试内省；调度器不消费它。
 type branchRegistration struct {
 	Parent   string
 	EndNodes []string
 }
 
-// makeSwitchBranchCondition returns a GraphMultiBranchCondition that
-// drives eino's MultiBranch from the parent's outputs["_next"]
-// field. The condition:
+// makeSwitchBranchCondition 返回用父节点 outputs["_next"] 驱动 eino
+// MultiBranch 的条件函数。逻辑：
 //
-//  1. Pulls `_next` out of the parent's output map (which the
-//     statePost handler has already written to state.Outputs and
-//     the lambda has returned).
-//  2. When `_next` is a []any (list of cpn_ids — Python's Switch
-//     can route to multiple targets simultaneously), all entries
-//     that are in the endNodes whitelist are returned as the chosen
-//     set. This mirrors the Python behavior where Switch's "to"
-//     field is a list and every listed cpn_id fires.
-//  3. When `_next` is a string (single target — legacy or default
-//     path), it is validated against the whitelist and returned as
-//     a single-entry map.
-//  4. Falls back to an empty map when `_next` is absent, empty, or
-//     contains no whitelisted entries. eino treats an empty chosen
-//     set as "no successor" — the workflow simply doesn't continue
-//     past the parent on this path.
+//  1. 从父输出 map 抠 `_next`（statePost 已把它写进 state.Outputs、
+//     lambda 也已返回）；
+//  2. `_next` 是 []any（cpn_id 列表——Python 的 Switch 可同时路由到
+//     多个目标）时，白名单内的所有条目都作为被选集合返回。对齐
+//     Python 行为：Switch 的 "to" 字段是列表，列出的每个 cpn_id 都触发；
+//  3. `_next` 是 string（单目标——旧版或默认路径）时，校验在白名单后
+//     作为单条目 map 返回；
+//  4. `_next` 缺失、为空或不含白名单条目时回退空 map。eino 把空被选
+//     集合当"无后继"——工作流在该路径不继续过父节点。
 func makeSwitchBranchCondition(endNodes map[string]bool) compose.GraphMultiBranchCondition[map[string]any] {
 	return func(_ context.Context, in map[string]any) (map[string]bool, error) {
 		raw, ok := in["_next"]
@@ -208,17 +162,6 @@ func makeSwitchBranchCondition(endNodes map[string]bool) compose.GraphMultiBranc
 	}
 }
 
-// fmtBranchRegistrations is a small debug helper kept here so the
-// table of installed branches can be dumped from a test or a future
-// verbose-logging path without pulling in fmt at the call site.
-// Currently unused; lives next to its data type for symmetry.
+// fmtBranchRegistrations 小型调试辅助：测试或将来冗长日志路径可直接
+// 打印已装分支的表格。当前未用；与数据类型放一起以求对称。
 func fmtBranchRegistrations(regs []branchRegistration) string {
-	if len(regs) == 0 {
-		return "no multi-branches installed"
-	}
-	var b strings.Builder
-	for _, r := range regs {
-		fmt.Fprintf(&b, "%s -> %v\n", r.Parent, r.EndNodes)
-	}
-	return b.String()
-}

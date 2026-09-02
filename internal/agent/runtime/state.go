@@ -1,33 +1,12 @@
+// runtime —— 画布组件共享的"每运行"状态（黑板）。
 //
-//  Copyright 2026 The InfiniFlow Authors. All Rights Reserved.
+// CanvasState 放在 runtime 包（而不是 canvas 包）是为了打破 import 环：
+// canvas 包负责 DSL 类型与拓扑构建，component 包负责组件实现，两者都
+// 通过本包读写 CanvasState，互相不依赖。
 //
-//  Licensed under the Apache License, Version 2.0 (the "License");
-//  you may not use this file except in compliance with the License.
-//  You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-//  Unless required by applicable law or agreed to in writing, software
-//  distributed under the License is distributed on an "AS IS" BASIS,
-//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-//  See the License for the specific language governing permissions and
-//  limitations under the License.
-//
-
-// runtime — per-run shared state for canvas components.
-//
-// CanvasState lives here (not in the canvas package) so that the
-// builder-side (canvas) and the implementation-side (component) can
-// both depend on it without forming an import cycle. The canvas
-// package owns DSL types and topology building; the component package
-// owns the registered component implementations; both read/write
-// CanvasState through this package.
-//
-// Concurrency: a single sync.RWMutex guards every map in CanvasState
-// (plan §2.5 — "start simple"). Helper methods (GetVar / SetVar /
-// ReadVars / Snapshot / etc.) lock internally; callers should not
-// acquire OutputsLock unless they have a specific reason to extend a
-// critical section.
+// 并发：一把 sync.RWMutex 守 CanvasState 的所有 map。辅助方法
+// （GetVar/SetVar/ReadVars/Snapshot 等）内部已加锁；调用方除非确需扩展
+// 临界区，否则不要再自己拿 OutputsLock。
 package runtime
 
 import (
@@ -43,20 +22,26 @@ import (
 	"github.com/cloudwego/eino/compose"
 )
 
-// CanvasState is the per-run shared state bag that all components read/write
-// through eino's StatePreHandler / StatePostHandler (compose/state.go).
+// CanvasState 单次运行内所有组件共享的"黑板"——每个组件通过 eino 的
+// StatePreHandler 读（输入的 "state" 键）、StatePostHandler 写（输出摊平
+// 进 Outputs 桶）。全程跟着一次 Invoke 生老病死。
 //
-// Fields mirror Python agent/canvas.py:43-95 with these mappings:
-//   - Outputs     : cpn_id -> param_name -> resolved value (variable source)
-//   - Sys         : sys.* namespace (query, user_id, conversation_turns, files)
-//   - Env         : env.* namespace (deployment-time constants)
-//   - Path        : entry-point sequence (Begin nodes)
-//   - History     : conversation history (chat-flow agents)
-//   - Memory      : tool-call summaries kept separate from conversation turns
-//   - Retrieval   : aggregate retrieval result (chunks, doc_aggs)
-//   - Globals     : cross-canvas-instance globals
-//   - CancelFlag  : set when cancel signal received; nodes may poll
-//   - RunID       : unique per-run identifier (used by RunTracker + CheckPointStore)
+// 【字段与含义】（对齐 Python agent/canvas.py:43-95）：
+//   - Outputs   : 输出桶。cpn_id → 参数名 → 已解析值。★模板引用源：
+//     "{{cpnID@key}}" 就是从这里取值（如 {{generate:0@content}}）
+//   - Sys       : sys.* 命名空间。query/user_id/conversation_turns/files/
+//     session_id 等运行期系统变量都住这
+//   - Env       : env.* 命名空间。部署期常量（如 env.counter 计数器）
+//   - Path      : 入口点序列（Begin 节点表）
+//   - History   : 对话历史（user/assistant 轮次）。多轮记忆之一：
+//     每轮结束被 buildPersistedAgentDSL 烤回会话 DSL
+//   - Memory    : 工具调用摘要（Agent 用过哪些工具干了什么的 LLM 总结），
+//     与对话轮次分开存。多轮记忆之二
+//   - Retrieval : 检索结果聚合（chunks、doc_aggs）——引用功能的来源
+//   - Globals   : 跨画布实例的全局变量
+//   - CancelFlag: 收到取消信号时置位；节点可以轮询它提前退出
+//   - RunID     : 每运行唯一标识（RunTracker + CheckPointStore 用）
+//   - SessionID : 会话 ID（多轮锚点）
 type CanvasState struct {
 	mu                 sync.RWMutex
 	activeHistoryIndex int
@@ -73,9 +58,8 @@ type CanvasState struct {
 	SessionID          string
 }
 
-// NewCanvasState returns a zero-valued CanvasState with all maps allocated.
-// The atomic CancelFlag is allocated eagerly so nodes can safely poll it
-// even before any cancel signal has been wired.
+// NewCanvasState 新建黑板：所有 map 预分配，CancelFlag 预先建好——
+// 取消信号还没接线时节点也能安全轮询。
 func NewCanvasState(runID, sessionID string) *CanvasState {
 	s := &CanvasState{
 		activeHistoryIndex: -1,
@@ -95,9 +79,9 @@ func NewCanvasState(runID, sessionID string) *CanvasState {
 	return s
 }
 
-// EnsureSysDate fills sys.date with the current local timestamp when it
-// is missing or blank. Python canvas initializes the same variable with
-// "%Y-%m-%d %H:%M:%S"; keep that wire format for DSL compatibility.
+// EnsureSysDate sys.date 缺失或为空时填当前本地时间戳。
+// Python 侧用同样的 "%Y-%m-%d %H:%M:%S" 格式初始化——保持线上格式
+// 一致以兼容 DSL。
 func (s *CanvasState) EnsureSysDate() {
 	if s == nil {
 		return
@@ -113,23 +97,20 @@ func (s *CanvasState) EnsureSysDate() {
 	s.Sys["date"] = time.Now().Format("2006-01-02 15:04:05")
 }
 
-// init registers CanvasState with eino's internal type registry so
-// that eino's StatePre/Post handler chain (which uses its own
-// InternalSerializer, NOT stdlib encoding/json) recognises the
-// type during the deepCopyState call that fires on every interrupt
-// boundary. eino's serialization registry requires the type to
-// implement both json.Marshaler AND json.Unmarshaler; CanvasState
-// has both (below). Without this init, the interrupt path surfaces
-// "failed to marshal state: unknown type: runtime.CanvasState"
-// and the resume cycle is blocked at the eino layer.
+// init 把 CanvasState 注册进 eino 的内部类型表。eino 的 StatePre/Post
+// 处理链在"每个中断边界"触发的 deepCopyState 里用的是自家
+// InternalSerializer（不是标准库 encoding/json），必须注册过类型它才认。
+// eino 的序列化表要求类型同时实现 json.Marshaler 和 json.Unmarshaler
+// （CanvasState 两者都有，见下）。不注册的话，中断路径会报
+// "failed to marshal state: unknown type: runtime.CanvasState"，
+// 恢复循环在 eino 那一层就被卡死。
 func init() {
 	_ = compose.RegisterSerializableType[CanvasState]("runtime.CanvasState")
 }
 
-// canvasStateJSON is the wire shape used by MarshalJSON / UnmarshalJSON.
-// Defined so the field tags and omitempty semantics are pinned in one
-// place. The CancelFlag is round-tripped as a bool (atomic.Bool can't
-// be marshalled directly without a wrapper).
+// canvasStateJSON 序列化专用结构（MarshalJSON/UnmarshalJSON 的线上形状）。
+// 字段标签与 omitempty 语义集中定义在这一处。CancelFlag 用 bool 往返
+// （atomic.Bool 没有包装器时无法直接序列化）。
 type canvasStateJSON struct {
 	ActiveHistoryIndex *int                      `json:"active_history_index,omitempty"`
 	Outputs            map[string]map[string]any `json:"outputs"`
@@ -145,22 +126,18 @@ type canvasStateJSON struct {
 	SessionID          string                    `json:"session_id"`
 }
 
-// MarshalJSON serialises the CanvasState for eino's StatePre/Post
-// handler chain (which JSON-encodes the state on every node boundary
-// when a StateSerializer is wired) and for Redis-backed CheckPointStore
-// payloads.
+// MarshalJSON 序列化黑板。两个消费者：
+//  1. eino 的 StatePre/Post 处理链（挂了 StateSerializer 时每个节点边界
+//     都会 JSON 编码一次状态）；
+//  2. Redis 后端的 CheckPointStore 载荷。
 //
-// Eino's interrupt path hit "failed to marshal state: unknown
-// type: runtime.CanvasState"
-// because the struct had no MarshalJSON and contained a sync.RWMutex
-// (unexported) + atomic.Bool (indirected; serialises as 8 bytes
-// without explicit handling). This hook defines the stable wire shape
-// (canvasStateJSON) and serialises through it.
+// 之所以要手写：结构体里有未导出的 sync.RWMutex 和非直连的 atomic.Bool
+// （不处理会序列化成 8 字节垃圾），eino 中断路径曾因此报
+// "failed to marshal state: unknown type: runtime.CanvasState"。
+// 本钩子定义稳定的线上形状（canvasStateJSON）并经它序列化。
 //
-// Concurrency: the lock is held briefly while we snapshot the maps;
-// readers may briefly block during marshal, which is fine for the
-// checkpoint/serializer hot path. The lock is read-only so concurrent
-// SetVar calls also proceed.
+// 并发：拍快照期间只持读锁——并发的 SetVar 仍能推进，checkpoint/
+// 序列化热路径上的读者最多短暂阻塞，可接受。
 func (s *CanvasState) MarshalJSON() ([]byte, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -189,11 +166,9 @@ func (s *CanvasState) MarshalJSON() ([]byte, error) {
 	return SafeJSONMarshal(snap)
 }
 
-// UnmarshalJSON restores the wire shape produced by MarshalJSON.
-// Cancels the read-lock contention: an unmarshal only happens during
-// checkpoint restore (rare) and boot, so we accept the lock-acquire
-// cost. atomic.Bool is allocated so the loaded value lands on a real
-// pointer (nodes may poll it concurrently with unmarshal completion).
+// UnmarshalJSON 还原 MarshalJSON 产出的线上形状。只在 checkpoint 恢复
+// （罕见）和启动时发生，锁开销可接受。atomic.Bool 单独分配——载入的
+// 值落在真实指针上（unmarshal 完成前节点也可能并发轮询它）。
 func (s *CanvasState) UnmarshalJSON(b []byte) error {
 	var snap canvasStateJSON
 	if err := json.Unmarshal(b, &snap); err != nil {

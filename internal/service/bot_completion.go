@@ -1,35 +1,17 @@
+// bot_completion.go —— /api/v1/chatbots/<dialog_id>/completions 的
+// SSE 信封写入器 + ChatbotCompletion 服务路径。线上形状由既有 Python
+// api/db/services/conversation_service.py::async_iframe_completion 决定
+// ——读 iframe SDK 的 JS 组件期望精确这个信封，帧里任何键的改动都是
+// 线上契约变更。
 //
-//  Copyright 2026 The InfiniFlow Authors. All Rights Reserved.
-//
-//  Licensed under the Apache License, Version 2.0 (the "License");
-//  you may not use this file except in compliance with the License.
-//  You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-//  Unless required by applicable law or agreed to in writing, software
-//  distributed under the License is distributed on an "AS IS" BASIS,
-//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-//  See the License for the specific language governing permissions and
-//  limitations under the License.
-//
-
-// bot_completion.go is the SSE envelope writer + ChatbotCompletion
-// service path for /api/v1/chatbots/<dialog_id>/completions. The wire
-// shape is dictated by the existing python
-// `api/db/services/conversation_service.py::async_iframe_completion`
-// — JS widgets reading the iframe SDK expect this exact envelope, so
-// any change to the frame keys is a wire-contract change.
-//
-// Frame shape (one JSON object per `data:` line):
+// 帧形状（每 `data:` 行一个 JSON 对象）：
 //
 //	{"code":0,"message":"","data":{"answer":"...","reference":{...},
 //	 "audio_binary":null,"id":"...","session_id":"..."}, ...}
 //
-// The final completion marker is `data: {"code":0,"message":"",
-// "data":true}` followed by the OpenAI-style `data: [DONE]` line
-// that the existing Go SSE writers emit on the production
-// /agents/chat/completions path.
+// 最终完成标记是 `data: {"code":0,"message":"","data":true}`，
+// 后跟 OpenAI 风格的 `data: [DONE]` 行——生产 /agents/chat/completions
+// 路径上既有 Go SSE 写入器就这么发。
 
 package service
 
@@ -51,50 +33,39 @@ import (
 	"ragflow/internal/entity"
 )
 
-// ChatbotSSEFrame is one envelope pushed to the SSE writer by the
-// chatbot completion path. Err takes precedence over Data and is
-// rendered as a python-style {code:500, message:str(e),
-// data:{answer:"**ERROR**..."}} frame.
+// ChatbotSSEFrame chatbot 补全路径推给 SSE 写入器的一个信封。Err 优先
+// 于 Data，渲染成 Python 风格 {code:500, message:str(e),
+// data:{answer:"**ERROR**..."}} 帧。
 type ChatbotSSEFrame struct {
-	// Event is the canvas.RunEvent type ("message",
-	// "user_inputs", "workflow_finished", etc.). It is
-	// forwarded in the SSE envelope as the `event` field so the
-	// front-end can distinguish interactive form pauses from
-	// plain assistant text (PR #14589). The field is omitted
-	// from the JSON when empty to preserve the original wire
-	// shape for callers that do not set it.
+	// Event 是 canvas.RunEvent 类型（"message"、"user_inputs"、
+	// "workflow_finished" 等）。转发进 SSE 信封的 event 字段——前端
+	// 由此区分交互表单暂停与普通助手文本（PR #14589）。为空时不进
+	// JSON，不设它的调用方保持原线上形状。
 	Event     string         `json:"event,omitempty"`
 	Data      string         `json:"-"`
 	Reference map[string]any `json:"-"`
 	SessionID string         `json:"-"`
 	Done      bool           `json:"-"`
 	Err       error          `json:"-"`
-	// Final marks the last answer frame of a turn. It is
-	// rendered as `"final": true` in the data payload so the
-	// front-end replaces (instead of appends to) the
-	// accumulated text — required because the final pipeline
-	// result is decorated (citation markers inserted mid-text)
-	// and no longer a strict superset of the streamed deltas.
+	// Final 标记本轮最后一个答案帧。渲染为 data 载荷里的 "final": true——
+	// 前端改为替换（而非追加）已累计文本。必须这样：最终流水线结果
+	// 被装饰过（引用标记插进文中），不再是流式增量的严格超集。
 	Final bool `json:"-"`
-	// StartToThink / EndToThink bracket the reasoning segment,
-	// rendered as start_to_think / end_to_think so the
+	// StartToThink / EndToThink 括住推理段，渲染成 start_to_think /
+	// end_to_think——前端像 Python 侧一样用 <think> 包裹。
 	// front-end can wrap it in <think> markers like the python
 	// side does.
 	StartToThink bool `json:"-"`
 	EndToThink   bool `json:"-"`
 }
 
-// WriteChatbotFrame emits one python-style SSE frame and flushes the
-// underlying http.ResponseWriter. The frame is `data: <json>\n\n`
-// and is byte-equivalent to the python side so the iframe SDK and
-// existing JS widgets keep working.
+// WriteChatbotFrame 发一帧 Python 风格 SSE 并 flush 底层 http.ResponseWriter。
+// 帧是 `data: <json>\n\n`，与 Python 侧字节等价——iframe SDK 与既有 JS 组件
+// 继续可用。
 //
-// Error frames sanitize the message — internal errors (gorm stack
-// frames, SQL details, storage paths) MUST NOT be echoed to the
-// client. The caller is expected to log the real error via
-// common.Error / zap before publishing the frame; only a generic
-// placeholder is rendered here. Mirrors the python
-// `api/db/services/conversation_service.py` error frame shape.
+// 错误帧对消息脱敏——内部错误（gorm 栈帧、SQL 细节、存储路径）绝不能
+// 回显给客户端。调用方应先经 common.Error/zap 记录真实错误再发帧；这里
+// 只渲染通用占位文案。对齐 Python conversation_service.py 的错误帧形状。
 func WriteChatbotFrame(w http.ResponseWriter, f ChatbotSSEFrame) error {
 	var payload map[string]any
 	if f.Err != nil {
@@ -124,12 +95,9 @@ func WriteChatbotFrame(w http.ResponseWriter, f ChatbotSSEFrame) error {
 		if f.EndToThink {
 			data["end_to_think"] = true
 		}
-		// Forward the canvas event type so the front-end can
-		// distinguish interactive form pauses ("user_inputs",
-		// "workflow_finished") from plain assistant messages
-		// (PR #14589). When Event is empty the field is omitted
-		// from the JSON so existing message frames stay
-		// byte-compatible.
+		// 转发画布事件类型——前端由此区分交互表单暂停（"user_inputs"、
+		// "workflow_finished"）与普通助手消息（PR #14589）。Event 为空
+		// 时不进 JSON，既有消息帧保持字节级兼容。
 		if f.Event != "" {
 			data["event"] = f.Event
 		}
@@ -139,9 +107,8 @@ func WriteChatbotFrame(w http.ResponseWriter, f ChatbotSSEFrame) error {
 			"data":    data,
 		}
 	}
-	// Use SafeJSONMarshal to handle non-serializable values (funcs,
-	// channels) that may have leaked into SSE payload maps. Mirrors
-	// the Python PR #14210 _canvas_json_default fallback in agent_api.py.
+	// SafeJSONMarshal 处理漏进 SSE 载荷 map 的不可序列化值（函数、通道）。
+	// 对齐 Python PR #14210 agent_api.py 的 _canvas_json_default 兑底。
 	b, err := runtime.SafeJSONMarshal(payload)
 	if err != nil {
 		return err
@@ -161,10 +128,9 @@ func WriteChatbotFrame(w http.ResponseWriter, f ChatbotSSEFrame) error {
 	return nil
 }
 
-// WriteDoneFrame emits the python completion marker
-// `data: {"code":0,"message":"","data":true}\n\n` followed by the
-// OpenAI-style `data: [DONE]\n\n` terminator. Used by both bot
-// completion paths.
+// WriteDoneFrame 发 Python 补全标记
+// `data: {"code":0,"message":"","data":true}\n\n`，后跟 OpenAI 风格
+// `data: [DONE]\n\n` 终止符。两条 bot 补全路径共用。
 func WriteDoneFrame(w http.ResponseWriter) error {
 	if _, err := w.Write([]byte(`data: {"code":0,"message":"","data":true}` + "\n\n")); err != nil {
 		return err
@@ -178,26 +144,23 @@ func WriteDoneFrame(w http.ResponseWriter) error {
 	return nil
 }
 
-// WriteChatbotRunEvent translates one canvas.RunEvent into the flat
-// Python agent-canvas SSE envelope:
+// WriteChatbotRunEvent ★把一个 canvas.RunEvent 翻译成扁平的 Python
+// agent-canvas SSE 信封：
 //
 //	data: {"event":"message","message_id":"...","task_id":"session-id",
 //	  "session_id":"session-id","created_at":123,"data":{"content":"..."}}\n\n
 //
-// This is intentionally different from WriteChatbotFrame's legacy
-// chatbot `{code,data:{answer:"..."}}` shape. The agent React page's
-// use-send-message.ts parser appends each parsed object directly to
-// answerList and expects top-level `event` / `message_id`, plus a
-// typed `data` payload. If RunEvent frames are double-wrapped in
-// data.answer, the browser receives bytes but cannot render the
-// assistant message or correlate the current Log panel.
+// 与 WriteChatbotFrame 的老式 chatbot {code,data:{answer:"..."}} 形状
+// 有意不同。agent React 页的 use-send-message.ts 解析器把每个解析出的
+// 对象直接 append 进 answerList，期望顶层 event/message_id 加带类型的
+// data 载荷。若 RunEvent 帧被双层包进 data.answer，浏览器收到字节却
+// 渲不出助手消息，也关联不上当前 Log 面板。
 //
-// The "done" event type emits `data:[DONE]\n\n` (no envelope),
-// matching the Python agent API terminator.
+// "done" 事件类型发 `data:[DONE]\n\n`（无信封）——对齐 Python agent API
+// 终止符。
 //
-// Returns the write error so callers can short-circuit; both nil
-// and io.ErrClosedPipe are tolerated because the client may have
-// disconnected mid-stream.
+// 返回写错误供调用方短路；nil 与 io.ErrClosedPipe 都容忍——客户端可能
+// 中途断连。
 func WriteChatbotRunEvent(w http.ResponseWriter, ev canvas.RunEvent) error {
 	if ev.Type == "done" {
 		_, err := w.Write([]byte("data:[DONE]\n\n"))
@@ -230,9 +193,8 @@ func WriteChatbotRunEvent(w http.ResponseWriter, ev canvas.RunEvent) error {
 			"message": msg,
 			"data":    false,
 		}
-		// Keep the error envelope wire-compatible while still correlating the
-		// failed run. task_id is only the legacy alias; both values are the
-		// same session identity used by the Go runtime and cancel endpoint.
+		// 保持错误信封线上兼容，同时能关联失败运行。task_id 只是旧别名；
+		// 两个值都是 Go 运行时与取消端点用的同一会话身份。
 		if ev.SessionID != "" {
 			payload["task_id"] = ev.SessionID
 			payload["session_id"] = ev.SessionID

@@ -1,19 +1,3 @@
-//
-//  Copyright 2026 The InfiniFlow Authors. All Rights Reserved.
-//
-//  Licensed under the Apache License, Version 2.0 (the "License");
-//  you may not use this file except in compliance with the License.
-//  You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-//  Unless required by applicable law or agreed to in writing, software
-//  distributed under the License is distributed on an "AS IS" BASIS,
-//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-//  See the License for the specific language governing permissions and
-//  limitations under the License.
-//
-
 package handler
 
 import (
@@ -485,6 +469,26 @@ func (h *AgentHandler) ListTemplates(c *gin.Context) {
 // @Param version query string false "version id (default: latest)"
 // @Success 200 {string} string "SSE: data: {...}\\n\\n"
 // @Router /api/v1/agents/{canvas_id}/run [post]
+// RunAgent 处理 POST /api/v1/agents/:canvas_id/run —— 画布调试/运行入口之一。
+//
+// 【整体流程：一次“运行画布”的 HTTP 请求是怎么被吃掉的】
+//  1. 从 JWT 里解出当前用户（GetUser）；
+//  2. 从 URL 取画布 ID、版本号、会话 ID（session_id 缺失时现场生成一个，
+//     会话记录的实际落库由 AgentService.RunAgent 负责）；
+//  3. 调 chatRunner.RunAgent(...) 拿到一个“事件通道”（<-chan canvas.RunEvent），
+//     注意：这一步不会等画布跑完，Agent 在后台协程里边跑边往通道里推事件；
+//  4. 立刻把 HTTP 响应头切换成 SSE（text/event-stream），然后 for-range 消费
+//     事件通道，每收到一件事就写一帧 SSE 给前端——这就是“打字机效果”的来源；
+//  5. 通道关闭（画布结束/暂停/出错）后，若没有发过 done 事件则补发 [DONE]。
+//
+// 【前端拿到的每一帧长什么样】（见 service.WriteChatbotRunEvent）：
+//	data: {
+// 		"event":"message",
+// 		"message_id":"...",
+// 		"session_id":"...",
+// 		"data":{...}
+// 	}
+//	最后一帧：data:[DONE]
 func (h *AgentHandler) RunAgent(c *gin.Context) {
 	user, code, msg := GetUser(c)
 	if code != common.CodeSuccess {
@@ -495,22 +499,33 @@ func (h *AgentHandler) RunAgent(c *gin.Context) {
 	version := c.Query("version")
 	sessionID := c.Query("session_id")
 	if sessionID == "" {
-		// Allocate the ordinary-Agent session identity at the HTTP boundary.
-		// Persistence of the session record remains owned by AgentService.RunAgent.
+		// 在 HTTP 边界就分配普通 Agent 会话身份（session_id）。
+		// 会话记录（api4_conversation 表一行）的实际持久化仍由
+		// AgentService.RunAgent 负责——这里只是先把 ID 造出来，
+		// 保证响应里能带回去给前端做下一轮对话。
 		sessionID = utility.GenerateToken()
 	}
 	userInput := readUserInput(c)
 
+	// ★ 核心一跳：进入服务层。返回值是事件通道，不是最终答案。
+	// 后续所有节点事件（node_started/message/...）都从这个通道流出来。
 	events, err := h.chatRunner.RunAgent(c.Request.Context(), user.ID, canvasID, sessionID, version, userInput, nil)
 	if err != nil {
 		ec, em := mapAgentError(err)
 		common.ResponseWithCodeData(c, ec, nil, em)
 		return
 	}
+	// 切换为 SSE 流式响应。三个头缺一不可：
+	//   Content-Type: text/event-stream —— 告诉浏览器这是 SSE；
+	//   Cache-Control: no-cache        —— 禁止中间层缓冲；
+	//   Connection: keep-alive         —— 保持长连接。
 	c.Writer.Header().Set("Content-Type", "text/event-stream")
 	c.Writer.Header().Set("Cache-Control", "no-cache")
 	c.Writer.Header().Set("Connection", "keep-alive")
 	doneSent := false
+	// 消费事件通道：RunEvent 由画布运行时（canvas.Runner + 各节点钩子）产生。
+	// WriteChatbotRunEvent 负责把一个 RunEvent 序列化成一帧 SSE 并立刻 Flush。
+	// 写失败（客户端断开）时直接返回，让后台协程自然排空。
 	for ev := range events {
 		if ev.Type == "done" {
 			doneSent = true
@@ -524,6 +539,8 @@ func (h *AgentHandler) RunAgent(c *gin.Context) {
 			return
 		}
 	}
+	// 兜底：画布跑完但没发过 done（例如空查询路径），补一个 [DONE] 终止帧，
+	// 否则前端的 SSE 解析循环不会退出。
 	if !doneSent {
 		if err := service.WriteChatbotRunEvent(c.Writer, canvas.RunEvent{Type: "done"}); err != nil {
 			common.Debug("agent run: failed to write [DONE]",
@@ -1195,6 +1212,29 @@ func userInputMeta(userInput any) []zap.Field {
 	return fields
 }
 
+// AgentChatCompletions 处理 POST /api/v1/agents/chat/completions
+// —— 前端 Agent 聊天页发消息的真正主入口（use-send-agent-message.ts 调的就是它）。
+//
+// 【请求体示例】（前端组装，见 use-send-agent-message.ts:326）：
+//	{
+//	  "agent_id": "canvas-123",               // 画布 ID
+//	  "stream": true,                         // 是否 SSE 流式
+//	  "query": "帮我查一下公司请假制度",         // 用户这轮的输入
+//	  "session_id": "sess-abc" | None,          // 第二轮起带上；首轮为空由这里生成
+//	  "files": [{"id":"...","name":"a.pdf"}],   // 上传文件描述符
+//	  "openai-compatible": false                // true 则走 OpenAI 兼容协议分支
+//	}
+//
+// 【本函数的五条分支】：
+//  A. openai-compatible=true  → handleOpenAICompat，输出 OpenAI choices 格式；
+//  B. 画布类别是 dataflow_canvas → runCanvasPipelineDebug：同步跑一次
+//     “数据流水线调试”（不入库、不索引），把解析出的 chunks 直接塞进 JSON 响应；
+//  C. stream=true  → SSE 流式（与 RunAgent 一样边跑边推）★主路径；
+//  D. stream=false → 聚合模式：收完所有事件后在内存里拼出完整答案，一次性返回 JSON；
+//  E. 画布一个事件都没产出（如空查询）→ 至少回传 session_id，让前端下一轮能续上会话。
+//
+// 【userInput 的推导优先级】（1289-1296 行附近）：
+//	query 字段 → inputs（Begin 表单）里第一个有值的输入 → messages 里最后一条用户消息。
 func (h *AgentHandler) AgentChatCompletions(c *gin.Context) {
 	user, code, msg := GetUser(c)
 	if code != common.CodeSuccess {
@@ -1258,6 +1298,7 @@ func (h *AgentHandler) AgentChatCompletions(c *gin.Context) {
 	// Real canvas run — derive userInput from `query` first, then fall
 	// back to the last user message (covers the front-end that posts
 	// running_hint_text without a top-level `query`).
+	// 推导用户输入：优先 query 字段；其次 Begin 表单 inputs；最后 messages。
 	var userInput any = req.Query
 	if req.Query == "" {
 		if extracted := extractUserInputFromFormInputs(req.Inputs); extracted != nil {
@@ -1273,15 +1314,15 @@ func (h *AgentHandler) AgentChatCompletions(c *gin.Context) {
 		}, userInputMeta(userInput)...)...,
 	)
 	if req.SessionID == "" {
-		// Keep the effective session available to the non-stream response and
-		// to the task_id=session_id wire alias even when the canvas emits no
-		// events (for example an empty query).
+		// 首轮对话：会话 ID 在 HTTP 边界生成，保证即使画布一个事件都没发
+		// （例如空查询），非流式响应/task_id 别名里也带着这个会话身份，
+		// 前端下一轮能续上同一会话。
 		req.SessionID = utility.GenerateToken()
 	}
 
-	// req.Files is already normalized to the 1D file list by the
-	// agentFiles unmarshaler. A nil/empty list reaches RunAgent as-is so
-	// its `len(files) > 0` guard sees a file-less run.
+	// ★ 进入服务层（与 RunAgent handler 殊途同归）：
+	// 权限校验 → 会话锁 → 选 DSL → 编译 eino 工作流 → 逐节点执行。
+	// 返回事件通道；Agent 组件的事件/答案增量全部从这里流出来。
 	events, err := h.chatRunner.RunAgent(c.Request.Context(), user.ID, req.AgentID, req.SessionID, "", userInput, req.Files)
 	if err != nil {
 		common.Warn("agent chat completions: RunAgent failed",
@@ -1298,41 +1339,39 @@ func (h *AgentHandler) AgentChatCompletions(c *gin.Context) {
 	}
 
 	if req.Stream {
-		// SSE streaming: one `data: {...}\n\n` frame per canvas RunEvent,
-		// terminated by `data:[DONE]\n\n`. We do NOT emit an SSE `event:`
-		// line — the front-end's use-send-message.ts parser feeds each
-		// `data:` line directly into JSON.parse and expects the event type
-		// in the JSON object's top-level `event` field.
+		// ============ 分支 C：SSE 流式输出 ============
+		// 一帧 SSE =
+		//   data:{"event":"message","message_id":"...","data":{...}}\n\n
+		// 注意：不写 SSE 的 event: 行——前端解析器直接 JSON.parse data: 后的内容，
+		// 事件类型在 JSON 顶层 "event" 字段里（use-send-message.ts 的约定）。
 		c.Writer.Header().Set("Content-Type", "text/event-stream")
 		c.Writer.Header().Set("Cache-Control", "no-cache")
 		c.Writer.Header().Set("Connection", "keep-alive")
 		emitted := false
 		doneSent := false
+		// 消费事件通道直到关闭。事件种类及来源：
+		//   workflow_started / workflow_finished —— buildRunFunc 发；
+		//   node_started / node_finished         —— 每个节点的状态钩子发（前端运行日志）；
+		//   message / message_end                —— Agent/Message 组件发（正文与引用）；
+		//   waiting_for_user                     —— UserFillUp 暂停时发（前端弹表单）；
+		//   cancelled / error                    —— Runner 分类运行结局时发。
 		for ev := range events {
 			emitted = true
 			if ev.Type == "done" {
 				doneSent = true
 			}
-			common.Debug("agent chat completions: streaming event",
-				zap.String("agent_id", req.AgentID),
-				zap.String("session_id", req.SessionID),
-				zap.String("event_type", ev.Type),
-				zap.String("message_id", ev.MessageID),
-			)
 			if err := service.WriteChatbotRunEvent(c.Writer, ev); err != nil {
 				common.Debug("agent chat completions: client disconnected",
 					zap.String("agent_id", req.AgentID),
 					zap.Error(err),
 				)
+				// 客户端断开：停止转发，但后台运行继续排空（见 PushEvent 的丢弃策略）。
 				return
 			}
 		}
 		if !emitted {
-			// Canvas produced no events (e.g. empty query). Echo the
-			// session_id so the client can resume the conversation
-			// (fixes #15169). The [DONE] terminator must be emitted
-			// after this branch because the canvas never sends a
-			// "done" event on this path.
+			// 画布一个事件都没发（如空查询）。至少回传 session_id 让前端能续会话
+			// （issue #15169）。补的 [DONE] 必须在这之后发。
 			common.Info("empty agent output - returning session_id",
 				zap.String("agent_id", req.AgentID),
 				zap.String("session_id", req.SessionID),
@@ -1352,16 +1391,17 @@ func (h *AgentHandler) AgentChatCompletions(c *gin.Context) {
 				)
 			}
 		}
-		common.Debug("agent chat completions: stream closed",
-			zap.String("agent_id", req.AgentID),
-			zap.String("session_id", req.SessionID),
-		)
 		return
 	}
 
-	// Non-streaming: collect all canvas events, accumulate message
-	// content and reference, then return a plain JSON response matching
-	// Python's get_result(data=final_ans) contract (agent_api.py:1616-1676).
+	// ============ 分支 D：非流式聚合 ============
+	// 收完所有事件后在内存里拼出完整答案，返回单个 JSON（对齐 Python
+	// agent_api get_result(data=final_ans) 的契约）：
+	//   - message 事件的 content 逐段累加成 fullContent；
+	//     推理段用 <think></think> 包裹（前端据此渲染“思考过程”折叠区）；
+	//   - reference 从 message_end 事件合并（引用块）；
+	//   - node_finished 里的 outputs.structured 收进 structuredOutput；
+	//   - workflow_finished 里的 usage（token 用量统计）收进 runUsage。
 	var fullContent string
 	reference := map[string]any{}
 	structuredOutput := map[string]any{}
@@ -1376,9 +1416,8 @@ func (h *AgentHandler) AgentChatCompletions(c *gin.Context) {
 				if c, ok := evData["content"].(string); ok {
 					fullContent += c
 				}
-				// Mirror Python agent_api.py: the reasoning segment stays
-				// wrapped in <think> tags in the aggregated answer so the
-				// chat UI can render the "thought" section.
+				// 推理段边界：start_to_think=true 时开一个 <think>，
+				// end_to_think=true 时闭合——聚合答案里保留标记。
 				if st, _ := evData["start_to_think"].(bool); st {
 					fullContent += "<think>"
 				} else if et, _ := evData["end_to_think"].(bool); et {

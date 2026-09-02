@@ -244,17 +244,23 @@ func (r *Runner) getInterruptID(canvasID, sessionID string) string {
 	return id
 }
 
-// Run drives one canvas invocation. See package docstring for the
-// four-outcome flow. The channel is always closed on return so the
-// handler's for-range loop terminates.
+// Run 驱动一次画布调用，返回事件通道（总会在结束时关闭，Handler 的 for-range 因此能正常退出）。
 //
-// Metadata injection: the output channel, message_id, and session_id are
-// injected into root so the RunFunc (buildRunFunc in
-// service/agent.go) can emit intermediate events (workflow_started,
-// node_started, node_finished, workflow_finished) during execution
-// rather than only after the invoke completes. The key names follow
-// the __<name>__ sentinel convention to avoid collisions with
-// runtime DSL keys.
+// 【元数据注入】把输出通道、message_id、session_id 注入 root，让 RunFunc
+// （service 层的 buildRunFunc）能在执行期间随时发中间事件
+// （workflow_started/node_started/node_finished/...），而不是等 Invoke
+// 完才有一坨结果。键名用 __<name>__ 哨兵约定，避免和 DSL 运行时键撞名。
+//
+// 【运行四种结局】（下方 goroutine 里逐一分流）：
+//  1. 正常结束          → RunFunc 自己已发过 message/workflow_finished，这里不再补；
+//  2. 取消 context.Canceled → 发 "cancelled" 事件；
+//  3. 中断（UserFillUp） → 保存中断 ID（供下次恢复），发 "waiting_for_user"
+//     事件（带组件 ID、提示语、输入表单 schema），前端弹表单收集用户输入；
+//  4. 错误              → 发 "error" 事件（内部错误额外打日志）。
+//
+// 【恢复钥匙装配】userInput 非空且本会话存有上次中断 ID 时，把
+// (__resume_interrupt_id__, __resume_data__) 注入 root，RunFunc 据此调用
+// compose.ResumeWithData 恢复工作流（service 层已注入过则跳过）。
 func (r *Runner) Run(
 	ctx context.Context,
 	run RunFunc,
@@ -270,24 +276,20 @@ func (r *Runner) Run(
 		return out
 	}
 
-	// Generate the message identifier the RunFunc and SSE envelope need.
+	// 本轮消息 ID：SSE 信封和 RunFunc 的 emit 都用它。
 	messageID := utility.GenerateToken()
 
-	// Inject the output channel + metadata so the RunFunc can emit
-	// events during execution (workflow_started, node_started,
-	// node_finished, etc.).
+	// 注入"广播天线"：事件通道 + 元数据进 root。
+	// RunFunc 执行中发的所有事件都从这个通道流给 Handler。
 	root["__events__"] = out
 	root["__message_id__"] = messageID
 	root["__session_id__"] = sessionID
 
 	go func() {
 		defer close(out)
-		// Panic sentinel (temporary diagnostic — see plan):
-		// a panic anywhere in the run goroutine used to silently
-		// propagate, leaving the events channel closed-empty so the
-		// SSE handler streamed a 200 OK with an empty body. We now
-		// log the panic value + stack trace so the next failing run
-		// surfaces a clear root cause in the server log.
+		// Panic 看守：运行协程里任何 panic 以前会静默传播，导致事件通道
+		// 空关闭、SSE 回了 200 但 body 全空。现在记下 panic 值 + 栈，
+		// 让失败能在服务端日志里看到明确根因。
 		defer func() {
 			if rec := recover(); rec != nil {
 				common.Error("canvas runner PANIC", fmt.Errorf("%v", rec),
@@ -297,12 +299,8 @@ func (r *Runner) Run(
 			}
 		}()
 
-		// Resume path: inject the previously-saved interrupt id and
-		// the user's follow-up into root. The RunFunc reads these
-		// keys and decorates ctx with compose.ResumeWithData before
-		// invoking the workflow. The sentinel keys are deleted from
-		// root inside the RunFunc — see service/agent.go's
-		// buildRunFunc.
+		// 恢复路径：userInput 非空时取回上次保存的中断 ID，连同用户
+		// 本次输入一起注入 root。RunFunc 消费后会把这俩哨兵键删掉。
 		if userInput != nil {
 			id := r.getInterruptID(canvasID, sessionID)
 			if _, hasPersistedID := root["__resume_interrupt_id__"]; !hasPersistedID && id != "" {
@@ -313,6 +311,7 @@ func (r *Runner) Run(
 
 		_, runErr := safeInvoke(ctx, run, root)
 		if runErr != nil {
+			// ===== 结局 2：取消 =====
 			if errors.Is(runErr, context.Canceled) {
 				push(ctx, out, RunEvent{
 					Type:      "cancelled",
@@ -323,6 +322,10 @@ func (r *Runner) Run(
 				})
 				return
 			}
+			// ===== 结局 3：等待用户输入（UserFillUp 中断）=====
+			// 持久化"根因"中断 ID 供 compose.ResumeWithData 恢复用；
+			// 对前端展示"叶子" user_fill_up 中断 ID——提示才能挂在
+			// 用户看得见的暂停节点上。
 			if ctxs := ExtractInterruptContexts(runErr); len(ctxs) > 0 {
 				// Wait-for-user: persist the real root-cause interrupt id for
 				// compose.ResumeWithData, but keep exposing the leaf
@@ -337,6 +340,8 @@ func (r *Runner) Run(
 					zap.String("display", displayID),
 					zap.String("resume", resumeID))
 				r.saveInterruptID(canvasID, sessionID, resumeID)
+				// waiting_for_user 事件载荷：暂停节点 ID + 提示语 +
+				// 输入表单 schema（前端据此渲染表单）。
 				waiting := WaitingForUserEvent{CpnID: displayID}
 				if ctx := FirstUserFillUpInterrupt(ctxs); ctx != nil {
 					if info, ok := ctx.Info.(map[string]any); ok {
@@ -352,14 +357,16 @@ func (r *Runner) Run(
 				return
 			}
 			if IsInterruptError(runErr) {
-				// Raw InterruptSignal (no wrapped InterruptCtx list
-				// available). Emit a generic waiting_for_user event
-				// without a cpn id — the front-end falls back to
-				// the first paused session it knows about.
+				// 裸 InterruptSignal（没包 InterruptCtx 列表）：发一个
+				// 不带组件 ID 的通用 waiting_for_user，前端回退到
+				// 它知道的第一个暂停会话。
 				r.saveInterruptID(canvasID, sessionID, runErr.Error())
 				push(ctx, out, RunEvent{Type: "waiting_for_user", Data: safeEventJSON(WaitingForUserEvent{CpnID: runErr.Error()}), MessageID: messageID, CreatedAt: nowUnix(), SessionID: sessionID})
 				return
 			}
+			// ===== 结局 4：真实错误 =====
+			// runErrorEvent 把错误分成 config（用户可读，如 LLM 未配置）
+			// 与 internal（服务端问题）两档；internal 档额外打错误日志。
 			errorEvent := runErrorEvent(runErr)
 			if errorEvent.Kind == RunErrorKindInternal {
 				common.Error("canvas runner internal error", runErr,
@@ -375,6 +382,8 @@ func (r *Runner) Run(
 			})
 			return
 		}
+		// ===== 结局 1：正常结束 =====
+		// message/message_end/workflow_finished 已由 buildRunFunc 发过。
 	}()
 
 	return out
@@ -390,8 +399,9 @@ func (r *Runner) Peek(canvasID, sessionID string) bool {
 	return ok
 }
 
-// safeInvoke calls the supplied RunFunc with the managed child context.
-// The RunFunc is expected to honour ctx.Done().
+// safeInvoke 用受管的子 context 调 RunFunc（RunFunc 应遵守 ctx.Done()）。
+// 在真正调用的协程里 recover panic——否则 panic 会直接打崩进程；转换成
+// 普通错误既保住 SSE 契约，Runner 也还能发终止事件。
 func safeInvoke(ctx context.Context, run RunFunc, root map[string]any) (*CanvasState, error) {
 	done := make(chan struct{})
 	var (
@@ -399,11 +409,6 @@ func safeInvoke(ctx context.Context, run RunFunc, root map[string]any) (*CanvasS
 		err   error
 	)
 	go func() {
-		// Recover here, inside the goroutine that actually invokes
-		// `run`. A panic from `run` would otherwise crash the process
-		// before any caller could observe it; converting it into a
-		// regular error keeps the SSE contract intact and lets the
-		// runner emit a terminal `done` event.
 		defer func() {
 			if rec := recover(); rec != nil {
 				common.Error("canvas runner PANIC", fmt.Errorf("%v", rec),
@@ -421,18 +426,18 @@ func safeInvoke(ctx context.Context, run RunFunc, root map[string]any) (*CanvasS
 		}
 		return state, err
 	case <-ctx.Done():
-		// Do not abandon the workflow goroutine. Eino and context-aware
-		// HTTP/tool calls should return promptly once the child context is
-		// cancelled; waiting here keeps the run under management.
+		// 不丢弃工作流协程。eino 和感知 context 的 HTTP/工具调用在子
+		// context 取消后应尽快返回；在这里等它结束才能保持运行受管。
 		<-done
 		return nil, ctx.Err()
 	}
 }
 
-// PushEvent sends an event to the channel, dropping it if the consumer
-// has gone away (handler cancelled). Exported so the service layer's
-// buildRunFunc can emit intermediate workflow events through the
-// same channel during execution.
+// PushEvent 把事件推进通道；消费者（Handler）已离开时直接丢弃。
+// 导出给 service 层 buildRunFunc 用——执行中间的 workflow/node 事件
+// 都走同一个通道。
+// 发送失败的 recover 被有意忽略：Handler 是唯一消费者，它的 for-range
+// 在请求 context 取消时退出，通道可能关闭。
 func PushEvent(ctx context.Context, ch chan<- RunEvent, ev RunEvent) {
 	if ch == nil {
 		return

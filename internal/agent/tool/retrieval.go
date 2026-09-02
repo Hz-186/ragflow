@@ -1,19 +1,3 @@
-//
-//  Copyright 2026 The InfiniFlow Authors. All Rights Reserved.
-//
-//  Licensed under the Apache License, Version 2.0 (the "License");
-//  you may not use this file except in compliance with the License.
-//  You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-//  Unless required by applicable law or agreed to in writing, software
-//  distributed under the License is distributed on an "AS IS" BASIS,
-//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-//  See the License for the specific language governing permissions and
-//  limitations under the License.
-//
-
 package tool
 
 import (
@@ -32,29 +16,25 @@ import (
 	"ragflow/internal/common"
 )
 
-// ErrGraphRAGNotSupported is returned by the Retrieval tool when
-// callers pass use_kg=true. GraphRAG support is a future
-// enhancement; users must either disable use_kg or fall back to
-// the Python Canvas.
+// ErrGraphRAGNotSupported 调用方传 use_kg=true 时 Retrieval 工具返回它。
+// GraphRAG 是未来增强；用户要么关掉 use_kg，要么回退 Python Canvas。
 var ErrGraphRAGNotSupported = errors.New("GraphRAG 检索暂不支持，请使用 Python Canvas 或关闭 use_kg")
 
-// ErrRetrievalServiceMissing is returned when the
-// internal/service/nlp RetrievalService is not registered. Wire a
-// real implementation via SetRetrievalService at boot to resolve.
+// ErrRetrievalServiceMissing 未注册 internal/service/nlp 的
+// RetrievalService 时返回。启动时经 SetRetrievalService 接入真实现即可。
 var ErrRetrievalServiceMissing = errors.New(
 	"Retrieval service not yet implemented (service not registered) — " +
 		"use Python Canvas or implement internal/service/nlp/retrieval.go",
 )
 
-// retrievalToolName preserves the Python typo ("dateset") for backward
-// compatibility with existing Canvas DSLs that reference the tool by name.
+// retrievalToolName 保留 Python 的拼写错误（"dateset"）——向后兼容按名
+// 引用该工具的存量 Canvas DSL。
 const retrievalToolName = "search_my_dateset"
 
 const retrievalToolDescription = "This tool can be utilized for relevant content searching in the datasets."
 
-// retrievalArgs is the JSON schema the model sends into InvokableRun. We
-// accept both `query` (canonical) and `dataset_ids` / `use_kg` etc. to
-// match the Python ToolMeta field set.
+// retrievalArgs 模型发进 InvokableRun 的 JSON schema。同时接受 `query`
+// （标准名）与 `dataset_ids` / `use_kg` 等——对齐 Python ToolMeta 字段集。
 type retrievalArgs struct {
 	Query                    string         `json:"query"`
 	DatasetIDs               []string       `json:"dataset_ids,omitempty"`
@@ -74,9 +54,8 @@ type retrievalArgs struct {
 	EmptyResponse            string         `json:"empty_response,omitempty"`
 }
 
-// retrievalResult is the JSON shape returned to the model. The `_ERROR`
-// field matches the Python tool's output convention; downstream components
-// can pattern-match on it.
+// retrievalResult 返还给模型的 JSON 形状。`_ERROR` 字段对齐 Python 工具
+// 的输出约定；下游组件可对它做模式匹配。
 type retrievalResult struct {
 	FormalizedContent string         `json:"formalized_content"`
 	Chunks            []chunkPayload `json:"chunks,omitempty"`
@@ -84,9 +63,8 @@ type retrievalResult struct {
 	Error             string         `json:"_ERROR,omitempty"`
 }
 
-// chunkPayload is the minimal chunk shape we surface. We don't try to
-// match every Python field — the stub returns empty data; the wired
-// implementation will populate the real shape.
+// chunkPayload 浮出的最小 chunk 形状。不追求对齐 Python 每个字段——
+// stub 返回空数据；接入真实现后填充完整形状。
 type chunkPayload struct {
 	ID         string  `json:"id,omitempty"`
 	Content    string  `json:"content,omitempty"`
@@ -94,23 +72,20 @@ type chunkPayload struct {
 	Score      float64 `json:"score,omitempty"`
 }
 
-// RetrievalTool is the Retrieval tool. It validates the input
-// (rejecting use_kg=true with ErrGraphRAGNotSupported) and
-// dispatches to the registered RetrievalService via
-// SetRetrievalService. When no service is registered, the call
-// surfaces ErrRetrievalServiceMissing.
+// RetrievalTool 检索工具。校验输入（use_kg=true 时拒绝并返
+// ErrGraphRAGNotSupported），并经 SetRetrievalService 分发给已注册的
+// RetrievalService。未注册服务时浮出 ErrRetrievalServiceMissing。
 type RetrievalTool struct {
 	defaults retrievalArgs
 }
 
-// NewRetrievalTool returns a RetrievalTool implementing eino's
-// tool.InvokableTool interface.
+// NewRetrievalTool 返回实现 eino tool.InvokableTool 接口的 RetrievalTool。
 func NewRetrievalTool() *RetrievalTool {
 	return NewRetrievalToolWithDefaults(retrievalArgs{})
 }
 
-// NewRetrievalToolWithDefaults returns a RetrievalTool with node-level
-// defaults from the Agent tool configuration.
+// NewRetrievalToolWithDefaults 返回带节点级默认值的 RetrievalTool（来自
+// Agent 工具配置）。
 func NewRetrievalToolWithDefaults(defaults retrievalArgs) *RetrievalTool {
 	if len(defaults.DatasetIDs) == 0 && len(defaults.KBIDs) != 0 {
 		defaults.DatasetIDs = append([]string(nil), defaults.KBIDs...)
@@ -118,8 +93,8 @@ func NewRetrievalToolWithDefaults(defaults retrievalArgs) *RetrievalTool {
 	return &RetrievalTool{defaults: defaults}
 }
 
-// Info returns the tool's metadata for the chat model. The schema mirrors
-// the Python RetrievalParam ToolMeta (plan, field alignment).
+// Info 返还给对话模型的工具元数据。schema 对齐 Python RetrievalParam
+// ToolMeta（字段级对齐）。
 func (r *RetrievalTool) Info(_ context.Context) (*schema.ToolInfo, error) {
 	return &schema.ToolInfo{
 		Name: retrievalToolName,
@@ -134,10 +109,16 @@ func (r *RetrievalTool) Info(_ context.Context) (*schema.ToolInfo, error) {
 	}, nil
 }
 
-// InvokableRun executes the tool. It validates the input and
-// dispatches to the registered RetrievalService. When no
-// service is registered, the call surfaces
-// ErrRetrievalServiceMissing.
+// InvokableRun ★执行检索。执行序列：
+//  1. 解析模型给的 JSON 参数；
+//  2. mergeDefaults 补节点级默认值（kb_ids→dataset_ids 别名、空值回退）；
+//  3. resolveRetrievalQuery 解析 query 里的 {{...}} 占位符；
+//  4. 快速校验：空 query → EmptyResponse；use_kg → 不支持；
+//     retrieval_from 只认 dataset/memory，各自要求对应 id 列表；
+//  5. resolveRetrievalDatasetIDs/resolveRetrievalFilter 解析变量引用；
+//  6. 组装 RetrievalRequest（含 TenantID）分发给已注册服务；
+//  7. renderChunks 拼 "[ID:x] 内容" 文本 + SetRetrievalReferences 把
+//     chunks 记进黑板供 Agent 引用落地用。
 func (r *RetrievalTool) InvokableRun(ctx context.Context, argumentsInJSON string, _ ...tool.Option) (string, error) {
 	var args retrievalArgs
 	if argumentsInJSON != "" {
@@ -191,11 +172,9 @@ func (r *RetrievalTool) InvokableRun(ctx context.Context, argumentsInJSON string
 	}
 	args.MetaDataFilter = resolvedFilter
 
-	// Dispatch to the registered RetrievalService. When the
-	// default stub is in place, the call surfaces
-	// ErrRetrievalServiceMissing; once a real impl is installed
-	// via SetRetrievalService (or SetSimpleRetrievalService for
-	// dev), the chunks flow through normally.
+	// 分发给已注册的 RetrievalService。默认 stub 在位时浮出
+	// ErrRetrievalServiceMissing；经 SetRetrievalService（或开发用
+	// SetSimpleRetrievalService）接入真实现后 chunks 正常流动。
 	searchReq := RetrievalRequest{
 		Query:                    args.Query,
 		DatasetIDs:               args.DatasetIDs,
@@ -229,9 +208,8 @@ func (r *RetrievalTool) InvokableRun(ctx context.Context, argumentsInJSON string
 	common.Debug("agent retrieval tool: search result",
 		zap.Int("chunks_count", len(chunks)),
 	)
-	// Map the chunks into the result envelope. The retrievalResult
-	// type carries the eino-tool envelope shape (chunkPayload, not
-	// RetrievalChunk), so we translate.
+	// 把 chunks 映射进结果信封。retrievalResult 类型带的是 eino 工具
+	// 信封形状（chunkPayload 而非 RetrievalChunk），所以要转一道。
 	payload := make([]chunkPayload, 0, len(chunks))
 	for _, c := range chunks {
 		payload = append(payload, chunkPayload{
@@ -249,10 +227,8 @@ func (r *RetrievalTool) InvokableRun(ctx context.Context, argumentsInJSON string
 		formalizedContent = args.EmptyResponse
 	}
 	out := retrievalResult{FormalizedContent: formalizedContent, Chunks: payload}
-	// Record chunks into canvas state so the Agent's post-stream
-	// citation grounding call can read them. The recording is
-	// best-effort — when the canvas state is not
-	// attached (e.g. unit tests), we skip silently.
+	// ★把 chunks 记进画布黑板，Agent 的流后引用落地（applyCitationGrounding）
+	// 才能读到。尽力而为——黑板未挂载（如单测）时静默跳过。
 	if state, _, sErr := runtime.GetStateFromContext[*runtime.CanvasState](ctx); sErr == nil && state != nil && len(chunks) > 0 && args.RetrievalFrom == "dataset" {
 		state.SetRetrievalReferences(referenceChunksFromRetrieval(chunks), referenceDocAggsFromRetrieval(chunks))
 	}
@@ -427,10 +403,9 @@ func resolveRetrievalValue(value any, state *runtime.CanvasState) (any, error) {
 	}
 }
 
-// renderChunks concatenates the retrieved chunks into a human-
-// readable content string. Mirrors Python's
-// `kb_prompt(kbinfos, ...)` format: each chunk gets a header
-// line with its ID and document, then the content.
+// renderChunks 把检索到的 chunks 拼成模型可读的内容串。对齐 Python
+// 的 kb_prompt(kbinfos, ...) 格式：每个 chunk 头部标 [ID:x]，后跟内容。
+// 模型据此在答案里插 [ID:N] 引用标记。
 func renderChunks(chunks []RetrievalChunk, query string) string {
 	var sb strings.Builder
 	for _, c := range chunks {
@@ -533,8 +508,7 @@ func referenceDocAggsFromRetrieval(chunks []RetrievalChunk) []map[string]any {
 	return out
 }
 
-// stubJSONWithErr is the (string, error) variant for call sites
-// that need to propagate marshal failures.
+// stubJSONWithErr (string, error) 变体：给需要传递 marshal 失败的调用点。
 func stubJSONWithErr(r retrievalResult) (string, error) {
 	b, err := json.Marshal(r)
 	if err != nil {
@@ -543,9 +517,8 @@ func stubJSONWithErr(r retrievalResult) (string, error) {
 	return string(b), nil
 }
 
-// stubJSON marshals the result and returns it as a string. Marshaling
-// failures are converted to a plain string error so the model can still
-// surface something to the user.
+// stubJSON marshal 结果并返字符串。marshal 失败转普通字符串错误——
+// 模型仍能向用户浮出点东西。
 func stubJSON(r retrievalResult) string {
 	b, err := json.Marshal(r)
 	if err != nil {

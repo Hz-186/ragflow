@@ -91,6 +91,19 @@ Rules:
 - `manual` is never wired into CI or any automated pipeline.
 - `unit` (no tag) must stay free of external-service dependencies so `go test ./...` passes without MySQL/MinIO/ES/Infinity/LLM. The native CGO static libraries (`office_oxide`/`pdfium`/`pdf_oxide`) are still required at build time and are wired automatically by `build.sh --test`; that is expected, not an external service.
 
+## 注释规范（强制）
+
+本仓库的注释以「让没读过这段代码的人一遍看懂」为唯一目标，统一执行以下规则（范例见 `rag/nlp/__init__.py` 中的中文注释风格）：
+
+1. **函数开头注释只写三样东西**：
+   - 一句话说明这个函数是干什么的（用大白话，可以加一个「—— 某某器/某某工」的短比喻）；
+   - **每个传入参数的含义，以及它「长得什么样子」**：用代码块/缩进给出真实的数据结构示例（例如 Go 的 map/slice/struct 字面量、Python 的 dict/list 示例），让读者不用跳去别处就能想象出数据的实际形态；
+   - 返回值「长得什么样子」（同样给出真实结构示例）。
+2. **步骤说明一律写在函数体内对应代码的旁边**：每一步做什么、为什么这么做，写成紧贴该步代码的行内/块内注释。**禁止**把一个函数的所有步骤集中堆在函数开头写成一大段「流程总览」。唯一例外：某一段逻辑本身技术含量很高、三言两语说不清，可以在那一小段代码上方多写几行把它讲透。
+3. **语言要求**：注释用中文，通俗易懂；禁止「这个/那个」式指代、黑话、不加解释的专有名词堆砌。原有英文注释翻译成中文；如果直译后仍然难懂，就改写成能让人看懂的版本。**只改注释，绝不改动任何代码逻辑**。
+4. **批量改写必须分批提交**：一次要改的注释太多时，先列一个待改函数清单（list），然后分多次编辑，每次只替换一部分，保证每次改动可审、可回滚。
+5. **改完必须自查**：每个文件改完后，检查是否还有「函数头大段步骤说明」残留、是否有未翻译的英文注释、是否有被误改的代码；必要时用子代理（subagent）复查，发现问题继续修，直到达标。
+
 ## Working Rules
 - When reviewing documentation or code, inspect the full affected path and report all verifiable findings in one review; do not return after only a few findings and expose further issues in later rounds.
 - When handling review comments, independently verify each substantive claim against the current code or tests before accepting, rejecting, or acting on it.

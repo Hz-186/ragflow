@@ -274,3 +274,6 @@ ragflow_deps/*.zip
 # external DeepDoc testdata, fetched on demand via scripts/fetch_deepdoc_testdata.sh
 # (symlinked into place from ~/.cache/ragflow-testdata; never committed)
 internal/deepdoc/native/testdata
+
+# machine-local caches (e.g. node compile cache); never committed
+.tmp/

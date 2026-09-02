@@ -1,11 +1,9 @@
-// Package canvas — compile entry.
+// Package canvas —— 编译入口。
 //
-// Compile turns a Canvas (DSL) into a CompiledCanvas: a compiled
-// compose.Runnable plus the CheckPointID used at this compile. The
-// compile-time wiring (state pre- / post-handlers, checkpoint store,
-// serializer) is configured here; the actual run path lives in
-// runner.go and the HTTP handler / SSE / RunTracker are wired in
-// internal/service and internal/handler.
+// Compile 把 Canvas（DSL）变成 CompiledCanvas：编译好的 compose.Runnable
+// 加本次编译用的 CheckPointID。编译期接线（状态前后钩子、checkpoint
+// 存储、序列化器）都在这配；真正的运行路径在 runner.go，HTTP/SSE/
+// RunTracker 的装配在 internal/service 与 internal/handler。
 package canvas
 
 import (
@@ -19,153 +17,132 @@ import (
 	"ragflow/internal/common"
 )
 
-// CheckPointStore is the minimal interface Compile needs at compile time.
-// RedisCheckPointStore satisfies this; tests can pass any in-memory
-// implementation. Matches eino's compose.CheckPointStore (an alias for
-// core.CheckPointStore) and adds a Delete method.
+// CheckPointStore 编译期需要的 checkpoint 最小接口。
+// RedisCheckPointStore 实现它；测试可以传任何内存实现。
+// 对齐 eino 的 compose.CheckPointStore（core.CheckPointStore 的别名）,
+// 额外加一个 Delete 方法。
 type CheckPointStore interface {
 	Get(ctx context.Context, id string) ([]byte, bool, error)
 	Set(ctx context.Context, id string, payload []byte) error
 	Delete(ctx context.Context, id string) error
 }
 
-// StateSerializer is the minimal interface Compile needs. The
-// CanvasStateSerializer in this package satisfies this. Mirrors
-// eino's compose.Serializer (Marshal/Unmarshal, no context).
+// StateSerializer 编译期需要的序列化器最小接口。
+// 本包的 CanvasStateSerializer 实现它。对齐 eino 的 compose.Serializer
+// （Marshal/Unmarshal，无 context）。
 type StateSerializer interface {
 	Marshal(v any) ([]byte, error)
 	Unmarshal(data []byte, v any) error
 }
 
-// CompiledCanvas is the compiled runtime representation of a Canvas DSL.
-// Workflow is the eino Runnable; CheckPointID is the eino checkpoint
-// identifier for this compile.
+// CompiledCanvas 画布 DSL 编译后的运行时表示。
+// Workflow 是 eino Runnable；CheckPointID 是本次编译的 checkpoint 标识。
 type CompiledCanvas struct {
 	Workflow     compose.Runnable[map[string]any, map[string]any]
 	CheckPointID string
 }
 
-// CompileOptions bundles the optional collaborators the compile entry needs.
-// All fields are optional; nil/zero means "skip that wire".
+// CompileOptions 编译入口的可选协作者集合。全字段可选；nil/零值表示
+// "该项不接线"。
 type CompileOptions struct {
 	Store      CheckPointStore
 	Serializer StateSerializer
-	// InterruptBefore / InterruptAfter are passed straight through to
-	// compose.WithInterruptBeforeNodes / WithInterruptAfterNodes.
+	// InterruptBefore / InterruptAfter 直通
+	// compose.WithInterruptBeforeNodes / WithInterruptAfterNodes。
 	InterruptBefore []string
 	InterruptAfter  []string
-	// CheckPointID is the stable eino checkpoint identifier. Unlike
-	// eino's compose.WithCheckPointID (a run-time Option applied at
-	// Workflow.Invoke), this is a compile-time descriptor: Compile cannot
-	// call compose.WithCheckPointID (the option type is wrong for a
-	// GraphCompileOption), so it only records the id on the returned
-	// CompiledCanvas — the caller threads it to Invoke. Use a stable value (for
-	// example a session-derived run id) so resuming hits the
-	// same Redis checkpoint (agent:cp:{id}). When empty,
-	// CompiledCanvas.CheckPointID stays empty and the caller must supply
-	// its own id (or omit it for a fresh per-run checkpoint).
+	// CheckPointID 稳定的 eino checkpoint 标识。与 eino 的
+	// compose.WithCheckPointID（Invoke 时的运行时 Option）不同，这是
+	// 编译期描述符：Compile 无法调 compose.WithCheckPointID（选项类型
+	// 对 GraphCompileOption 不匹配），所以只把 id 记在返回的
+	// CompiledCanvas 上——调用方再把它传给 Invoke。用稳定值（如按会话
+	// 派生的 run id）恢复时才能命中同一个 Redis checkpoint
+	// （agent:cp:{id}）。留空则 CompiledCanvas.CheckPointID 为空,
+	// 调用方自己给 id（或省略以获得全新每运行 checkpoint）。
 	CheckPointID string
-	// InterruptAfterNonTerminal, when true, makes Compile compute the
-	// non-terminal node ids internally (components with out-degree > 0)
-	// and register compose.WithInterruptAfterNodes on them — the caller
-	// does not enumerate them. UserFillUp nodes are excluded (see §4.2.b)
-	// because they already emit their own compose.Interrupt;
-	// double-registering the same node for two interrupt sources would
-	// break resume. Terminal nodes (no downstream) are excluded so the
-	// graph does not pause on completion and force an extra, needless
-	// ResumeWithData round.
+	// InterruptAfterNonTerminal 为 true 时，Compile 内部算出"非终点节点"
+	// （出度 > 0 的组件）并给它们注册 compose.WithInterruptAfterNodes,
+	// 调用方不用枚举。UserFillUp 节点被排除（见 §4.2.b）——它们已经
+	// 自己发 compose.Interrupt；同一节点注册两个中断源会把恢复搞坏。
+	// 终点节点（无下游）也被排除——图不能在完成时暂停，强迫多来一轮
+	// 没必要的 ResumeWithData。
 	InterruptAfterNonTerminal bool
-	// OverrideParams is a run-level override map keyed by cpnID. Each
-	// component's `params` is merged only with its own entry
-	// (an arbitrary string-keyed map); the override wins on top-level key
-	// collision. Components absent from the
-	// map are left untouched. Used by the ingestion pipeline so a single
-	// Pipeline.Run can override the DSL-baked component params without
-	// mutating the shared *Canvas (see node_body.go applyOverrideParams).
+	// OverrideParams 运行级参数覆盖表，按 cpnID 键控。每个组件的
+	// params 只与自己的条目合并（任意 string 键控 map）；顶层键冲突时
+	// 覆盖项赢。表里没有的组件不受影响。供 ingestion 流水线使用：
+	// 单次 Pipeline.Run 覆盖 DSL 固化的组件参数而不改共享 *Canvas
+	// （见 node_body.go applyOverrideParams）。
 	OverrideParams map[string]any
 }
 
-// CompileOption mutates a CompileOptions before the compile runs.
+// CompileOption 编译前修改 CompileOptions。
 type CompileOption func(*CompileOptions)
 
-// WithCheckPointStore attaches a CheckPointStore to compile.
+// WithCheckPointStore 给编译挂 CheckPointStore。
 func WithCheckPointStore(s CheckPointStore) CompileOption {
 	return func(o *CompileOptions) { o.Store = s }
 }
 
-// WithStateSerializer attaches a StateSerializer to compile.
+// WithStateSerializer 给编译挂 StateSerializer。
 func WithStateSerializer(s StateSerializer) CompileOption {
 	return func(o *CompileOptions) { o.Serializer = s }
 }
 
-// WithInterruptBefore configures compose.WithInterruptBeforeNodes.
+// WithInterruptBefore 配置 compose.WithInterruptBeforeNodes。
 func WithInterruptBefore(nodes []string) CompileOption {
 	return func(o *CompileOptions) { o.InterruptBefore = nodes }
 }
 
-// WithInterruptAfter configures compose.WithInterruptAfterNodes.
+// WithInterruptAfter 配置 compose.WithInterruptAfterNodes。
 func WithInterruptAfter(nodes []string) CompileOption {
 	return func(o *CompileOptions) { o.InterruptAfter = nodes }
 }
 
-// WithCheckPointID sets the stable checkpoint id recorded on the returned
-// CompiledCanvas. Unlike eino's compose.WithCheckPointID (a run-time
-// Option), this is a compile-time descriptor: Compile stores the id so the
-// caller can pass it to Workflow.Invoke. Pass a stable, session-derived id
-// so resuming loads the same Redis
-// checkpoint (agent:cp:{id}).
+// WithCheckPointID 把稳定的 checkpoint id 记到返回的 CompiledCanvas 上。
+// 与 eino 的 compose.WithCheckPointID（运行时 Option）不同，这是编译期
+// 描述符：Compile 存下 id，调用方传给 Workflow.Invoke。传稳定的、按会话
+// 派生的 id，恢复时才能加载同一个 Redis checkpoint（agent:cp:{id}）。
 func WithCheckPointID(id string) CompileOption {
 	return func(o *CompileOptions) { o.CheckPointID = id }
 }
 
-// WithInterruptAfterNonTerminalCpn registers an after-node interrupt on
-// every non-terminal component (out-degree > 0) automatically. The set is
-// computed inside Compile from the Canvas topology, so callers can't pass
-// the wrong list (e.g. all cpnIDs, which would also interrupt terminal
-// nodes and force an extra needless ResumeWithData round). UserFillUp
-// nodes are excluded (§4.2.b). See computeNonTerminalCpnIDs for the exact
-// selection rules.
+// WithInterruptAfterNonTerminalCpn 自动给每个非终点组件（出度 > 0）注册
+// 后置中断。集合由 Compile 从画布拓扑内部算出，调用方传不了错误清单
+// （比如全量 cpnID 会连终点节点也中断，多出一轮没必要的 ResumeWithData）。
+// UserFillUp 节点被排除（§4.2.b）。精确选择规则见 computeNonTerminalCpnIDs。
 func WithInterruptAfterNonTerminalCpn() CompileOption {
 	return func(o *CompileOptions) { o.InterruptAfterNonTerminal = true }
 }
 
-// WithOverrideParams attaches a run-level override map (keyed by
-// cpnID) to compile. Each component's params are merged with
-// its own entry at compile time (run-level wins on key collision, see
-// node_body.go applyOverrideParams). Passing nil is a no-op.
+// WithOverrideParams 给编译挂运行级参数覆盖表（按 cpnID 键控）。
+// 每个组件的 params 在编译期与自己的条目合并（键冲突时运行级赢，见
+// node_body.go applyOverrideParams）。传 nil 是空操作。
 func WithOverrideParams(m map[string]any) CompileOption {
 	return func(o *CompileOptions) { o.OverrideParams = m }
 }
 
-// Compile builds the eino Workflow from the Canvas and returns the
-// compiled Runnable. State pre- / post-handlers are wired inside BuildWorkflow
-// (see scheduler.go). Checkpoint store + serializer are wired here as
-// compile-time options (compose.GraphCompileOption).
+// Compile 从 Canvas 构建 eino Workflow 并返回编译好的 Runnable。
+// 状态前后钩子在 BuildWorkflow 里接线（见 scheduler.go）；
+// checkpoint 存储 + 序列化器在此作为编译期选项（GraphCompileOption）接线。
 //
-// IMPORTANT: eino v0.9.2 option split (plan §2.6 fix):
+// ★ EINO 编译模版：eino v0.9.2 起选项分两类，不能混：
 //
-//	WithStatePreHandler / WithStatePostHandler  -> GraphAddNodeOpt (NODE option)
-//	WithCheckPointStore / WithSerializer        -> GraphCompileOption
+//	WithStatePreHandler / WithStatePostHandler  → GraphAddNodeOpt（节点级）
+//	WithCheckPointStore / WithSerializer        → GraphCompileOption（编译级）
 //
-// Mixing them up makes the call fail to compile. We do not accept
-// GraphCompileOption from the caller directly — that would let them pass
-// the wrong option type. The CompileOption indirection keeps the
-// GraphCompileOption surface inside this file.
+// 不直接收调用方的 GraphCompileOption——那会让他们传错选项类型。
+// CompileOption 间接层把 GraphCompileOption 的面收在本文件内。
 func Compile(ctx context.Context, c *Canvas, opts ...CompileOption) (*CompiledCanvas, error) {
 	cfg := CompileOptions{}
 	for _, o := range opts {
 		o(&cfg)
 	}
 
-	// Decoder-boundary guard: if the caller handed us a Canvas
-	// whose `components` still contains LoopItem or IterationItem
-	// entries, they bypassed dsl.NormalizeForCanvas (the only
-	// supported decoder path). The fold step never ran, so the
-	// runtime will see legacy child names and the workflow below
-	// will misbehave. Surface a visible stderr warning so the
-	// regression is observable — this is intentionally a log
-	// rather than a panic, because internal drivers (tests,
-	// fixtures) may exercise the path with raw components.
+	// 解码边界看守：调用方给的 Canvas 若 `components` 里还有 LoopItem/
+	// IterationItem 条目，说明绕过了 dsl.NormalizeForCanvas（唯一受支持
+	// 的解码路径）——折叠步骤没跑，运行时会看到旧版子节点名，下面的
+	// 工作流会行为异常。打一条可见日志让回归可观测——有意用日志而不用
+	// panic：内部驱动（测试、fixture）可能带原始组件走这条路。
 	if c != nil {
 		var n int
 		for _, comp := range c.Components {
@@ -179,26 +156,21 @@ func Compile(ctx context.Context, c *Canvas, opts ...CompileOption) (*CompiledCa
 		}
 	}
 
-	// S3 (plan §4.2.b 方案 A): ingestion resume mode forbids UserFillUp
-	// nodes. A UserFillUp node emits its own compose.Interrupt
-	// (wait-for-user); the pipeline resume loop (pipeline.go runResumable)
-	// classifies every interrupt via IsInterruptError and auto-resumes with
-	// nil data — so a UserFillUp pause would be silently skipped instead of
-	// waiting for a human. Reject at compile time so the mis-classification
-	// can never occur. The non-terminal-after filter (computeNonTerminalCpnIDs)
-	// already keeps UserFillUp out of the after-node set; this is a hard
-	// guard layered on top (plan §8 step 5). Checked before BuildWorkflow so
-	// the guard fires on DSL content regardless of whether the graph builds.
+	// S3（§4.2.b 方案 A）：ingestion 恢复模式禁止 UserFillUp 节点。
+	// UserFillUp 自己发 compose.Interrupt（等用户）；流水线恢复循环
+	// （pipeline.go runResumable）会把每个中断都按 IsInterruptError
+	// 分类并自动用 nil 数据恢复——UserFillUp 的暂停会被静默跳过而不是
+	// 等人。编译期直接拒绝，误分类根本不会发生。非终点后置过滤器
+	// （computeNonTerminalCpnIDs）已把 UserFillUp 排除在后置中断集合外；
+	// 这里在其上再加一道硬闸（§8 第 5 步）。放在 BuildWorkflow 之前，
+	// 无论图能不能建得起，闸都按 DSL 内容触发。
 	//
-	// The same guard also forbids legacy no-op nodes (e.g. "ExitLoop", see
-	// legacyNoOpNames / isLegacyNoOp). A no-op node routes to an echo body
-	// that never emits TrackProgress, so it would still be counted in
-	// ingestion_task.component_total yet never report progress — leaving the
-	// aggregate percent permanently below 100% (plan §8 "known
-	// inconsistency"). Forbidding it keeps component_total == "components
-	// that report progress", so percent can reach 100% and the
-	// resume/percent invariant holds. Ingestion DSLs must consist solely of
-	// progress-reporting components.
+	// 同一道闸也禁止 legacy 空操作节点（如 "ExitLoop"，见
+	// legacyNoOpNames/isLegacyNoOp）。空操作节点走回显函数体，从不发
+	// TrackProgress，却仍被计入 ingestion_task.component_total——聚合
+	// 百分比永远到不了 100%（§8 "已知不一致"）。禁止它保持
+	// component_total == "会上报进度的组件数"，百分比能到 100%,
+	// 恢复/百分比不变式成立。ingestion DSL 只能由上报进度的组件组成。
 	if cfg.InterruptAfterNonTerminal && c != nil {
 		var bad []string
 		bad = append(bad, AutoDiscoverUserFillUpIDs(c)...)
@@ -212,10 +184,9 @@ func Compile(ctx context.Context, c *Canvas, opts ...CompileOption) (*CompiledCa
 		}
 	}
 
-	// Thread the run-level override (if any) into ctx so each
-	// component's params is merged with its own entry inside
-	// buildNodeBody. The override is keyed by cpnID; the canvas package
-	// never imports ingestion.
+	// 把运行级覆盖表（若有）穿进 ctx，buildNodeBody 里每个组件的
+	// params 与自己的条目合并。覆盖按 cpnID 键控；canvas 包不 import
+	// ingestion。
 	if cfg.OverrideParams != nil {
 		ctx = withOverrideParams(ctx, cfg.OverrideParams)
 	}
@@ -227,10 +198,10 @@ func Compile(ctx context.Context, c *Canvas, opts ...CompileOption) (*CompiledCa
 
 	compileOpts := make([]compose.GraphCompileOption, 0, 4)
 	if cfg.Store != nil {
-		// eino's compose.WithCheckPointStore expects compose.CheckPointStore
-		// (no Delete). Our CheckPointStore adds Delete; pass an adapter
-		// that drops it. RunTracker doesn't call Delete on this
-		// path — it deletes the agent:cp:* key via a separate Redis call.
+		// eino 的 compose.WithCheckPointStore 要求 compose.CheckPointStore
+		// （无 Delete）。我们的 CheckPointStore 多了 Delete；传一个扔掉
+		// Delete 的适配器。RunTracker 不在这条路上调 Delete——它删除
+		// agent:cp:* 键走单独的 Redis 调用。
 		compileOpts = append(compileOpts, compose.WithCheckPointStore(checkPointAdapter{cfg.Store}))
 	}
 	if cfg.Serializer != nil {
@@ -239,11 +210,9 @@ func Compile(ctx context.Context, c *Canvas, opts ...CompileOption) (*CompiledCa
 	if len(cfg.InterruptBefore) > 0 {
 		compileOpts = append(compileOpts, compose.WithInterruptBeforeNodes(cfg.InterruptBefore))
 	}
-	// Merge the caller-supplied InterruptAfter list with the
-	// internally-computed non-terminal set (when requested). The
-	// computed set excludes UserFillUp nodes (§4.2.b); the caller list is
-	// trusted verbatim. Dedupe so a node isn't registered twice in one
-	// WithInterruptAfterNodes call.
+	// 调用方给的 InterruptAfter 清单与内部算出的非终点集合（若要求了）
+	// 合并。算出的集合排除 UserFillUp（§4.2.b）；调用方清单按原样信任。
+	// 去重，避免同一节点在同一次 WithInterruptAfterNodes 里注册两次。
 	after := append([]string{}, cfg.InterruptAfter...)
 	if cfg.InterruptAfterNonTerminal {
 		after = append(after, computeNonTerminalCpnIDs(c)...)
@@ -260,19 +229,15 @@ func Compile(ctx context.Context, c *Canvas, opts ...CompileOption) (*CompiledCa
 	return &CompiledCanvas{Workflow: runnable, CheckPointID: cfg.CheckPointID}, nil
 }
 
-// computeNonTerminalCpnIDs returns the cpnIDs of every component with at
-// least one downstream edge (out-degree > 0). These are the nodes the
-// "interrupt-after-node" resume strategy must pause on: any node that has
-// work after it.
+// computeNonTerminalCpnIDs 返回所有"至少有一条下游边"（出度 > 0）的
+// 组件 ID。"节点后中断"恢复策略必须在这些节点上暂停：后面还有活的
+// 任何节点。
 //
-// Terminal nodes (no downstream) are intentionally excluded — interrupting
-// them would make Invoke return an interrupt error instead of a completion,
-// and force an extra needless ResumeWithData round before the graph truly
-// finishes.
+// 终点节点（无下游）有意排除——中断它们会让 Invoke 返回中断错误而非
+// 完成结果，逼着图真正结束前多来一轮没必要的 ResumeWithData。
 //
-// UserFillUp nodes are excluded (§4.2.b): they already emit their own
-// compose.Interrupt and must not be registered for a second, conflicting
-// interrupt source. Double-registering the same node breaks resume.
+// UserFillUp 被排除（§4.2.b）：它们已自己发 compose.Interrupt，不能再
+// 注册第二个冲突的中断源。同一节点双重注册会破坏恢复。
 func computeNonTerminalCpnIDs(c *Canvas) []string {
 	if c == nil {
 		return nil
@@ -293,10 +258,9 @@ func computeNonTerminalCpnIDs(c *Canvas) []string {
 	return ids
 }
 
-// dedupeStrings returns in with duplicate entries removed, preserving
-// first-seen order. Used to merge the computed non-terminal set with the
-// caller-supplied InterruptAfter list without registering a node twice in
-// the same WithInterruptAfterNodes call.
+// dedupeStrings 去重并保持首见顺序。用于合并"内部算出的非终点集合"
+// 与"调用方给的 InterruptAfter 清单"，避免同一节点在同一
+// WithInterruptAfterNodes 调用里注册两次。
 func dedupeStrings(in []string) []string {
 	if len(in) == 0 {
 		return in
@@ -313,9 +277,8 @@ func dedupeStrings(in []string) []string {
 	return out
 }
 
-// checkPointAdapter drops the Delete method that compose.CheckPointStore
-// does not declare. The RedisCheckPointStore in this package has deleted;
-// the adapter is a thin passthrough.
+// checkPointAdapter 扔掉 compose.CheckPointStore 没声明的 Delete 方法。
+// 本包 RedisCheckPointStore 有 Delete；适配器是薄透传。
 type checkPointAdapter struct{ inner CheckPointStore }
 
 func (a checkPointAdapter) Get(ctx context.Context, id string) ([]byte, bool, error) {
@@ -325,10 +288,8 @@ func (a checkPointAdapter) Set(ctx context.Context, id string, payload []byte) e
 	return a.inner.Set(ctx, id, payload)
 }
 
-// serializerAdapter exposes the eino-shaped Serializer (Marshal/Unmarshal,
-// no context). The CanvasStateSerializer in this package matches the
-// same shape, so
-// the adapter is a passthrough.
+// serializerAdapter 暴露 eino 形状的 Serializer（Marshal/Unmarshal，无
+// context）。本包 CanvasStateSerializer 同形，适配器是透传。
 type serializerAdapter struct{ inner StateSerializer }
 
 func (a serializerAdapter) Marshal(v any) ([]byte, error)   { return a.inner.Marshal(v) }

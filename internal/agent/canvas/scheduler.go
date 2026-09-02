@@ -128,25 +128,22 @@ func isKnownPrimitive(name string) bool {
 	return false
 }
 
-// statePre is the StatePreHandler wired onto every node. It injects the
-// current per-cpn Outputs into the input map under the "state" key so the
-// lambda body can read its inputs without re-fetching from ctx. We don't
-// mutate the user's input map — we shallow-copy.
+// statePre 每个节点执行前的状态钩子（StatePreHandler）：
+//  1. 把黑板（eino 每运行态 CanvasState）的最新快照注入输入 map 的 "state" 键——
+//     组件体直接从 in["state"] 读上游产出，不用再从 ctx 里捞；
+//  2. 双黑板同步：eino 的每运行态 state 与 service 层挂在 ctx 上的 ctxState
+//     是两个对象（WithGenLocalState 会各建一份），这里做双向搬运——
+//     输出桶与命名空间用 eino 态覆盖 ctx 态；历史/记忆/SysHistory 取
+//     "更长的一份"，保证下游组件无论从哪个对象读都看到同一份最新数据。
 //
-// The context-attached *CanvasState is the canonical store for
-// components (Begin / Message / LLM all read it via
-// runtime.GetStateFromContext). When the caller attached one to the
-// context (orchestrator path or test setup), we sync the eino
-// per-run state's outputs into it so downstream nodes see the
-// upstream outputs. The eino state is still useful as a fallback
-// when no context state is attached.
+// 注意不改用户的输入 map——浅拷贝一份再塞 state 键。
 func statePre(ctx context.Context, in map[string]any, state *CanvasState) (map[string]any, error) {
 	if in == nil {
 		in = map[string]any{}
 	}
-	// Sync the eino state → context state when both exist so
-	// downstream components reading via GetStateFromContext see
-	// the upstream outputs the state post handler already wrote.
+	// eino 态 → ctx 态的双向同步（两个对象都存在且不同一实例时）：
+	// 下游组件经 GetStateFromContext 读的是 ctxState，必须让它看到
+	// statePost 写进 eino 态的上游产出。
 	if state != nil {
 		if ctxState, _, _ := runtime.GetStateFromContext[*runtime.CanvasState](ctx); ctxState != nil && ctxState != state {
 			localHistory := state.SnapshotHistory()
@@ -189,6 +186,7 @@ func statePre(ctx context.Context, in map[string]any, state *CanvasState) (map[s
 			}
 		}
 	}
+	// 快照塞进副本的 "state" 键，组件体从 in["state"] 读取。
 	snapshot := state.Snapshot()
 	out := make(map[string]any, len(in)+1)
 	for k, v := range in {
@@ -198,28 +196,27 @@ func statePre(ctx context.Context, in map[string]any, state *CanvasState) (map[s
 	return out, nil
 }
 
-// statePost is the StatePostHandler — it flattens the lambda's output
-// keys into the per-cpn Outputs bucket keyed by the cpn_id passed
-// through the input map ("cpn_id" key, injected by BuildWorkflow's
-// per-node wrapper).
+// statePost 节点执行后的状态钩子（StatePostHandler）：
+// 把 Lambda 输出的顶层键摊平进该组件的输出桶 Outputs[cpnID][key]。
+// cpn_id 由 BuildWorkflow 的节点包装器塞进输出 map（"__cpn_id__" 键）。
 //
-// Storage convention: each top-level key in the component's output
-// map lands as Outputs[cpnID][key]. v1 templates reference these as
-// {{cpnID@key}} (e.g. {{generate:0@content}}). Nesting the entire
-// payload under Outputs[cpnID]["result"] would force every template
-// to use {{cpnID@result.content}} which the v1 DSL never writes.
+// 【存储约定】组件输出 map 的每个顶层键 → Outputs[cpnID][key]。
+// v1 模板按 {{cpnID@key}} 引用（如 {{generate:0@content}}）。若把整个
+// 载荷嵌在 Outputs[cpnID]["result"] 下，模板就得写
+// {{cpnID@result.content}}——v1 DSL 从不这么写。
 //
-// The write is mirrored into the context-attached *CanvasState when
-// one is present, so downstream components that read state via
-// runtime.GetStateFromContext (Begin / Message / LLM) see the
-// upstream output. The eino per-run state stays the source of truth
-// for the snapshot exposed via statePre.
+// 写入同时镜像到 ctx 上挂的 ctxState（若存在）——下游通过
+// GetStateFromContext 读状态的组件（Begin/Message/LLM）才能看到上游
+// 产出。eino 每运行态仍是 statePre 暴露快照的权威数据源。
 func statePost(ctx context.Context, out map[string]any, state *CanvasState) (map[string]any, error) {
+	// 从输出 map 里取 BuildWorkflow 注入的组件 ID（无 ID 则无需摊平）。
 	cpnID, _ := out["__cpn_id__"].(string)
 	if cpnID == "" {
 		return out, nil
 	}
 	ctxState, _, _ := runtime.GetStateFromContext[*runtime.CanvasState](ctx)
+	// 摊平：跳过 __cpn_id__/state/__legacy_noop__ 三个内部键，
+	// 其余顶层键写进 eino 态和 ctx 态两个黑板的 Outputs[cpnID][key]。
 	for k, v := range out {
 		if k == "__cpn_id__" || k == "state" || k == "__legacy_noop__" {
 			continue
@@ -231,6 +228,8 @@ func statePost(ctx context.Context, out map[string]any, state *CanvasState) (map
 			ctxState.SetVar(cpnID, k, v)
 		}
 	}
+	// 反向同步：ctx 态的 Sys/Env/Globals/History/Memory 回写到 eino 态，
+	// 保持两块黑板一致（组件可能直接更新了 ctx 态）。
 	if ctxState != nil && state != nil && ctxState != state {
 		sysNS, envNS, globalsNS := ctxState.SnapshotNamespaces()
 		state.Sys = sysNS
@@ -270,9 +269,10 @@ func sanitizeNodeInputs(inputs map[string]any) map[string]any {
 	return out
 }
 
-// nodeStartedAt records the per-node start time in state.Sys and emits a
-// node_started RunEvent. Called from the per-node statePre wrapper.
-// Metadata (message/session ids) is read from ctx via RunMeta.
+// nodeStartedAt 节点开始钩子：记录开始时间到 state.Sys，并往外发
+// node_started 事件（前端运行日志每一行的开始标记）。
+// 事件载荷：{inputs, created_at, component_id, component_name, component_type}。
+// message/session 元数据从 ctx 的 RunMeta 里读（service 层 WithRunMeta 挂的）。
 func nodeStartedAt(ctx context.Context, state *CanvasState, cpnID, componentName, componentType string, inputs map[string]any) {
 	common.Debug("node_started", zap.String("cpnID", cpnID), zap.String("componentName", componentName))
 	if state == nil {
@@ -313,9 +313,10 @@ func nodeStartedAt(ctx context.Context, state *CanvasState, cpnID, componentName
 	})
 }
 
-// nodeFinishedNow emits a node_finished RunEvent. Called from the per-node
-// statePost wrapper. The elapsed time is computed from the time recorded
-// by nodeStartedAt. Metadata is read from ctx via RunMeta.
+// nodeFinishedNow 节点结束钩子：发 node_finished 事件（前端运行日志的
+// 完成行）。耗时用 nodeStartedAt 记的开始时间算。
+// 事件载荷：{inputs, outputs, component_id/n a me/type, error, elapsed_time,
+// created_at}——outputs 从该组件的 Outputs 桶抠出来。
 func nodeFinishedNow(ctx context.Context, state *CanvasState, cpnID, componentName, componentType string, nodeErr error) {
 	if state == nil {
 		return
@@ -331,7 +332,7 @@ func nodeFinishedNow(ctx context.Context, state *CanvasState, cpnID, componentNa
 		elapsed = 0
 	}
 
-	// Collect outputs from the state's Outputs bucket for this cpn.
+	// 从黑板的输出桶里收该组件的产出。
 	var outputs map[string]any
 	if state.Outputs != nil {
 		if bucket, ok := state.Outputs[cpnID]; ok && len(bucket) > 0 {
@@ -385,20 +386,28 @@ func nodeFinishedNow(ctx context.Context, state *CanvasState, cpnID, componentNa
 	})
 }
 
-// BuildWorkflow assembles a *compose.Workflow from a Canvas DSL.
+// BuildWorkflow 把画布 DSL 组装成 *compose.Workflow —— ★ EINO 框架使用的核心模版。
+// DSL（前端画布 JSON）→ eino compose.Workflow（可执行工作流图）的翻译器。
 //
-// Topology rules (per plan §1.1, §2.4):
+// 【EINO 组装模版五步】：
 //
-//   - For every cpn_id in c.Components: add a Lambda node.
-//   - For every (cpn_id, upstream) edge: cpn.AddInput(upstream).
-//   - For components with no upstream (Begin nodes): wire an empty input
-//     from compose.START so eino knows they are start candidates.
-//   - For components with no downstream (terminals): wire them to the
-//     implicit END via wf.End().AddInput(cpnID, ...).
+//	GenState：WithGenLocalState 挂黑板工厂（每运行从 ctx 克隆或从 DSL globals 播种）；
+//	Pass 0（宏展开）：Loop/Parallel 展开成"外层单节点 + 内嵌子工作流"，
+//	          成员记进 macroMembers 供主 Pass 跳过；
+//	Pass 1（注册节点）：每个 cpn 加一个 Lambda 节点（buildNodeBody 产函数体），
+//	          同时包上 statePre/statePost 钩子（发 node 事件+黑板同步）；
+//	Pass 2（连线）：按 DSL 边 AddInput。钻石/合流拓扑下第一个上游走数据边，
+//	          其余走 AddDependency（只等执行不喂数据）——eino 每节点只允许
+//	          一条真实数据输入；
+//	Pass 2.5（分支闸门）：Switch/Categorize 的每个孩子都已被 Pass 2 连了
+//	          数据边，但只该跑"被选中的那个"——wireMultiBranches 加控制闸；
+//	Pass 3（起点/终点）：无上游的节点接 compose.START（成为入口），
+//	          无下游的节点经合成汇合节点接 END。不接会报
+//	          "start node not set / end node not set"。
 //
-// State pre/post handlers are added to every node as NODE options
-// (GraphAddNodeOpt). The handlers carry the per-run *CanvasState which eino
-// extracts from context for us (via WithGenLocalState — wired in compile.go).
+// 状态前后钩子以节点选项（GraphAddNodeOpt）挂到每个节点上；钩子携带的
+// 每运行态 *CanvasState 由 eino 经 WithGenLocalState（compile.go 装配）
+// 从 context 里提取。
 func BuildWorkflow(ctx context.Context, c *Canvas) (*compose.Workflow[map[string]any, map[string]any], error) {
 	if c == nil {
 		return nil, fmt.Errorf("canvas: nil canvas")
@@ -407,24 +416,16 @@ func BuildWorkflow(ctx context.Context, c *Canvas) (*compose.Workflow[map[string
 		return nil, fmt.Errorf("canvas: no components")
 	}
 
-	// GenLocalState copies the request-initialized *CanvasState when the
-	// caller attached one to the context. The service layer populates that
-	// state with per-run sys values (query, files, user_id) and persisted
-	// history/memory before Invoke; replacing it here with DSL globals would
-	// make the first statePre copy stale defaults such as sys.files=[] back
-	// over the request values.
+	// 【黑板工厂】ctx 上挂了黑板（service 层初始化过的）就整份克隆——
+	// 保留注入的 sys 值（query/files/user_id）与持久化的历史/记忆；
+	// 这里若换成 DSL globals 的新黑板，第一个 statePre 会拿stale默认值
+	// （如 sys.files=[]）把请求值覆盖掉。
 	//
-	// Callers that do not attach a state still get a fresh DSL-seeded state.
-	// eino calls this once per run and threads the result through
-	// StatePre/Post handlers.
-	//
-	// The initial env/sys values come from c.Globals (the DSL-level
-	// "globals" map) so that env.* references like "env.counter" resolve
-	// to their declared defaults rather than nil. The Go port splits
-	// "sys.*" and "env.*" dotted keys into separate Sys/Env maps so
-	// GetVar("env.counter") can look up Env["counter"] directly;
-	// seeding here mirrors the Python canvas.__init__ →
-	// self.globals["env.counter"] = 0 path.
+	// 没挂黑板的调用方（纯 canvas 包测试）得到 DSL 播种的新黑板：
+	// globals 里 "sys.*"/"env.*"/其余键 分别进 Sys/Env/Globals——
+	// 这样 env.counter 这类引用能解析到声明默认值而不是 nil
+	// （对齐 Python canvas.__init__ 的 self.globals["env.counter"]=0）。
+	// eino 每次运行调用一次本工厂，结果穿进 StatePre/Post 钩子。
 	globals := c.Globals
 	genState := func(runCtx context.Context) *CanvasState {
 		if ctxState, _, _ := runtime.GetStateFromContext[*runtime.CanvasState](runCtx); ctxState != nil {
@@ -461,19 +462,21 @@ func BuildWorkflow(ctx context.Context, c *Canvas) (*compose.Workflow[map[string
 		return st
 	}
 
+	// EINO 模版：NewWorkflow 泛型 [输入map, 输出map]，WithGenLocalState 挂黑板工厂。
 	wf := compose.NewWorkflow[map[string]any, map[string]any](
 		compose.WithGenLocalState(genState),
 	)
 
-	// Pre-pass: runtime-control macro expansion. Loop and Parallel are
-	// both compiled as single outer nodes backed by a sub-workflow.
-	// Their body members are tracked in `macroMembers` so the main pass
-	// skips those nodes in the outer graph.
+	// ===== Pass 0：运行控制宏展开 =====
+	// Loop 和 Parallel 都编译成"外层单节点 + 背后子工作流"。
+	// 成员记进 macroMembers，主 Pass 跳过这些节点（它们活在子图里）。
 	macroMembers := make(map[string]bool)
 	macroNodes := make(map[string]*compose.WorkflowNode)
 	for cpnID, comp := range c.Components {
 		switch {
 		case strings.EqualFold(comp.Obj.ComponentName, "Loop"):
+			// Loop：展开子图 + 终止条件，挂生命周期钩子
+			// （钩子补发 loop 外层节点的 node_started/finished 事件）。
 			exp, err := buildLoopExpansion(ctx, c, cpnID)
 			if err != nil {
 				return nil, err
@@ -528,20 +531,16 @@ func BuildWorkflow(ctx context.Context, c *Canvas) (*compose.Workflow[map[string
 		}
 	}
 
-	// Pass 1: register every node and remember its upstream list so we can
-	// wire edges in a second pass (Compose disallows AddInput before the
-	// upstream exists). Skip macro cpns and their sub-graph members —
-	// they live in `macroNodes` and inside the sub-workflow respectively.
+	// ===== Pass 1：注册节点 =====
+	// 每个 cpn 注册进图并记下上游边（eino 不允许在上游存在前 AddInput，
+	// 所以连线推迟到 Pass 2）。宏节点与其子图成员跳过——前者在
+	// macroNodes 里，后者活在子工作流里。
 	//
-	// Component-routing rules per cpn (centralised in buildNodeBody):
-	//
-	//   1. component_name is in legacyNoOpNames (e.g. "ExitLoop") →
-	//      dedicated no-op echo lambda with __legacy_noop__ tag.
-	//   2. runtime.DefaultFactory() registered → factory-built real
-	//      component invoked per iteration.
-	//   3. no factory registered → placeholder body (canvas-only test
-	//      fallback; production wiring always registers a factory via
-	//      component.init()).
+	// 组件路由三分支（集中在 buildNodeBody）：
+	//  1. legacyNoOpNames（如 ExitLoop）→ 带 __legacy_noop__ 标记的空操作回显 Lambda；
+	//  2. runtime.DefaultRegistry 注册过 → 工厂构造真实组件（生产路径，
+	//     由 component 包 init() 注册）；
+	//  3. 没注册 → 占位函数体（canvas 包测试兜底）。
 	type pendingEdge struct {
 		cpn string
 		up  string
@@ -549,9 +548,7 @@ func BuildWorkflow(ctx context.Context, c *Canvas) (*compose.Workflow[map[string
 	pending := make([]pendingEdge, 0, 4*len(c.Components))
 	nodes := make(map[string]*compose.WorkflowNode, len(c.Components))
 	for cpnID := range c.Components {
-		// Macro cpns are already registered in the pre-pass. We
-		// still need to record their upstream edges so Pass 2 can wire
-		// `upstream -> macro`.
+		// 宏节点已在 Pass 0 注册；但还要记它的上游边供 Pass 2 连线。
 		if _, isMacro := macroNodes[cpnID]; isMacro {
 			for _, up := range c.Components[cpnID].Upstream {
 				pending = append(pending, pendingEdge{cpn: cpnID, up: up})
@@ -565,6 +562,9 @@ func BuildWorkflow(ctx context.Context, c *Canvas) (*compose.Workflow[map[string
 		if name == "" {
 			return nil, fmt.Errorf("canvas: component %q has empty component_name", cpnID)
 		}
+		// Agent 执行模式：直连 Message 子节点才启用"惰性执行"
+		// （Agent 流由 Message 消费）；否则抑制 Agent 的消息事件
+		// （由 Message 统一出口）。
 		deferToMessage := directMessageDownstream(c, cpnID)
 		nodeOpts := runtime.ComponentExecutionOptions{
 			DeferAgentToMessage:        deferToMessage,
@@ -574,12 +574,10 @@ func BuildWorkflow(ctx context.Context, c *Canvas) (*compose.Workflow[map[string
 		if err != nil {
 			return nil, err
 		}
-		// Per-node statePre/statePost wrappers close over cpnID and
-		// component metadata so they can emit node_started /
-		// node_finished events at the correct per-node lifecycle
-		// points. The events channel and run metadata are read from
-		// the context via WithRunMeta / GetRunMeta (populated by the
-		// service layer before invoke).
+		// 每节点 statePre/statePost 包装器闭包捕获 cpnID 与组件元数据，
+		// 在正确的节点生命周期点发 node_started/node_finished。
+		// 事件通道与运行元数据从 ctx 里读（service 层 invoke 前挂的
+		// WithRunMeta / GetRunMeta）。
 		componentName := c.Components[cpnID].Obj.ComponentName
 		nodePre := func(ctx context.Context, in map[string]any, state *CanvasState) (map[string]any, error) {
 			nodeStartedAt(ctx, state, cpnID, componentName, componentName, in)
@@ -588,9 +586,9 @@ func BuildWorkflow(ctx context.Context, c *Canvas) (*compose.Workflow[map[string
 		nodePost := func(ctx context.Context, out map[string]any, state *CanvasState) (map[string]any, error) {
 			result, postErr := statePost(ctx, out, state)
 			if postErr == nil && runtime.IsDeferredStream(result["content"]) {
-				// Python keeps the Agent node pending while Message consumes its
-				// partial generator. Message completes this callback after the
-				// deferred stream closes.
+				// Agent 的输出是延迟流（由下游 Message 消费）：
+				// 挂起 node_finished until 流关闭（Message 会在
+				// 消费完后调用这个回调补发）。对齐 Python 行为。
 				runtime.RegisterDeferredNode(ctx, cpnID, func() {
 					nodeFinishedNow(ctx, state, cpnID, componentName, componentName, nil)
 				})
@@ -599,6 +597,8 @@ func BuildWorkflow(ctx context.Context, c *Canvas) (*compose.Workflow[map[string
 			}
 			return result, postErr
 		}
+		// EINO 模版：InvokableLambda 包函数体 → AddLambdaNode 进图，
+		// WithStatePre/PostHandler 挂钩子，WithNodeName 命名。
 		lambda := compose.InvokableLambda[map[string]any, map[string]any](body)
 		node := wf.AddLambdaNode(cpnID, lambda,
 			compose.WithStatePreHandler[map[string]any, *CanvasState](nodePre),
@@ -611,25 +611,18 @@ func BuildWorkflow(ctx context.Context, c *Canvas) (*compose.Workflow[map[string
 		}
 	}
 
-	// Pass 2: wire edges. Skip self-edges and edges to unknown upstreams —
-	// those would be a DSL bug; BuildWorkflow returns an error so the
-	// orchestrator can surface a clear failure (better than a silent
-	// non-trigger).
+	// ===== Pass 2：连线 =====
+	// 跳过自环与未知上游的边（DSL bug）——返回错误让上层看到明确失败
+	// 好过静默不触发。
 	//
-	// Multi-upstream handling: eino's Workflow only allows ONE actual data
-	// input per node (subsequent AddInput without FieldMapping triggers
-	// "entire output has already been mapped"). For diamond / merge
-	// topologies, the first upstream carries data; the rest register as
-	// exec-only dependencies via AddDependency so the node waits for
-	// them but doesn't try to consume a second data source. Component
-	// bodies that need to merge multi-source inputs switch to explicit
-	// FieldMapping via the StatePreHandler (see scheduler.go's
-	// statePre implementation).
+	// 【多上游处理】eino 的 Workflow 每节点只允许一条真实数据输入
+	// （再 AddInput 不带 FieldMapping 会报 "entire output has already
+	// been mapped"）。钻石/合流拓扑：第一个上游走数据边，其余用
+	// AddDependency 注册为"只等执行、不喂数据"的依赖边。需要合并多源
+	// 输入的组件经 StatePreHandler 里显式读黑板合并。
 	//
-	// An upstream may be a regular node OR a Loop node (registered in
-	// the pre-pass). Both are valid edge sources. Symmetrically, the
-	// downstream may itself be a Loop node — in that case we resolve
-	// the *compose.WorkflowNode via loopNodes rather than nodes.
+	// 上游可能是普通节点也可能是宏节点（Pass 0 注册），两者都是合法
+	// 边源；下游同理。
 	resolveNode := func(id string) *compose.WorkflowNode {
 		if n, ok := nodes[id]; ok {
 			return n
@@ -659,42 +652,28 @@ func BuildWorkflow(ctx context.Context, c *Canvas) (*compose.Workflow[map[string
 		}
 	}
 
-	// Pass 2.5: install MultiBranch edges for runtime-control parents.
-	// Switch / Categorize produce a `_next` output identifying which
-	// downstream child should run at runtime. Without this pass every
-	// declared child fires unconditionally (Pass 2 wired AddInput from
-	// parent to every child); the branch adds a control-only gate so
-	// only the chosen child is executed. The AddInput edges stay in
-	// place — they carry the data path; the branch carries the control
-	// path. See multibranch.go for the full rationale.
+	// ===== Pass 2.5：分支闸门 =====
+	// Switch/Categorize 在运行时产出 _next 指明哪个下游该跑。没有这步，
+	// Pass 2 已把所有声明过的孩子都连了数据边 → 全部无条件触发。
+	// 这里给每个孩子加"控制边闸门"：只有被选中的孩子执行。
+	// 数据边保留（传数据），闸门边管控制。详见 multibranch.go。
 	wireMultiBranches(wf, c, macroMembers)
 
-	// Pass 3: wire start nodes (no upstream) from compose.START, and wire
-	// terminal nodes (no downstream) to compose.END. eino
-	// tracks start/end membership by these explicit wirings — without
-	// them, Compile() returns "start node not set" / "end node not set".
+	// ===== Pass 3：起点/终点 =====
+	// 无上游的节点接 compose.START（成为工作流入口）；无下游的终点节点
+	// 接 END。eino 靠这些显式连线判断 start/end——不接会在 Compile() 报
+	// "start node not set / end node not set"。
 	//
-	// Multi-terminal case: eino's END node is stricter than regular
-	// workflow nodes about repeated output mappings. Instead of wiring
-	// multiple terminals directly into END, route them through one
-	// synthetic merge node. The merge node consumes one terminal as its
-	// data input and treats the rest as exec-only dependencies, mirroring
-	// the same "first input carries data; the rest are dependencies"
-	// policy used in Pass 2.
+	// 【多终点处理】eino 的 END 对重复输出映射比普通节点更严格：多个
+	// 终点不直接接 END，而是经过一个合成汇合节点——第一个终点当数据
+	// 输入，其余当 exec-only 依赖（与 Pass 2 同一策略）。
 	//
-	// A "start" node with no upstream gets an empty input from START so
-	// eino registers it as a workflow entry point. FieldMapping is nil
-	// because the placeholder lambdas just echo whatever they receive.
-	//
-	// Loop nodes are wired here too: a Loop is START if it has no
-	// upstream; it is END if it has no downstream in the outer graph
-	// (a downstream that's also a sub-graph member doesn't count — that
-	// node is part of the loop's body, not the outer graph's edge).
+	// Loop 节点同样在这里接：无上游的 Loop 是 START；在"外层图"里无
+	// 下游的 Loop 是 END（下游若也是子图成员则不算——那是 loop 体的一部分）。
 	terminals := make([]string, 0, len(c.Components))
 	for cpnID, comp := range c.Components {
 		if node, isMacro := macroNodes[cpnID]; isMacro {
-			// Macro parents with no upstream are START nodes. Parents
-			// with upstream had their AddInput wired in Pass 2 already.
+			// 无上游的宏父节点是 START；有上游的在 Pass 2 已连过 AddInput。
 			if len(comp.Upstream) == 0 && !first[cpnID] {
 				node.AddInput(compose.START)
 			}
@@ -729,9 +708,8 @@ func BuildWorkflow(ctx context.Context, c *Canvas) (*compose.Workflow[map[string
 	return wf, nil
 }
 
-// directMessageDownstream: only a direct
-// Message child enables lazy Agent execution. Intermediate nodes must not
-// accidentally change the Agent's execution mode.
+// directMessageDownstream 只有"直连的 Message 子节点"才启用惰性 Agent 执行。
+// 中间隔了别的节点不能意外改变 Agent 的执行模式。
 func directMessageDownstream(c *Canvas, cpnID string) bool {
 	if c == nil {
 		return false
@@ -775,13 +753,11 @@ func wireWorkflowTerminals(
 		return nil
 	}
 
-	// Sub-workflows wire END without field mappings. These multi-terminal
-	// shapes commonly come from mutually exclusive branches (for example a
-	// loop body Switch choosing either continue or exit). We therefore
-	// create a small field-mapped gather node that forwards whichever
-	// branch actually produced output, instead of the outer workflow's
-	// dependency-based merge node that would incorrectly wait for every
-	// terminal to execute in the same run.
+	// 子工作流的 END 不带 field mapping。多终点形态常来自互斥分支
+	// （如 loop 体里的 Switch 选继续或退出），所以这里建一个小型
+	// field-mapped 汇合节点，转发"实际产出了输出的那个分支"，而不是
+	// 外层工作流那种基于依赖的合流节点（后者会错误地等待所有终点
+	// 都在同一轮执行完）。
 	if !useFieldMapping {
 		gatherNode := wf.AddLambdaNode(
 			terminalMergeNodeID,

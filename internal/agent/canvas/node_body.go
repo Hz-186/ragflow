@@ -1,32 +1,12 @@
+// node_body.go — 单节点 Lambda 函数体的构造。
 //
-//  Copyright 2026 The InfiniFlow Authors. All Rights Reserved.
+// 外层图（scheduler.go）和 Loop 子图（loop_subgraph.go）装的 lambda 节点都：
+//  1. 给输出打 __cpn_id__ 标签，statePost 才能把结果摊平进
+//     Outputs[cpnID][...] 桶；
+//  2. 要么调工厂构造的真实组件，要么回退到空操作回显体。
 //
-//  Licensed under the Apache License, Version 2.0 (the "License");
-//  you may not use this file except in compliance with the License.
-//  You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-//  Unless required by applicable law or agreed to in writing, software
-//  distributed under the License is distributed on an "AS IS" BASIS,
-//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-//  See the License for the specific language governing permissions and
-//  limitations under the License.
-//
-
-// node_body.go — per-node lambda body construction.
-//
-// Both the outer graph (scheduler.go) and the Loop sub-graph
-// (loop_subgraph.go) install lambda nodes that:
-//
-//  1. tag their output with __cpn_id__ so statePost can persist the
-//     result into Outputs[cpnID]["result"];
-//  2. either invoke a real factory-built component or fall back to a
-//     no-op echo body.
-//
-// Centralising the construction here keeps both call sites consistent
-// and makes the legacy-no-op / factory / placeholder routing logic the
-// single source of truth.
+// 构造逻辑集中在这里，两个调用方保持一致；legacy-no-op / 工厂 /
+// 占位体的路由规则也只有这一份。
 package canvas
 
 import (
@@ -44,52 +24,34 @@ import (
 	"go.uber.org/zap"
 )
 
-// nodeBodyFn is the plain function shape compose.InvokableLambda accepts.
-// We avoid a named type alias because compose.InvokableLambda's generic
-// inference only accepts the underlying func literal type, not a named
-// alias on top of it.
+// nodeBodyFn compose.InvokableLambda 接受的普通函数形状。
+// 不用具名类型别名：compose.InvokableLambda 的泛型推断只认底层函数
+// 字面量类型，不认套在它上面的命名别名。
 type nodeBodyFn = func(ctx context.Context, in map[string]any) (map[string]any, error)
 
-// buildNodeBody returns the lambda body for a single canvas node.
+// buildNodeBody 返回单个画布节点的 lambda 函数体。★组件路由四分支。
 //
-// Routing rules:
+// 路由规则：
+//  1. isLegacyNoOp(name) → legacyNoOpBody：回显输入 + __legacy_noop__ 标签。
+//     DSL v1 的哨兵组件（如 "ExitLoop"）落这里；
+//  2. name 是 "UserFillUp"（大小写不敏感）→ UserFillUpNodeBody。
+//     此路由优先于常规工厂——用 eino 中断语义取代老的 Invoke 体：
+//     首次执行 compose.Interrupt 暂停整图，恢复时 compose.GetResumeContext
+//     读用户续填的数据；
+//  3. 有组件工厂 → 工厂构造组件，返回委托其 Invoke 的函数体；
+//  4. 都不是 → placeholderBody（canvas 包单测兜底；生产环境总有
+//     component.init() 注册的工厂，走不到这）。
 //
-//  1. isLegacyNoOp(name) → legacyNoOpBody (echo + __legacy_noop__ tag).
-//     DSL v1 sentinels like "ExitLoop" land here.
-//  2. name is "UserFillUp" (case-insensitive) → UserFillUpNodeBody.
-//     This route takes precedence over the regular factory path so
-//     the eino interrupt semantics replace the legacy
-//     UserFillUpComponent.Invoke body. UserFillUpNodeBody calls
-//     compose.Interrupt on first execution and reads the resume
-//     payload via compose.GetResumeContext on subsequent runs.
-//  3. runtime.DefaultFactory() is non-nil → call the factory once to
-//     construct a runtime.Component, then return a body that delegates
-//     to that component's Invoke. A factory error surfaces here with
-//     the cpn_id wrapped for diagnostics.
-//  4. otherwise → placeholderBody. This is the canvas-package-only
-//     fallback used when no factory has been registered (most commonly
-//     in canvas-only unit tests that do not import the component
-//     package). Production runs always have a factory installed via
-//     component.init() → runtime.SetDefaultFactory(component.New).
+// 返回的函数体总会给输出 map 打 __cpn_id__ 标签——共享 statePost 处理器
+// 据此把结果记进该组件的 Outputs 桶。UserFillUpNodeBody 自己打标签，
+// 保证中断驱动的分支也能把恢复载荷归到正确的 cpn 上。
 //
-// The returned body always tags the output map with __cpn_id__ so the
-// shared statePost handler can persist the result into the per-cpn
-// Outputs bucket. UserFillUpNodeBody tags its output itself so the
-// interrupt-driven branch still attributes the resume payload to the
-// right cpn.
-// ctxKeyOverrideParams carries the run-level override map into
-// BuildWorkflow so a component's params can be merged with it
-// at compile time. The map is keyed by cpnID; each component only sees the
-// entry for its own id (an arbitrary string-keyed map). It mirrors the ctx
-// plumbing used for the per-run component factory
-// (componentFactoryFromContext): the override is threaded through
-// canvas.Compile → BuildWorkflow → buildNodeBody without the canvas
-// package ever importing the ingestion layer.
+// 【依赖倒置】canvas 包不能 import component 包（会成环）；组件构造经
+// runtime.DefaultFactory 间接拿——component 包 init() 把 New 注册进来。
 const ctxKeyOverrideParams ctxKey = "canvas_override_params"
 
-// withOverrideParams attaches a run-level override map to ctx. It is
-// a no-op when m is nil so callers can pass a possibly-nil run parameter
-// straight through.
+// withOverrideParams 把运行级覆盖表挂到 ctx。m 为 nil 时是空操作，
+// 调用方可以直接把可能为 nil 的运行参数透传进来。
 func withOverrideParams(ctx context.Context, m map[string]any) context.Context {
 	if m == nil {
 		return ctx
@@ -102,12 +64,10 @@ func overrideParamsFromContext(ctx context.Context) map[string]any {
 	return m
 }
 
-// applyOverrideParams returns a clone of params with the per-component
-// override (already resolved for this cpnID by the caller) merged into
-// params. The override wins on top-level key collisions. The original
-// params map is never mutated — the merge result is a fresh map —
-// because the params come from the shared *Canvas and a per-run override
-// must not leak into the next Run on the same Pipeline.
+// applyOverrideParams 返回 params 的克隆，并把该组件的覆盖项
+// （调用方已按 cpnID 解析好）合并进去。顶层键冲突时覆盖项赢。
+// 原 params map 绝不被改动——合并结果是新 map——因为 params 来自共享的
+// *Canvas，一次运行的覆盖不能泄漏给同一 Pipeline 的下一次 Run。
 func applyOverrideParams(params, cpnOverride map[string]any) map[string]any {
 	if len(cpnOverride) == 0 {
 		return params
@@ -171,10 +131,8 @@ func buildNodeBodyWithOptions(ctx context.Context, cpnID, name string, params ma
 	return placeholderBody(cpnID), nil
 }
 
-// legacyNoOpBody returns the body installed for DSL v1 sentinel
-// components (legacyNoOpNames). It echoes the input and tags
-// __legacy_noop__ so downstream debuggers can tell the node fired but
-// did nothing.
+// legacyNoOpBody DSL v1 哨兵组件（legacyNoOpNames）装的函数体：
+// 回显输入并打 __legacy_noop__ 标签——下游调试者能看出"节点触发过但啥也没干"。
 
 func resolveComponentFactory(ctx context.Context) runtime.ComponentFactory {
 	if factory := componentFactoryFromContext(ctx); factory != nil {
@@ -195,12 +153,10 @@ func legacyNoOpBody(cpnID string) nodeBodyFn {
 	}
 }
 
-// componentTimeout returns the per-component Invoke timeout.
-//
-// Reads the COMPONENT_EXEC_TIMEOUT env var (seconds); defaults to 600s
-// (10 min) to match the Python @timeout decorator's default in
-// agent/component/base.py. Invalid / non-positive values fall back to
-// the default — invalid input must never widen the timeout silently.
+// componentTimeout 组件 Invoke 的超时。
+// 读环境变量 COMPONENT_EXEC_TIMEOUT（秒）；默认 600s（10 分钟），对齐
+// Python agent/component/base.py 里 @timeout 装饰器的默认值。
+// 非法/非正值回退默认——错误输入绝不能默默放宽超时。
 func componentTimeout() time.Duration {
 	const def = 600 * time.Second
 	if v := common.GetEnv(common.EnvComponentExecTimeout); v != "" {
@@ -211,50 +167,35 @@ func componentTimeout() time.Duration {
 	return def
 }
 
-// realComponentBody returns a body that delegates to the supplied
-// runtime.Component. The component is constructed once at build time
-// (in buildNodeBody) and re-invoked per iteration.
+// realComponentBody 返回委托给给定 runtime.Component 的函数体。
+// 组件在构建期（buildNodeBody 里）构造一次，之后每轮迭代重复 Invoke。
 //
-// This is the SINGLE chokepoint through which every component Invoke
-// passes — both the agent canvas and the ingestion pipeline
-// (internal/ingestion/pipeline compiles a canvas and runs its workflow)
-// reach components here. Cross-cutting concerns therefore belong here,
-// not inside each component's Invoke:
+// ★ 所有组件 Invoke 的唯一咽喉——agent 画布和 ingestion 流水线
+// （internal/ingestion/pipeline 也会编译画布跑工作流）都从这进组件。
+// 横切关注点因此放这，不放各组件的 Invoke 里：
+//   - 执行上下文：从父 ctx 只派生取消能力，不加框架级墙钟超时——
+//     长知识编译步骤（几十次 LLM 调用）不会被固定上限掐断。任务取消
+//     仍经父_CANCEL 打断组件；每次调用的模型级超时留在模型驱动里管。
+//   - 进度：runtime.TrackProgress，回调从 ctx 取（nil 表示无观察者）。
+//     进度成了框架级能力——组件不用自己包一层。
+//   - 耗时记账：runtime.TrackElapsed 往输出 map 盖 _created_time/
+//     _elapsed_time，数据流水线 UI 的每节点耗时不用各组件重复记账。
 //
-//   - execution context: derived from the parent with cancellation only — no
-//     framework-level wall-clock deadline is imposed on any component, so a
-//     long knowledge-compilation step (many LLM calls) is not cut short by a
-//     fixed ceiling. A cancelled task still interrupts via the parent cancel;
-//     per-call model deadlines stay at the model driver.
-//   - progress: runtime.TrackProgress, with the callback pulled from
-//     ctx (nil ⇒ no observer). This makes progress a framework-level
-//     concern — components no longer wrap themselves.
-//   - elapsed-time accounting: runtime.TrackElapsed stamps
-//     _created_time / _elapsed_time into the output map so the
-//     dataflow-result UI can show per-node timing without each
-//     component repeating the bookkeeping.
+// 超时报 "timeout after Xs"；父上下文取消报 "cancelled"；其余错误带
+// cpn_id 包装组件原错误。
 //
-// Timeout errors are surfaced as `timeout after Xs: <wrapped>`;
-// parent-context cancellation as `cancelled: <wrapped>`; all other
-// errors wrap the component's own error with the cpn_id for diagnostics.
-//
-// The output map is tagged with __cpn_id__ before return so statePost
-// can attribute the result; if the component already populated that
-// key it is overwritten with the canvas-controlled value to keep
-// attribution authoritative.
+// 返回前输出 map 打上 __cpn_id__——statePost 归账用；组件即便自己填过
+// 该键也以 canvas 控制的值为准，归属保持权威。
 func realComponentBody(cpnID, componentClass string, comp runtime.Component) nodeBodyFn {
 	return realComponentBodyWithOptions(cpnID, componentClass, comp, runtime.ComponentExecutionOptions{})
 }
 
 func realComponentBodyWithOptions(cpnID, componentClass string, comp runtime.Component, opts runtime.ComponentExecutionOptions) nodeBodyFn {
 	return func(ctx context.Context, in map[string]any) (map[string]any, error) {
-		// The framework imposes no wall-clock deadline on component execution.
-		// Long-running components (notably knowledge compilation, which fans out
-		// over many model calls) exceed any fixed ceiling and would otherwise
-		// fail with "context deadline exceeded". We derive a cancellation-only
-		// context so a cancelled task (parent cancel) still interrupts the
-		// component mid-run, while no arbitrary timeout is applied. Per-call
-		// model deadlines remain enforced at the model driver.
+		// 框架不给组件执行设墙钟超时：长跑组件（尤其知识编译，扇出
+		// 大量模型调用）超过任何固定上限，否则会报 "context deadline
+		// exceeded"。这里派生"只带取消"的上下文——任务取消（父
+		// cancel）仍能在半路打断组件；每次模型调用的超时在模型驱动层管。
 		cctx, cancel := context.WithCancel(ctx)
 		defer cancel()
 
@@ -267,10 +208,9 @@ func realComponentBodyWithOptions(cpnID, componentClass string, comp runtime.Com
 			return e
 		})
 		if invokeErr != nil {
-			// Surface the failure as a structured log line. The wrapped error
-			// already carries the full cause chain (e.g. deepseek DNS/timeout),
-			// but without this the failure only showed up as a generic
-			// "Task ... failed" line with no clear cause in the logs.
+			// 失败以结构化日志行浮出。包装错误已携带完整因果链
+			// （如 deepseek DNS/超时），不记这条的话日志里只剩一条
+			// 通用 "Task ... failed" 看不出根因。
 			common.Error("canvas: component invoke failed", invokeErr,
 				zap.String("component_id", cpnID),
 				zap.String("component_class", componentClass))
@@ -290,10 +230,9 @@ func realComponentBodyWithOptions(cpnID, componentClass string, comp runtime.Com
 	}
 }
 
-// placeholderBody is the canvas-only fallback used when no factory
-// has been registered. It echoes the input map untouched (except for
-// the __cpn_id__ tag) so canvas unit tests can exercise topology
-// wiring without depending on any real component implementation.
+// placeholderBody 是 canvas-only fallback，当没有注册工厂时使用。
+// 它回显输入 map 未变（除了 __cpn_id__ 标签）所以 canvas 单测可以
+// 练习拓扑连接而无需依赖任何真实组件实现。
 func placeholderBody(cpnID string) nodeBodyFn {
 	return func(ctx context.Context, in map[string]any) (map[string]any, error) {
 		out, err := placeholderLambda(ctx, in)
@@ -305,27 +244,22 @@ func placeholderBody(cpnID string) nodeBodyFn {
 	}
 }
 
-// withStateBracket wraps body so that it performs the same pre/post
-// state work as the outer-graph's eino StatePreHandler / StatePostHandler
-// pair, but reads the state from the request context (attached via
-// runtime.WithState) instead of an eino-managed graph-local state.
+// withStateBracket 包装 body：执行与外层图 eino StatePreHandler/
+// StatePostHandler 对等的状态前后工作，但状态从请求 ctx 上读
+// （runtime.WithState 挂的），而不是 eino 管理的图内局部状态。
 //
-// This is the path used by the Loop sub-graph: its nodes do not have
-// access to the outer graph's WithGenLocalState, but they do inherit
-// the context-attached *CanvasState that the outer graph (or the
-// invoking caller) installed. Wrapping the body lets sub-graph nodes
-// participate in the same state snapshot / result-persistence
-// contract as outer nodes.
+// Loop 子图走这条路：子图节点够不着外层图的 WithGenLocalState,
+// 但继承了外层图（或调用方）挂在 ctx 上的 *CanvasState。包上这层,
+// 子图节点就能参与和外层节点一致的状态快照/结果持久化契约。
 //
-// If no state is attached to ctx (e.g. a sub-graph test that runs
-// the body directly), the wrapper degrades to a plain invocation:
-// the body still runs, its output is still tagged with __cpn_id__,
-// but no state snapshot is injected and no result is persisted.
+// ctx 上没挂状态时（如直接跑函数体的子图单测），包装退化成普通调用：
+// 函数体照跑、输出照打 __cpn_id__，但不注入状态快照、不持久化结果。
 func withStateBracket(cpnID, componentName string, body nodeBodyFn) nodeBodyFn {
 	return func(ctx context.Context, in map[string]any) (map[string]any, error) {
 		originalIn := in
 		state, _, _ := runtime.GetStateFromContext[*runtime.CanvasState](ctx)
 		if state != nil {
+			// 前：发 node_started + 黑板快照注入 in["state"]（同 statePre）。
 			nodeStartedAt(ctx, state, cpnID, componentName, componentName, originalIn)
 			if in == nil {
 				in = map[string]any{}
@@ -348,6 +282,8 @@ func withStateBracket(cpnID, componentName string, body nodeBodyFn) nodeBodyFn {
 		if state == nil {
 			return out, nil
 		}
+		// 后：输出摊平进 Outputs 桶（同 statePost）+ 发 node_finished；
+		// 延迟流（Agent 输出由 Message 消费）挂起 finished 事件等流关闭。
 		if out == nil {
 			nodeFinishedNow(ctx, state, cpnID, componentName, componentName, nil)
 			return out, nil

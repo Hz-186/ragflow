@@ -1,14 +1,12 @@
-// Package component — Agent (T1).
+// Package component —— Agent（T1）。
 //
-// Multi-turn ReAct agent powered by eino's flow/agent/react package.
-// Uses the RAGFlow model layer (models.EinoChatModel) as a
-// ToolCallingChatModel, delegating the ReAct loop to eino's
-// production-grade implementation.
+// 由 eino flow/agent/react 驱动的多轮 ReAct Agent。
+// 用 RAGFlow 模型层（models.EinoChatModel）充当 ToolCallingChatModel，
+// ReAct 循环委托给 eino 的生产级实现。
 //
-// Public outputs (content / tool_calls / artifacts) match the
-// plan-specified shape. The agent now wires AgentParam.Tools into
-// eino's native react.AgentConfig.ToolsConfig; when no tools are
-// configured the ReAct loop naturally degenerates to one model call.
+// 公开输出（content / tool_calls / artifacts）符合计划规定的形状。
+// AgentParam.Tools 已接入 eino 原生 react.AgentConfig.ToolsConfig；
+// 未配工具时 ReAct 循环自然退化为一次模型调用。
 package component
 
 import (
@@ -37,79 +35,72 @@ import (
 	"go.uber.org/zap"
 )
 
+// maxSubAgentDepth 子 Agent 嵌套调用的最大深度——防止两个 Agent 互相
+// 把对方当工具、无限套娃。每进一层子 Agent，ctx 里的深度计数 +1，
+// 到 8 层再被调用就直接报错。
 const maxSubAgentDepth = 8
+
+// defaultAgentDeferredTimeout 延迟执行模式的默认超时。Agent 直连
+// Message 组件时不立即跑，而是等 Message 打开流时才真正执行，
+// 从打开那一刻起最多跑 10 分钟。
 const defaultAgentDeferredTimeout = 10 * time.Minute
 
-// agentPatternless matches `<model>@<provider>` and
-// `<model>@<instance>@<provider>` (the trailing `@<provider>` is
-// always the last segment — the segment just before the last `@`
-// is treated as the bare model name for upstream API calls). The
-// browser component has the same idea at browser.go:88-92, but
-// keeps the regex greedy for its 2-part fixture; we keep both
-// behaviors here via the in-function split below.
-
-// agentProviderLastSegmentSplit takes a composite llm_id and
-// returns (bareModelName, providerName, true) — or ("", "", false)
-// when no `@<provider>` suffix exists. The bare model name is
-// always `parts[0]` (the FIRST `@`-delimited segment); the
-// provider is `parts[1]` for the 2-part shape and `parts[2]` for
-// the 3+ shape. Any middle `@<seg>` segments (the "instance" in
-// Python's split_model_name) are intentionally dropped — the Go
-// drivers and the tenant_llm lookup both key on the bare model
-// name + factory, not on the instance.
+// agentProviderLastSegmentSplit 拆复合 llm_id，返回
+// (裸模型名, 厂商名, true)；无 @<provider> 后缀时返回 ("", "", false)。
+// 裸模型名恒为 parts[0]（第一个 @ 之前的段）；厂商名 2 段形状取
+// parts[1]、3+ 段形状取 parts[2]。中间的 @<seg> 段（Python
+// split_model_name 里的 "instance"）有意丢弃——Go 侧驱动与 tenant_llm
+// 查找都按「裸模型名 + factory」为键，不看 instance。
 //
-// Mirrors Python's split_model_name at
-// api/db/joint_services/tenant_model_service.py:163-178:
-//   - "model"                     → ("model", "",       false)
+// 对齐 Python 的 split_model_name
+// （api/db/joint_services/tenant_model_service.py:163-178）：
+//   - "model"                     → ("model", "",        false)
 //   - "model@provider"            → ("model", "provider", true)
 //   - "model@instance@provider"   → ("model", "provider", true)
-//   - 4+ parts                    → ("parts[0]", "parts[2]", true) —
-//     the trailing segment wins, anything between instance and
-//     provider is dropped (Python uses parts[2] unconditionally).
+//   - 4+ 段                       → ("parts[0]", "parts[2]", true)——末段
+//     赢；instance 与 provider 之间的段丢弃（Python 无条件用 parts[2]）。
 func agentProviderLastSegmentSplit(s string) (modelName, providerName string, hasProvider bool) {
 	return splitCompositeLLMID(s)
 }
 
-// AgentComponent is a multi-turn ReAct agent.
+// AgentComponent 多轮 ReAct Agent 组件。
 type AgentComponent struct {
 	param AgentParam
 }
 
-// AgentParam captures the (resolved) DSL parameters for an Agent node.
+// AgentParam 承载 Agent 节点（已解析）的 DSL 参数。
 type AgentParam struct {
-	ModelID                  string
-	Description              string
-	SystemPrompt             string
-	UserPrompt               string
-	Thinking                 string
-	MaxTokens                *int
-	TopP                     *float64
-	Temperature              *float64
-	Tools                    []string                  // Agent-visible tool names resolved into Eino BaseTool instances
-	ToolParams               map[string]map[string]any // node-level tool constructor params keyed by tool name
-	SubAgents                []SubAgentTool
-	MaxRounds                int
-	MessageHistoryWindowSize int // number of prior conversation turns to include; zero disables history
+	ModelID      string
+	Description  string
+	SystemPrompt string
+	UserPrompt   string
+	Thinking     string
+	MaxTokens    *int
+	TopP         *float64
+	Temperature  *float64
+	Tools        []string                  // Agent 可见的工具名，解析成 Eino BaseTool 实例
+	ToolParams   map[string]map[string]any // 节点级工具构造参数，按工具名键控
+	SubAgents    []SubAgentTool
+	MaxRounds    int
+	// MessageHistoryWindowSize 拉取的既往对话轮数；0 表示不带历史。
+	MessageHistoryWindowSize int
 	OptimizeMultiTurn        bool
 	OptimizeHistoryWindow    int
-	// Meta is the OpenAI-style function-call schema the Agent exposes
-	// when it is itself called as a tool by a parent component. Mirrors
-	// Python's `meta: ToolMeta` field — describes the Agent's own
-	// inputs (user_prompt / reasoning / context) for callers.
+	// Meta 是 Agent 自己作为工具被父组件调用时暴露的 OpenAI 风格
+	// function-call schema。对齐 Python 的 meta: ToolMeta 字段——向调用方
+	// 描述 Agent 自身的输入（user_prompt / reasoning / context）。
 	Meta AgentMeta
-	// Cite enables post-stream citation grounding. When true,
-	// the Agent reads the chunks recorded in
-	// state.Retrieval["chunks"] (populated by the Retrieval tool),
-	// renders prompts.CitationPlusPrompt, and makes a second LLM
-	// call to insert [ID:N] tags into the final content. Mirrors
-	// Python's `_generate_with_citation` flow.
+	// Cite 开启流后引用落地。为 true 时 Agent 读
+	// state.Retrieval["chunks"]（由 Retrieval 工具填充），渲染
+	// prompts.CitationPlusPrompt，再调一次 LLM 往最终内容里插 [ID:N]
+	// 标记。对齐 Python 的 _generate_with_citation 流程。
 	Cite    bool
 	Driver  string
 	APIKey  string
 	BaseURL string
 }
 
-// SubAgentTool is a child Agent exposed to a parent Agent as an Eino tool.
+// SubAgentTool 是包在 Eino 工具里、暴露给父 Agent 的子 Agent。
 type SubAgentTool struct {
 	Name        string
 	Description string
@@ -117,47 +108,48 @@ type SubAgentTool struct {
 }
 
 const (
-	agentUserPromptSchemaDefault         = "This is the order you need to send to the agent."
+	// agentUserPromptSchemaDefault 子 Agent 工具 schema 里 user_prompt
+	// 参数的默认描述——告诉父 Agent 这个字段该填什么。
+	agentUserPromptSchemaDefault = "This is the order you need to send to the agent."
+	// defaultAgentMessageHistoryWindowSize 默认历史窗口：带最近 13 轮
+	// 既往对话进模型上下文（0 表示不带历史）。
 	defaultAgentMessageHistoryWindowSize = 13
 )
 
-// AgentMeta declares the OpenAI-style function-call interface for the
-// Agent component. Mirrors ragflow Python's ToolMeta shape.
+// AgentMeta 声明 Agent 组件的 OpenAI 风格 function-call 接口。
+// 对齐 RAGFlow Python 的 ToolMeta 形状。
 type AgentMeta struct {
 	Name        string
 	Description string
-	// Parameters is the JSON-Schema-shaped object describing the
-	// Agent's own input parameters. Each key is the parameter name
-	// (e.g. "user_prompt", "reasoning", "context") and the value
-	// carries type/description/required.
+	// Parameters 是 JSON-Schema 形状的对象，描述 Agent 自身的输入参数。
+	// 每个键是参数名（如 "user_prompt"、"reasoning"、"context"），
+	// 值携带 type/description/required。
 	Parameters map[string]AgentMetaParam
 }
 
-// AgentMetaParam is a single field in the Agent's input schema.
+// AgentMetaParam Agent 输入 schema 里的单个字段。
 type AgentMetaParam struct {
 	Type        string
 	Description string
 	Required    bool
 }
 
-// AgentOutput mirrors the outputs map (per plan §2.11.3 row 8):
+// AgentOutput 对齐 outputs map（§2.11.3 第 8 行）：
 //
 //	"content"     string
-//	"tool_calls"  []map[string]any  (one entry per tool call observed)
-//	"artifacts"   []map[string]any  (collected from tool responses — empty in P0)
+//	"tool_calls"  []map[string]any（观察到的每次工具调用一条）
+//	"artifacts"   []map[string]any（从工具响应收集——P0 阶段为空）
 type AgentOutput struct {
 	Content   string
 	ToolCalls []map[string]any
 	Artifacts []map[string]any
 }
 
-// agentRunner is the package-level ReAct runner. The production value
-// delegates to eino's flow/agent/react. Tests replace it with a function
-// that returns canned *schema.Message values.
+// agentRunner 包级 ReAct 运行器。生产值委托 eino 的 flow/agent/react；
+// 测试用返回预制 *schema.Message 的函数替换它。
 var agentRunner = runEinoReActAgent
 
-// runEinoReActAgent creates an eino react agent and runs it against the
-// model built from p.
+// runEinoReActAgent 创建 eino react agent 并用 p 构建的模型运行它。
 func runEinoReActAgent(ctx context.Context, p AgentParam) (*schema.Message, error) {
 	chatModel, err := buildAgentChatModel(ctx, p)
 	if err != nil {
@@ -168,11 +160,10 @@ func runEinoReActAgent(ctx context.Context, p AgentParam) (*schema.Message, erro
 		return nil, fmt.Errorf("build tools: %w", err)
 	}
 	input := buildAgentInputMessages(ctx, p)
-	// Eino's MaxStep counts graph nodes, not model calls. One ReAct round
-	// consists of a model decision, a tool node, and the following model
-	// decision that consumes the tool result. Reserve one additional step for
-	// the final model response, so max_rounds=1 can complete a tool call and
-	// produce its answer instead of failing with "exceeds max steps".
+	// ★ MaxStep 数的是图节点数，不是模型调用数。一个 ReAct 轮 = 一次
+	// 模型决策 + 一个工具节点 + 下一次消费工具结果的模型决策。另为
+	// 最终模型回复留一步——max_rounds=1 才能完成一次工具调用并产出
+	// 答案，而不是报 "exceeds max steps"。
 	maxSteps := p.MaxRounds*2 + 1
 
 	agent, err := react.NewAgent(ctx, &react.AgentConfig{
@@ -180,10 +171,9 @@ func runEinoReActAgent(ctx context.Context, p AgentParam) (*schema.Message, erro
 		ToolsConfig: compose.ToolsNodeConfig{
 			Tools: tools,
 		},
-		// Python's streaming tool loop consumes the complete provider
-		// response before deciding whether the round contains a tool call.
-		// Eino's default checker only inspects the first non-empty chunk,
-		// which can miss a ToolCall emitted after explanatory text.
+		// ★ Python 的流式工具循环先吞完整个提供方响应，再判断本轮是否
+		// 含工具调用。Eino 默认检查器只看第一个非空 chunk，会漏掉出现在
+		// 解释文本之后的 ToolCall。
 		StreamToolCallChecker: scanAllStreamForToolCall,
 		MessageModifier: func(_ context.Context, msgs []*schema.Message) []*schema.Message {
 			if p.SystemPrompt != "" {
@@ -199,17 +189,15 @@ func runEinoReActAgent(ctx context.Context, p AgentParam) (*schema.Message, erro
 
 	opt, future := react.WithMessageFuture()
 	ctx = setArtifactCollector(ctx, future)
-	// Start the model-stream collector BEFORE agent.Stream. The checker
-	// (scanAllStreamForToolCall) must consume the whole round before the
-	// graph releases its output stream, so agent.Stream does not return
-	// until the model finishes. GetMessageStreams blocks on the future's
-	// started signal (closed by the graph onStart callback), so starting
-	// the collector first lets thinking deltas stream out in real time
-	// while the checker runs, instead of buffering the entire round.
+	// ★ 模型流收集器必须在 agent.Stream 之前启动。检查器
+	// （scanAllStreamForToolCall）要吞完一整轮才放行图的输出流，
+	// agent.Stream 因此直到模型结束才返回。GetMessageStreams 阻塞在
+	// future 的 started 信号（由图 onStart 回调关闭）上——先启收集器，
+	// 思考增量就能在检查器跑的同时实时流出，而不是整轮缓冲。
 	emitDone := emitAgentModelStreams(ctx, future)
 	stream, err := agent.Stream(ctx, input, opt)
 	if err != nil {
-		// Drain the collector so its goroutine exits before we return.
+		// 流收集器的 goroutine 排空后再返回，避免泄漏。
 		select {
 		case <-emitDone:
 		case <-ctx.Done():
@@ -249,18 +237,15 @@ func runEinoReActAgent(ctx context.Context, p AgentParam) (*schema.Message, erro
 	return msg, nil
 }
 
-// scanAllStreamForToolCall consumes the whole model response, then branches
-// to the Tools node only when any streamed message contains a ToolCall. It
-// must read to EOF because providers append the tool-call message at the end
-// of the stream (see EinoChatModel.Stream), mirroring Python's
-// async_chat_streamly_with_tools, which likewise consumes an entire SSE round
-// before deciding. This keeps tool_choice=auto — a model may still answer
-// directly when it decides no tool is needed.
+// scanAllStreamForToolCall 吞完整模型响应后，仅当任一流式消息含
+// ToolCall 才分支到 Tools 节点。必须读到 EOF——提供方把 tool-call
+// 消息追加在流末尾（见 EinoChatModel.Stream），对齐 Python 的
+// async_chat_streamly_with_tools：同样先吞完一整轮 SSE 再决策。
+// 这样保留 tool_choice=auto——模型判定不需要工具时仍可直接作答。
 //
-// The checker runs synchronously inside the graph's main loop, so
-// runEinoReActAgent starts emitAgentModelStreams before agent.Stream to keep
-// thinking deltas streaming in real time while this function drains the
-// round.
+// 检查器在图主循环里同步执行——所以 runEinoReActAgent 在 agent.Stream
+// 之前先启 emitAgentModelStreams：本函数排空一轮的同时思考增量继续
+// 实时流出。
 func scanAllStreamForToolCall(_ context.Context, stream *schema.StreamReader[*schema.Message]) (bool, error) {
 	defer stream.Close()
 
@@ -279,26 +264,23 @@ func scanAllStreamForToolCall(_ context.Context, stream *schema.StreamReader[*sc
 	}
 }
 
-// buildAgentInputMessages assembles the Python-compatible Agent prompt: the
-// configured history window followed by the current user prompt. The current
-// in-flight user entry is excluded through SnapshotPriorHistory, because the
-// canvas service appends it to state before invoking the workflow. Uploaded
-// files from sys.files are folded into that user prompt (file texts merged,
-// images attached as multi-modal content parts).
+// buildAgentInputMessages ★组装 Agent 输入上下文（对齐 Python）：
+// 配置的历史窗口 + 当前用户 prompt。当前进行中的用户条目经
+// SnapshotPriorHistory 排除——canvas 服务在调工作流前已把它追加进
+// state。sys.files 上传文件折进用户 prompt（文件文本合并、图片作为
+// 多模态 content part 附加）。
 func buildAgentInputMessages(ctx context.Context, p AgentParam) []*schema.Message {
 	var state *runtime.CanvasState
 	if s, _, err := runtime.GetStateFromContext[*runtime.CanvasState](ctx); err == nil && s != nil {
 		state = s
 	}
-	// Inject sys.files uploads into the current user message, mirroring
-	// the LLM component (llm.go) and Python's Agent._prepare_prompt_variables
-	// delegation to LLMBundle. Uploaded files land in state.Sys["files"]
-	// (service/agent.go) as data:image URIs / parsed text; without this
-	// step a vision agent never sees the attached image. File texts merge
-	// into the user prompt; images become multi-modal content parts.
-	// The {sys.files} placeholder, when present, has already been resolved
-	// by ResolveTemplate upstream in invokeNow, so injection here is
-	// unconditional — same effective behavior as the LLM component.
+	// ★ 把 sys.files 上传注入当前用户消息，对齐 LLM 组件（llm.go）与
+	// Python Agent._prepare_prompt_variables 委托 LLMBundle 的做法。
+	// 上传文件落在 state.Sys["files"]（service/agent.go 里写入），形态为
+	// data:image URI / 已解析文本；不注入的话视觉 Agent 永远看不到
+	// 附图。文件文本并入用户 prompt；图片转多模态 content part。
+	// {sys.files} 占位符若存在，上游 invokeNow 里的 ResolveTemplate 已
+	// 解析过——所以这里无条件注入，与 LLM 组件行为等效。
 	userText := p.UserPrompt
 	var images []string
 	if state != nil {
@@ -319,12 +301,14 @@ func buildAgentInputMessages(ctx context.Context, p AgentParam) []*schema.Messag
 	}
 	messages := []schema.Message{}
 	if p.MessageHistoryWindowSize > 0 && state != nil {
-		// Python takes the last 2*N entries from history, which already
-		// contains the current user input, and then removes that final
-		// entry before formatting the configured prompt.
+		// 对齐 Python：历史里已含当前用户输入时取最后 2*N 条再去掉末尾
+		// 那条。Go 侧 SnapshotPriorHistory 本身不含当前输入，所以条数上
+		// 等价——取最后 2*N-1 条，效果一致。
 		priorLimit := p.MessageHistoryWindowSize*2 - 1
 		messages = prependHistory(messages, state.SnapshotPriorHistory(), priorLimit)
 	}
+	// 历史末尾若已是 user 消息（上一轮遗留），用当前用户消息原地覆盖，
+	// 避免出现两条连续 user 消息；否则正常追加在末尾。
 	if len(messages) > 0 && messages[len(messages)-1].Role == current.Role {
 		messages[len(messages)-1] = current
 	} else {
@@ -338,30 +322,44 @@ func buildAgentInputMessages(ctx context.Context, p AgentParam) []*schema.Messag
 	return input
 }
 
+// emitAgentModelStreams —— 思考过程实时转发器。后台 goroutine 盯着
+// eino MessageFuture 吐出的每一轮模型流，把 assistant 的正文/思考增量
+// 逐条转发给前端（runtime.EmitAgentMessage），让用户在模型还没说完时
+// 就能看到字在往外冒。
+//
+// 返回值是一个只发一次的 error 通道：goroutine 结束时把第一个遇到的
+// 错误（没有错误就是 nil）塞进去，调用方读这个通道等它收尾。
+//
+// 转发时的过滤规则（逐条判断，不符合就跳过）：
+//   - 只转发 assistant 角色的消息（工具结果、用户消息不转）；
+//   - 正文和思考都为空的空包不转；
+//   - 如果本次运行已经发过完整的 Agent 消息事件、又不是延迟模式的
+//     专用接收器，就不再重复转发，避免前端收到两份。
 func emitAgentModelStreams(ctx context.Context, future react.MessageFuture) <-chan error {
 	done := make(chan error, 1)
 	go func() {
 		var firstErr error
-		iter := future.GetMessageStreams()
+		iter := future.GetMessageStreams() // 拿到「每轮模型输出一个流」的迭代器（会阻塞到图启动）
 		for {
-			msgStream, hasNext, err := iter.Next()
+			msgStream, hasNext, err := iter.Next() // 取下一轮的模型流
 			if err != nil {
 				firstErr = err
 				break
 			}
-			if !hasNext {
+			if !hasNext { // 所有轮次都取完了，正常收工
 				break
 			}
 			if msgStream == nil {
 				continue
 			}
+			// 逐条读出这一轮的流式增量并转发。
 			for {
 				msg, err := msgStream.Recv()
-				if errors.Is(err, io.EOF) {
+				if errors.Is(err, io.EOF) { // 这一轮流完了，去取下一轮
 					break
 				}
 				if err != nil {
-					if firstErr == nil {
+					if firstErr == nil { // 只记第一个错误，后面的忽略
 						firstErr = err
 					}
 					break
@@ -369,38 +367,46 @@ func emitAgentModelStreams(ctx context.Context, future react.MessageFuture) <-ch
 				if msg == nil {
 					continue
 				}
-				if msg.Role != "" && msg.Role != schema.Assistant {
+				if msg.Role != "" && msg.Role != schema.Assistant { // 只转 assistant 的话
 					continue
 				}
-				if msg.Content == "" && msg.ReasoningContent == "" {
+				if msg.Content == "" && msg.ReasoningContent == "" { // 空包不转
 					continue
 				}
+				// 已经发过完整消息事件且不是延迟模式的接收器 → 不重复发。
 				if runtime.AgentMessageEventsEmitted(ctx) && !runtime.HasDeferredAgentMessageSink(ctx) {
 					continue
 				}
-				runtime.EmitAgentMessage(ctx, msg.Content, msg.ReasoningContent)
+				runtime.EmitAgentMessage(ctx, msg.Content, msg.ReasoningContent) // 实时推给前端
 			}
 			msgStream.Close()
 		}
-		done <- firstErr
+		done <- firstErr // 收尾：把第一个错误（或 nil）报给调用方
 	}()
 	return done
 }
 
-// addToolCallMemory summarizes the tool calls observed in msg via
-// a small LLM call and returns a one-line history entry. Mirrors
-// Python's `add_memory(user, assist, func_name, params, results,
-// user_defined_prompt)` — the LLM condenses the tool usage into a
-// short, memory-worthy sentence.
+// addToolCallMemory —— 工具调用记忆压缩器。把本轮 ReAct 里观察到的
+// 工具调用喂给一次小型 LLM 调用，让它压成一句话，作为可写进对话历史
+// 的记忆条目。对齐 Python 的 add_memory(user, assist, func_name,
+// params, results, user_defined_prompt)。
 //
-// When the LLM call fails or there are no tool calls, the function
-// returns ("", nil) and the caller skips appending to history.
+// 参数：
+//   - msg：ReAct 循环结束后的最终消息，里面带 ToolCalls 列表，形如：
+//     msg.ToolCalls = [{ID: "call_1", Function: {Name: "retrieval",
+//     Arguments: `{"query":"..."}`}}, ...]
+//   - p：只用来取模型四件套（Driver / ModelID / APIKey / BaseURL）。
+//
+// 返回：
+//   - 压缩后的一句话，如 "检索了产品手册中关于退货政策的段落"；
+//   - 没有工具调用时返回 ("", nil)，调用方据此跳过写历史；
+//   - LLM 调用失败时返回 ("", err)，同样由调用方决定不写历史。
 func addToolCallMemory(ctx context.Context, db *gorm.DB, p AgentParam, msg *schema.Message) (string, error) {
 	calls := extractToolCalls(msg)
-	if len(calls) == 0 {
+	if len(calls) == 0 { // 本轮没用过工具，没什么可记的
 		return "", nil
 	}
-	// Format a compact summary of the calls.
+	// 把每次调用拼成紧凑文本，形如：retrieval(map[query:...]); sql(map[...])
 	var callsDesc strings.Builder
 	for i, c := range calls {
 		if i > 0 {
@@ -428,26 +434,33 @@ func addToolCallMemory(ctx context.Context, db *gorm.DB, p AgentParam, msg *sche
 	return strings.TrimSpace(resp.Content), nil
 }
 
-// applyCitationGrounding is the post-stream citation grounding
-// call. It reads the chunks recorded in state.Retrieval["chunks"]
-// (populated by the Retrieval tool), renders
-// prompts.CitationPlusPrompt, and makes a second LLM call asking
-// the model to insert [ID:N] tags into the assistant's final
-// content.
+// applyCitationGrounding —— 答案引用标注器（流后二次加工）。ReAct 循环
+// 跑完后，把最终答案和检索到的切片一起交给一次额外的 LLM 调用，让模型
+// 在答案里插入 [ID:N] 标记，标明每句话出自哪个切片。对齐 Python 的
+// cite_letter / generate_with_citation 流程。
 //
-// Returns the grounded content on success, the original content
-// unchanged when no chunks are available or the call fails. Mirrors
-// Python's `cite_letter` / `generate_with_citation` flow.
+// 参数：
+//   - content：Agent 的最终答案文本；
+//   - chunks：检索切片列表，形如：
+//     []prompts.CitationSource{{ID: "chunk_123", Content: "原文段落..."}, ...}
+//     （由 Retrieval 工具写入 state.Retrieval["chunks"]，调用方先经
+//     chunksFromState 取出）。
+//
+// 返回：
+//   - 成功：插好 [ID:N] 标记的新文本；
+//   - 未开 Cite / 没有切片 / 答案本身为空：原样返回 content；
+//   - LLM 调用失败：返回原文 + err（引用标注是尽力而为，失败不阻断主流程）。
 func applyCitationGrounding(ctx context.Context, db *gorm.DB, p AgentParam, content string, chunks []prompts.CitationSource) (string, error) {
-	if !p.Cite {
+	if !p.Cite { // 没开引用功能，原样返回
 		return content, nil
 	}
-	if len(chunks) == 0 {
+	if len(chunks) == 0 { // 没有可引用的切片，无标注可做
 		return content, nil
 	}
-	if strings.TrimSpace(content) == "" {
+	if strings.TrimSpace(content) == "" { // 答案本身是空的，没东西可标
 		return content, nil
 	}
+	// 渲染引用专用 system prompt：把切片清单和标注规则写进去。
 	systemPrompt, _ := prompts.CitationPlusPrompt(chunks)
 	inv := getDefaultChatInvoker()
 	resp, err := inv.Invoke(ctx, db, ChatInvokeRequest{
@@ -462,31 +475,39 @@ func applyCitationGrounding(ctx context.Context, db *gorm.DB, p AgentParam, cont
 		TopP: p.TopP,
 	})
 	if err != nil {
-		// Grounding is best-effort. Return the original content
-		// so the message still flows; the caller can decide
-		// whether to surface the error.
+		// 标注是尽力而为：失败时返回原文，保证消息照常往下流，
+		// 要不要把错误暴露给用户由调用方决定。
 		return content, err
 	}
 	grounded := strings.TrimSpace(resp.Content)
-	if grounded == "" {
+	if grounded == "" { // 模型返回了空内容，宁可保留原文也不丢答案
 		return content, nil
 	}
 	return grounded, nil
 }
 
-// chunksFromState extracts the recorded retrieval chunks from
-// the canvas state in ctx. Returns nil when the state or the
-// chunks key is absent / empty. The returned slice is shaped
-// for prompts.CitationSource — the grounding renderer.
+// chunksFromState —— 检索切片提取器。从 ctx 里的画布状态中取出
+// Retrieval 工具记录的检索切片，整理成引用标注渲染器要的形状。
+//
+// 输入：ctx（携带画布运行状态，state.Retrieval["chunks"] 形如：
+//
+//	[]map[string]any{{"id": "chunk_123", "content": "原文段落..."}, ...}
+//
+// 输出：
+//
+//	[]prompts.CitationSource{{ID: "chunk_123", Content: "原文段落..."}, ...}
+//
+// 状态不存在、切片为空、或某条切片缺 id/content 时，对应跳过或返回 nil。
 func chunksFromState(ctx context.Context) []prompts.CitationSource {
 	state, _, err := runtime.GetStateFromContext[*runtime.CanvasState](ctx)
-	if err != nil || state == nil {
+	if err != nil || state == nil { // 不在画布运行上下文里，没有状态可查
 		return nil
 	}
-	raw := state.GetRetrievalChunks()
+	raw := state.GetRetrievalChunks() // 取出 Retrieval 工具写入的原始切片记录
 	if len(raw) == 0 {
 		return nil
 	}
+	// 逐条转成 CitationSource，id 或 content 缺失的残缺记录直接丢弃。
 	out := make([]prompts.CitationSource, 0, len(raw))
 	for _, m := range raw {
 		id, _ := m["id"].(string)
@@ -499,24 +520,30 @@ func chunksFromState(ctx context.Context) []prompts.CitationSource {
 	return out
 }
 
-// GetInputForm aggregates the Agent's own user-callable parameters with each
-// sub-tool's input form. Mirrors Python's `Agent.get_input_form`, which
-// returns a flat field-definition map keyed by input name.
+// GetInputForm —— Agent 输入表单自述器。汇总「这个 Agent 节点需要用户/上游
+// 填哪些输入」，对齐 Python 的 Agent.get_input_form。对齐对象是一个以输入名
+// 为键的扁平字段定义 map。
 //
-// Today the sub-tool input forms are aggregated via an optional
-// `InputForm() map[string]any` method on the eino tool (when tools
-// implement it); tools that don't expose a structured input form
-// are skipped silently.
+// 返回形如：
+//
+//	{
+//	  "query": {"type": "line", "name": "query", "optional": false}, // 来自 prompt 里的 {query} 占位符
+//	  "retrieval": {...工具自报的输入表单...},                       // 来自实现了 InputForm() 的工具
+//	}
+//
+// 子工具的表单靠可选的 InputForm() map[string]any 方法自报；没实现该方法
+// 的工具静默跳过，不报错。
 func (c *AgentComponent) GetInputForm() map[string]any {
+	// 第一步：从 system/user prompt 里扫出所有 {xxx} 占位符，作为用户可填字段。
 	out := extractAgentPromptInputForm(c.param.SystemPrompt, c.param.UserPrompt)
-	// GetInputForm is metadata introspection outside a Canvas run and its
-	// interface has no context. Runtime tool construction uses the run ctx in
-	// runEinoReActAgent above.
+	// GetInputForm 是画布运行之外的元数据自省，接口上没有 context；
+	// 真正运行时的工具构建用的是 runEinoReActAgent 里的运行 ctx。
 	metadataCtx := context.Background()
 	tools, err := buildAgentTools(metadataCtx, c.param)
 	if err != nil {
-		return out
+		return out // 工具构建失败时只返回 prompt 占位符部分，不阻断表单元数据查询
 	}
+	// 第二步：逐个工具问名字，能自报表单的就以工具名为键并入总表。
 	for _, t := range tools {
 		info, ierr := t.Info(metadataCtx)
 		name := ""
@@ -533,15 +560,20 @@ func (c *AgentComponent) GetInputForm() map[string]any {
 	return out
 }
 
+// extractAgentPromptInputForm 从两段 prompt 文本里扫出所有 {xxx} 变量
+// 占位符（用 runtime.VarRefPattern 匹配），去重后生成输入表单。
+// 每个占位符对应一个单行文本输入框，形如：
+//
+//	{"type": "line", "name": "query", "optional": false}
 func extractAgentPromptInputForm(systemPrompt, userPrompt string) map[string]any {
 	out := map[string]any{}
-	seen := map[string]struct{}{}
+	seen := map[string]struct{}{} // 同名占位符只记一次（两段 prompt 可能重复引用）
 	matches := append(runtime.VarRefPattern.FindAllStringSubmatch(systemPrompt, -1), runtime.VarRefPattern.FindAllStringSubmatch(userPrompt, -1)...)
 	for _, match := range matches {
 		if len(match) < 2 {
 			continue
 		}
-		key := strings.TrimSpace(match[1])
+		key := strings.TrimSpace(match[1]) // 捕获组里是占位符名，如 {query} → "query"
 		if key == "" {
 			continue
 		}
@@ -558,6 +590,8 @@ func extractAgentPromptInputForm(systemPrompt, userPrompt string) map[string]any
 	return out
 }
 
+// sortedAgentPromptInputKeys 返回 prompt 占位符名的去重排序列表，
+// 供需要稳定遍历顺序的调用方（如渲染表单、拼提示词）使用。
 func sortedAgentPromptInputKeys(systemPrompt, userPrompt string) []string {
 	form := extractAgentPromptInputForm(systemPrompt, userPrompt)
 	keys := make([]string, 0, len(form))
@@ -568,41 +602,49 @@ func sortedAgentPromptInputKeys(systemPrompt, userPrompt string) []string {
 	return keys
 }
 
-// Reset calls Reset on every sub-tool that implements the Resetter
-// interface. Mirrors Python's per-tool reset() — useful for clearing
-// per-invocation state (caches, scratch buffers) between calls.
+// Reset —— 子工具状态清零器。逐个调用实现了 Reset() 的子工具的复位方法，
+// 清掉每次调用累积的私有状态（缓存、临时缓冲）。对齐 Python 的逐工具
+// reset()。
 func (c *AgentComponent) Reset() {
-	// Reset is a context-free lifecycle hook and does not execute a tool.
-	// Runtime tool construction receives the Canvas run context.
+	// Reset 是无 context 的生命周期钩子，不执行工具；运行时的工具构建
+	// 拿的是画布运行 ctx，这里只是复位元数据，用 Background 即可。
 	tools, err := buildAgentTools(context.Background(), c.param)
 	if err != nil {
-		return
+		return // 工具都构建不出来，自然没有可复位的对象
 	}
 	for _, t := range tools {
-		if r, ok := t.(interface{ Reset() }); ok {
+		if r, ok := t.(interface{ Reset() }); ok { // 只复位实现了 Reset 接口的工具
 			r.Reset()
 		}
 	}
 }
 
-// optimizeMultiTurnQuestion asks the LLM to rephrase the current user
-// prompt into a self-contained question that doesn't require the
-// conversation history to understand. Mirrors Python's `full_question`
-// LLM pass.
+// optimizeMultiTurnQuestion —— 多轮问题改写器。把「依赖上下文的简短追问」
+// 改写成「不依赖历史也能看懂的完整问题」，供后续检索/推理使用。对齐
+// Python 的 full_question LLM 环节。
 //
-// Returns the original prompt unchanged if:
-//   - history has < 2 entries (no prior turns to fold in)
-//   - the rephrase LLM call fails
+// 参数：
+//   - history：既往对话，形如：
+//     []map[string]any{{"role": "user", "content": "..."},
+//     {"role": "assistant", "content": "..."}, ...}
+//   - 改写对象是 p.UserPrompt（当前轮用户输入）。
 //
-// Window defaults to AgentParam.OptimizeHistoryWindow (3) when zero.
+// 返回：
+//   - 改写后的自含问题；
+//   - 历史不足 2 条（没有可折叠的前文）或拼不出有效历史时返回 ("", nil)，
+//     调用方继续用原问题；
+//   - LLM 调用失败时返回 ("", err)，调用方同样回退用原问题。
+//
+// 历史窗口默认取 OptimizeHistoryWindow，为 0 时用 3。
 func optimizeMultiTurnQuestion(ctx context.Context, db *gorm.DB, p AgentParam, history []map[string]any) (string, error) {
 	window := p.OptimizeHistoryWindow
 	if window <= 0 {
-		window = 3
+		window = 3 // 默认只拿最近 3 条历史参与改写，避免 prompt 过长
 	}
-	if len(history) < 2 {
+	if len(history) < 2 { // 连一轮完整对话都凑不齐，没有可折叠的指代
 		return "", nil
 	}
+	// 只取最后 window 条，拼成 "role: content" 逐行文本。
 	start := 0
 	if len(history) > window {
 		start = len(history) - window
@@ -612,12 +654,12 @@ func optimizeMultiTurnQuestion(ctx context.Context, db *gorm.DB, p AgentParam, h
 		e := history[i]
 		role, _ := e["role"].(string)
 		content, _ := e["content"].(string)
-		if role == "" || content == "" {
+		if role == "" || content == "" { // 残缺条目跳过，不往改写素材里掺空行
 			continue
 		}
 		fmt.Fprintf(&histBuf, "%s: %s\n", role, content)
 	}
-	if histBuf.Len() == 0 {
+	if histBuf.Len() == 0 { // 窗口内全是残缺条目，等于没有历史
 		return "", nil
 	}
 	system := "You are a question rephraser. Given conversation history and the user's latest input, rewrite the latest input as a self-contained question that does not require the history to understand. Output ONLY the rephrased question, no preamble, no quotes."
@@ -640,11 +682,25 @@ func optimizeMultiTurnQuestion(ctx context.Context, db *gorm.DB, p AgentParam, h
 	return strings.TrimSpace(resp.Content), nil
 }
 
+// buildAgentTools —— Agent 工具箱装配器。把 AgentParam 里声明的工具名和
+// 子 Agent 全部变成 eino 能调用的 BaseTool 实例列表。
+//
+// 参数：
+//   - p.Tools：静态工具名列表，如 []string{"retrieval", "execute_sql"}；
+//   - p.ToolParams：按工具名键控的构造参数，如：
+//     {"execute_sql": {"db_url": "..."}}
+//   - p.SubAgents：子 Agent 规格列表，每个包成一个可调用的工具。
+//
+// 返回：拼好的工具列表（静态工具在前、子 Agent 工具在后）。
+// 任一静态工具无名、或工具名撞车时直接报错——重名会让模型的工具调用
+// 指向歧义。
 func buildAgentTools(ctx context.Context, p AgentParam) ([]einotool.BaseTool, error) {
+	// 第一步：把配置的工具名批量构建成真实工具实例。
 	tools, err := agenttool.BuildAll(p.Tools, p.ToolParams)
 	if err != nil {
 		return nil, err
 	}
+	// 第二步：逐个检查静态工具的名字——必须有名字且不能重复。
 	toolNames := make(map[string]struct{}, len(tools)+len(p.SubAgents))
 	for _, tool := range tools {
 		info, err := tool.Info(ctx)
@@ -659,6 +715,8 @@ func buildAgentTools(ctx context.Context, p AgentParam) ([]einotool.BaseTool, er
 		}
 		toolNames[info.Name] = struct{}{}
 	}
+	// 第三步：每个子 Agent 包成 subAgentTool 追加进来；名字与已有工具冲突时
+	// 自动加后缀去重（见 uniqueAgentToolName）。
 	for _, subAgent := range p.SubAgents {
 		name := uniqueAgentToolName(subAgent.Name, toolNames)
 		toolNames[name] = struct{}{}
@@ -667,11 +725,19 @@ func buildAgentTools(ctx context.Context, p AgentParam) ([]einotool.BaseTool, er
 	return tools, nil
 }
 
+// subAgentTool 把子 Agent 包成 eino 工具——父 Agent 眼里的一个普通工具，
+// 调用时实际是启动了一个完整的嵌套 Agent。
 type subAgentTool struct {
-	name string
-	spec SubAgentTool
+	name string       // 注册给父 Agent 的工具名（已去重）
+	spec SubAgentTool // 子 Agent 的名字、描述与完整参数
 }
 
+// Info 返回子 Agent 工具的 schema——告诉父 Agent 的模型「这个工具叫什么、
+// 干什么、要传哪三个参数」。三个固定入参对齐 Python 的子 Agent 调用约定：
+//
+//	user_prompt：要子 Agent 办的具体事；
+//	reasoning：  父 Agent 为什么选它（促使模型想清楚再调）；
+//	context：    子 Agent 需要的背景信息（子 Agent 看不到父对话历史）。
 func (t *subAgentTool) Info(_ context.Context) (*schema.ToolInfo, error) {
 	params := map[string]*schema.ParameterInfo{
 		"user_prompt": {
@@ -701,8 +767,10 @@ func (t *subAgentTool) Info(_ context.Context) (*schema.ToolInfo, error) {
 	}, nil
 }
 
+// subAgentDepthKey 是 ctx 里存「子 Agent 嵌套深度」的键。
 type subAgentDepthKey struct{}
 
+// subAgentDepth 读出当前调用链已嵌套到第几层子 Agent；没有记录就是 0（顶层）。
 func subAgentDepth(ctx context.Context) int {
 	if v, ok := ctx.Value(subAgentDepthKey{}).(int); ok {
 		return v
@@ -710,14 +778,29 @@ func subAgentDepth(ctx context.Context) int {
 	return 0
 }
 
+// InvokableRun —— 子 Agent 工具的执行入口。父 Agent 的模型决定调用这个工具时，
+// eino 会把模型生成的 JSON 参数传进来，本函数负责真正启动子 Agent 并把答案
+// 以字符串形式还给父 Agent。
+//
+// 参数：
+//   - argsJSON：模型生成的参数，形如：
+//     `{"user_prompt":"...", "reasoning":"...", "context":"..."}`
+//
+// 返回：
+//   - 子 Agent 输出的 content 字符串；若输出里没有字符串 content，则把整个
+//     输出 map 序列化成 JSON 字符串返回；
+//   - 嵌套超过 maxSubAgentDepth 层、参数解析失败、子 Agent 执行失败时报错。
 func (t *subAgentTool) InvokableRun(ctx context.Context, argsJSON string, _ ...einotool.Option) (string, error) {
+	// 防套娃：嵌套深度到顶就拒绝，避免两个 Agent 互相调用无限递归。
 	depth := subAgentDepth(ctx)
 	if depth >= maxSubAgentDepth {
 		return "", fmt.Errorf("sub-agent tool %q: max nesting depth (%d) exceeded", normalizeAgentToolName(t.spec.Name), maxSubAgentDepth)
 	}
 
+	// 深度 +1 写回 ctx，子 Agent 内部再调工具时能看到新深度。
 	ctx = context.WithValue(ctx, subAgentDepthKey{}, depth+1)
 
+	// 把模型给的 JSON 参数解成 inputs map；空参数当空 map 处理。
 	inputs := map[string]any{}
 	if strings.TrimSpace(argsJSON) != "" {
 		if err := json.Unmarshal([]byte(argsJSON), &inputs); err != nil {
@@ -725,10 +808,12 @@ func (t *subAgentTool) InvokableRun(ctx context.Context, argsJSON string, _ ...e
 		}
 	}
 
+	// 用子 Agent 自己的参数新建组件并立即执行（复用完整的 Agent 流程）。
 	out, err := NewAgentComponent(t.spec.Param).Invoke(ctx, dao.DB, inputs)
 	if err != nil {
 		return "", fmt.Errorf("sub-agent tool %q: %w", normalizeAgentToolName(t.spec.Name), err)
 	}
+	// 优先还纯文本 content；没有就把整个输出打包成 JSON 字符串。
 	if content, ok := out["content"].(string); ok {
 		return content, nil
 	}
@@ -739,6 +824,8 @@ func (t *subAgentTool) InvokableRun(ctx context.Context, argsJSON string, _ ...e
 	return string(payload), nil
 }
 
+// subAgentToolDescription 选子 Agent 工具的描述文本：优先用外层显式配的
+// Description，其次用子 Agent 参数里的 Description，都没有就用默认占位句。
 func subAgentToolDescription(spec SubAgentTool) string {
 	if strings.TrimSpace(spec.Description) != "" {
 		return strings.TrimSpace(spec.Description)
@@ -749,6 +836,8 @@ func subAgentToolDescription(spec SubAgentTool) string {
 	return "This is an agent for a specific task."
 }
 
+// uniqueAgentToolName 给子 Agent 工具取一个不撞车的名字：基础名可用就直接用，
+// 被占了就依次尝试 base_2、base_3……直到找到空位。
 func uniqueAgentToolName(name string, used map[string]struct{}) string {
 	base := normalizeAgentToolName(name)
 	if _, exists := used[base]; !exists {
@@ -762,12 +851,20 @@ func uniqueAgentToolName(name string, used map[string]struct{}) string {
 	}
 }
 
+// normalizeAgentToolName 把任意字符串洗成合法的工具名——只保留字母、数字、
+// 下划线、连字符。规则：
+//
+//	非法字符替换成下划线，连续多个只留一个（"my agent!" → "my_agent"）；
+//	首尾的分隔符剔掉；数字开头的前面补 "agent_"（"2号助手" → "agent_2"）；
+//	洗完是空串的一律叫 "agent"。
 func normalizeAgentToolName(name string) string {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return "agent"
 	}
 
+	// 逐字符过滤：合法字符原样保留；非法字符换成下划线，
+	// 但连续非法字符只产生一个下划线。
 	var b strings.Builder
 	lastSeparator := false
 	for _, r := range name {
@@ -786,35 +883,39 @@ func normalizeAgentToolName(name string) string {
 		}
 	}
 
-	out := strings.Trim(b.String(), "_-")
+	out := strings.Trim(b.String(), "_-") // 首尾残留的分隔符没意义，剔掉
 	if out == "" {
 		return "agent"
 	}
-	if out[0] >= '0' && out[0] <= '9' {
+	if out[0] >= '0' && out[0] <= '9' { // 数字开头对某些模型/框架不合法，前缀兜底
 		out = "agent_" + out
 	}
 	return out
 }
 
-// NewAgentComponent builds an AgentComponent from raw params.
+// NewAgentComponent 用已解析的参数构造 AgentComponent；未配 MaxRounds 时
+// 补上 Python Agent 的默认值（max_rounds = 5）。
 func NewAgentComponent(p AgentParam) *AgentComponent {
 	if p.MaxRounds <= 0 {
-		// Keep the Python Agent default (AgentParam.max_rounds = 5).
 		p.MaxRounds = 5
 	}
 	return &AgentComponent{param: p}
 }
 
-// Name returns the registered component name.
+// Name 返回组件在注册表里的名字："Agent"。
 func (c *AgentComponent) Name() string { return "Agent" }
 
-// Invoke either returns a lazy Agent stream for a direct downstream Message,
-// or executes the Agent eagerly for all other graph shapes. The mode is a
-// compile-time canvas decision carried through context, not a DSL parameter.
+// Invoke —— Agent 组件的统一入口。根据画布编译期写进 ctx 的开关走两条路：
+//
+//   - 下游直连 Message 组件（DeferAgentToMessage=true）：不立即执行，返回一个
+//     懒流占位（DeferredStream），等 Message 真正要数据时才启动 Agent；
+//   - 其他所有图形状：立即执行（走 invokeNow）。
+//
+// 模式是画布编译期的决定，经 ctx 传递，不是 DSL 参数。
 func (c *AgentComponent) Invoke(ctx context.Context, db *gorm.DB, inputs map[string]any) (map[string]any, error) {
 	if runtime.ComponentExecutionOptionsFromContext(ctx).DeferAgentToMessage {
-		// Preserve the Agent-class duration installed by the node wrapper, then
-		// start a fresh deadline when Message opens the lazy stream.
+		// 沿用节点包装层给 Agent 装的总时长作为超时基准；没有截止期就用默认 10 分钟。
+		// 计时从 Message 打开懒流那一刻才真正开始。
 		timeout := defaultAgentDeferredTimeout
 		if deadline, ok := ctx.Deadline(); ok {
 			if remaining := time.Until(deadline); remaining > 0 {
@@ -822,6 +923,8 @@ func (c *AgentComponent) Invoke(ctx context.Context, db *gorm.DB, inputs map[str
 			}
 		}
 		deferred := &runtime.DeferredStream{
+			// Message 打开懒流时回调：新建带超时的 ctx、挂上增量接收器，
+			// 然后走和立即执行完全相同的 invokeNow 路径。
 			Open: func(openCtx context.Context, sink runtime.AgentDeltaSink) (map[string]any, error) {
 				agentCtx, cancel := context.WithTimeout(openCtx, timeout)
 				defer cancel()
@@ -833,25 +936,48 @@ func (c *AgentComponent) Invoke(ctx context.Context, db *gorm.DB, inputs map[str
 	return c.invokeNow(ctx, db, inputs)
 }
 
-// invokeNow contains the original eager Agent execution path. Deferred
-// Message consumption calls this function later with an invocation-local
-// delta sink, so the same ReAct/citation/tool behavior is reused once.
+// invokeNow —— Agent 的完整执行主流程（立即执行路径；延迟模式下 Message 打开
+// 懒流后也调这里，只是多带一个本次调用专属的增量接收器，其余行为完全一致）。
+//
+// 参数：
+//   - inputs：运行时输入，形如 {"user_prompt": "...", "reasoning": "..."}，
+//     会叠加到 DSL 静态参数之上（见 mergeAgentParam）；
+//
+// 返回（成功时）：
+//
+//	{
+//	  "content":  "最终答案文本（含附件 Markdown 链接）",
+//	  "thinking": "模型思考过程（提供方单独返回时才有）",
+//	  "tool_calls": [{"id": "...", "name": "...", "arguments": "..."}],
+//	  "artifacts":  [{"name": "report.pdf", "url": "https://..."}],
+//	}
+//
+// 出错分两种：构建/取消类错误直接返回 err；ReAct 图运行失败转成
+// {"_ERROR": "**ERROR**: ..."} 走数据流，交给画布异常分支处理。
 func (c *AgentComponent) invokeNow(ctx context.Context, db *gorm.DB, inputs map[string]any) (map[string]any, error) {
+	// 重置消息发射状态，并在退出前收尾（确保最终消息事件一定发出）。
 	runtime.ResetAgentMessageEmission(ctx)
 	defer runtime.FinalizeAgentMessage(ctx)
 
+	// 运行时输入叠加到 DSL 静态参数上，得到本次执行用的最终参数。
 	p := mergeAgentParam(c.param, inputs)
+	// 记录上游是否真的传了有效的 user_prompt（空串/默认占位句不算），
+	// 后面决定要不要拼 reasoning/context、要不要回退到 sys.query。
 	hasRuntimeUserPrompt := false
 	if v, ok := stringFrom(inputs, "user_prompt"); ok {
 		hasRuntimeUserPrompt = !shouldFallbackToSysQuery(v)
 	}
 
+	// 解析模型引用：把复合 llm_id 拆成裸模型名+驱动，并从租户配置里
+	// 补齐 driver / api_key / base_url（显式配了的优先）。
 	var err error
 	p.ModelID, p.Driver, p.APIKey, p.BaseURL, err = resolveChatModelRef(ctx, db, p.ModelID, p.Driver, p.APIKey, p.BaseURL)
 	if err != nil {
 		return nil, err
 	}
 
+	// 从 ctx 取画布状态，并把两段 prompt 里的 {component@param} 模板引用
+	// 解析成真实值（上游组件的输出可以直接嵌进 prompt）。
 	var state *runtime.CanvasState
 	if s, _, err := runtime.GetStateFromContext[*runtime.CanvasState](ctx); err == nil && s != nil {
 		state = s
@@ -868,6 +994,11 @@ func (c *AgentComponent) invokeNow(ctx context.Context, db *gorm.DB, inputs map[
 			}
 		}
 	}
+	// 用户 prompt 的最终定型，三选一：
+	// ① 上游传了有效 user_prompt（典型：作为子 Agent 被调用）→ 把父 Agent 给的
+	//    reasoning/context 拼进去；
+	// ② prompt 是空/默认占位句且没配 system prompt → 回退用用户原始提问 sys.query；
+	// ③ 其余情况保持模板解析后的原样。
 	if hasRuntimeUserPrompt {
 		p.UserPrompt = formatAgentRuntimePrompt(inputs, p.UserPrompt)
 	} else if shouldFallbackToSysQuery(p.UserPrompt) && strings.TrimSpace(p.SystemPrompt) == "" && state != nil {
@@ -876,24 +1007,22 @@ func (c *AgentComponent) invokeNow(ctx context.Context, db *gorm.DB, inputs map[
 		}
 	}
 
+	// 必填校验：模型和两段 prompt 至少要有一个非空。
 	if p.ModelID == "" {
 		return nil, &ParamError{Field: "model_id", Reason: "required"}
 	}
 	if p.UserPrompt == "" && p.SystemPrompt == "" {
 		return nil, &ParamError{Field: "user_prompt", Reason: "at least one of user_prompt or system_prompt must be set"}
 	}
-	// v1 fixtures sometimes ship only a system prompt. Fall back to
-	// using the system text as the user message so the underlying
-	// chat call still has something to send to the model.
+	// 只配了 system prompt 的老式画布：拿 system 文本当用户消息兜底，
+	// 保证底层聊天调用总有东西可发。
 	if p.UserPrompt == "" {
 		p.UserPrompt = p.SystemPrompt
 	}
 
-	// Multi-turn conversation optimization. When the canvas state
-	// carries prior history and OptimizeMultiTurn is enabled
-	// explicitly, rephrase the user prompt into a self-contained question via
-	// a dedicated LLM call. The rephrased prompt is what the Agent runner
-	// actually consumes.
+	// 多轮对话优化：显式开启且画布带历史时，先用一次专门的 LLM 调用把当前
+	// 提问改写成自含问题（把「它」「这个」之类的指代展开），改写结果才是
+	// ReAct 循环真正消费的用户输入。
 	if p.OptimizeMultiTurn {
 		if state, _, sErr := runtime.GetStateFromContext[*runtime.CanvasState](ctx); sErr == nil && state != nil {
 			if rephrased, err := optimizeMultiTurnQuestion(ctx, db, p, state.SnapshotPriorHistory()); err == nil && rephrased != "" {
@@ -902,11 +1031,11 @@ func (c *AgentComponent) invokeNow(ctx context.Context, db *gorm.DB, inputs map[
 		}
 	}
 
+	// ★ 真正启动 ReAct 循环（模型决策 ↔ 工具执行，直到出答案或到轮数上限）。
 	msg, err := agentRunner(ctx, p)
-	// Tool-call memory summarization. After the ReAct loop
-	// completes, summarize the tool calls via an LLM and append to
-	// the canvas state's Memory. Conversation History is reserved for
-	// actual user/assistant turns maintained by the canvas service.
+	// 工具调用记忆：循环跑完后把用过的工具压成一句话写进画布状态的 Memory，
+	// 供后续轮次参考。对话 History 另由画布服务维护真实的用户/助手轮次，
+	// 这里不碰。
 	if err == nil && msg != nil {
 		if state, _, sErr := runtime.GetStateFromContext[*runtime.CanvasState](ctx); sErr == nil && state != nil {
 			if summary, sErr2 := addToolCallMemory(ctx, db, p, msg); sErr2 == nil && summary != "" {
@@ -915,26 +1044,18 @@ func (c *AgentComponent) invokeNow(ctx context.Context, db *gorm.DB, inputs map[
 		}
 	}
 	if err != nil {
-		// Python's LLM layer turns model/tool execution failures into an
-		// ``**ERROR**`` response, which Agent exposes as the `_ERROR`
-		// component output.  Preserve cancellation as a real graph error,
-		// but keep ordinary ReAct failures in the component data flow so
-		// Canvas exception branches can handle them.
+		// 错误分流（对齐 Python：LLM 层的执行失败会变成 **ERROR** 响应，Agent
+		// 以 _ERROR 输出暴露给画布异常分支）：
+		// - 取消/超时、以及构建配置类错误 → 保持真实错误，让无效画布快速失败；
+		// - ReAct 图运行类错误（如超过最大步数）→ 转成 _ERROR 数据，交给画布
+		//   的异常分支处理。
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || !isAgentGraphRunError(err) {
 			return nil, fmt.Errorf("component: Agent.Invoke: %w", err)
 		}
 		return map[string]any{"_ERROR": "**ERROR**: " + err.Error()}, nil
 	}
-	// Post-stream citation grounding. When Cite is enabled and
-	// the canvas state has recorded retrieval chunks (populated
-	// by the Retrieval tool during the ReAct loop), make a second
-	// LLM call to insert [ID:N] tags into the final content. The
-	// grounding call is best-effort — on failure the original
-	// content is kept and the error is surfaced under
-	// outputs["grounding_error"].
-	// Diagnostic sentinel (temporary — see plan): log the post-
-	// agentRunner state right before the `msg.Content` deref so a
-	// subsequent panic shows whether the agent returned (nil, nil).
+	// 防御：运行器正常不该返回 (nil, nil)。真遇到时先落一条调试日志，
+	// 再包成明确错误返回，避免后面取 msg.Content 时空指针崩溃。
 	if msg == nil {
 		common.Debug("agent.Invoke: msg is NIL after agentRunner",
 			zap.String("driver", p.Driver),
@@ -950,6 +1071,8 @@ func (c *AgentComponent) invokeNow(ctx context.Context, db *gorm.DB, inputs map[
 	content := msg.Content
 	thinking := msg.ReasoningContent
 
+	// 流后引用落地：开了 Cite 且有检索切片时，再调一次 LLM 给答案插 [ID:N]
+	// 标注。尽力而为——失败保留原文，只把状态记进 grounding_status。
 	var groundingStatus string
 	if p.Cite {
 		chunks := chunksFromState(ctx)
@@ -965,8 +1088,10 @@ func (c *AgentComponent) invokeNow(ctx context.Context, db *gorm.DB, inputs map[
 			}
 		}
 	}
+	// 从工具响应里收集附件（图片/文件链接），并渲染成 Markdown 追加到答案末尾。
 	artifacts := collectArtifactsFromToolCalls(ctx, msg)
 	artifactMD := formatArtifactMarkdown(artifacts, content)
+	// 组装最终输出（形状见函数头注释）。
 	out := map[string]any{
 		"content":    content + artifactMD,
 		"thinking":   thinking,
@@ -976,6 +1101,8 @@ func (c *AgentComponent) invokeNow(ctx context.Context, db *gorm.DB, inputs map[
 	if groundingStatus != "" {
 		out["grounding_status"] = groundingStatus
 	}
+	// 如果本次运行从未实时流出过消息（比如测试或特殊图形状），补发一次完整
+	// 消息事件，保证前端总能收到最终结果。
 	streamed := runtime.AgentMessageEventsEmitted(ctx) || runtime.DeferredAgentMessageEventsEmitted(ctx)
 	if !streamed {
 		runtime.EmitAgentMessage(ctx, content+artifactMD, thinking)
@@ -983,10 +1110,9 @@ func (c *AgentComponent) invokeNow(ctx context.Context, db *gorm.DB, inputs map[
 	return out, nil
 }
 
-// isAgentGraphRunError identifies ReAct graph failures that Python exposes
-// through the Agent component's _ERROR output. Construction/configuration
-// errors must remain real component errors so invalid canvases still fail
-// fast; only the graph execution limit/error is routed to exception branches.
+// isAgentGraphRunError 判断一个错误是不是「ReAct 图运行失败」（如超过最大步数）。
+// 只有这类错误才转成 _ERROR 输出走画布异常分支；构建/配置类错误必须保持真实错误，
+// 让无效画布快速失败。靠错误文本里的特征串识别。
 func isAgentGraphRunError(err error) bool {
 	if err == nil {
 		return false
@@ -995,8 +1121,8 @@ func isAgentGraphRunError(err error) bool {
 	return strings.Contains(msg, "[graphrunerror]") || strings.Contains(msg, "exceeds max steps")
 }
 
-// Stream implements Component.Stream. Mirrors Invoke then pushes the
-// single payload through the channel.
+// Stream 实现 Component.Stream 接口：包一层 Invoke，把唯一一次结果（或错误）
+// 推进通道后关闭。Agent 的流式体验由消息事件承担，这里只交付最终载荷。
 func (c *AgentComponent) Stream(ctx context.Context, db *gorm.DB, inputs map[string]any) (<-chan map[string]any, error) {
 	out := make(chan map[string]any, 1)
 	go func() {
@@ -1011,7 +1137,7 @@ func (c *AgentComponent) Stream(ctx context.Context, db *gorm.DB, inputs map[str
 	return out, nil
 }
 
-// Inputs returns parameter metadata for tooling.
+// Inputs 返回输入参数的说明元数据（供前端/工具展示，不参与执行逻辑）。
 func (c *AgentComponent) Inputs() map[string]string {
 	return map[string]string{
 		"model_id":                "Provider-side model identifier (e.g. \"gpt-4o-mini\")",
@@ -1030,7 +1156,7 @@ func (c *AgentComponent) Inputs() map[string]string {
 	}
 }
 
-// Outputs returns output metadata.
+// Outputs 返回输出字段的说明元数据（供前端/工具展示，不参与执行逻辑）。
 func (c *AgentComponent) Outputs() map[string]string {
 	return map[string]string{
 		"content":          "Final assistant content (after the ReAct loop terminates)",
@@ -1041,25 +1167,23 @@ func (c *AgentComponent) Outputs() map[string]string {
 	}
 }
 
-// buildAgentChatModel constructs an EinoChatModel from AgentParam by
-// resolving the driver through the RAGFlow provider manager.
+// buildAgentChatModel —— Agent 专用聊天模型组装器。按 AgentParam 里的模型信息，
+// 经 RAGFlow 驱动层构造出可供 eino ReAct 循环调用的 EinoChatModel。
+//
+// 参数：p 只用到模型四件套（ModelID / Driver / APIKey / BaseURL）和生成参数
+// （TopP / MaxTokens / Temperature / Thinking）。
+// 返回：包好的 EinoChatModel；驱动解析失败时报错。
 func buildAgentChatModel(ctx context.Context, p AgentParam) (*models.EinoChatModel, error) {
 	driver := p.Driver
 	modelID := p.ModelID
 
-	// When the Agent DSL omits `driver`, derive it from the composite
-	// llm_id format. The RAGFlow DSL stores the model identifier as
-	// "<model>@<instance>@<provider>" (mirrors Python's
-	// split_model_name at
-	// api/db/joint_services/tenant_model_service.py:163-178 and the
-	// Go-side SplitModelNameAndFactory at
-	// internal/service/tenant.go:168). Two-part
-	// "<model>@<provider>" and bare "<model>" are also accepted —
-	// bare means no driver known, which falls through to the dummy
-	// driver below. The trailing "@<provider>" suffix must also be
-	// stripped from the model id before passing to the driver — the
-	// upstream APIs (ZhipuAI, OpenAI, …) do not accept composite
-	// names and would 400 on the "@<provider>" tail.
+	// DSL 没写 driver 时，从复合 llm_id 里拆出厂商名当驱动。RAGFlow DSL 里模型
+	// 标识存成 "<model>@<instance>@<provider>"（对齐 Python 的 split_model_name，
+	// api/db/joint_services/tenant_model_service.py:163-178；Go 侧对应
+	// SplitModelNameAndFactory，internal/service/tenant.go:168）。两段式
+	// "<model>@<provider>" 和裸 "<model>" 也认——裸名表示不知道驱动，后面落到
+	// dummy 驱动。同时必须把 "@<provider>" 尾巴从模型名里剔掉再交给驱动：
+	// 上游 API（ZhipuAI、OpenAI 等）不认复合名，带着尾巴会直接 400。
 	if driver == "" && modelID != "" {
 		if bareModelName, providerName, ok := splitCompositeLLMID(modelID); ok {
 			driver = providerName
@@ -1067,8 +1191,9 @@ func buildAgentChatModel(ctx context.Context, p AgentParam) (*models.EinoChatMod
 		}
 	}
 	if driver == "" {
-		driver = "dummy"
+		driver = "dummy" // 实在没有驱动信息时用占位驱动（仅测试/特殊场景能跑通）
 	}
+	// 经驱动工厂拿到具体厂商的聊天模型实现。
 	d, err := newChatModelDriver(driver, p.BaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("resolve driver %q: %w", driver, err)
@@ -1079,7 +1204,7 @@ func buildAgentChatModel(ctx context.Context, p AgentParam) (*models.EinoChatMod
 	apiKey := p.APIKey
 	cfg := &models.APIConfig{ApiKey: &apiKey}
 	cm := models.NewChatModel(d, &modelID, cfg)
-	// Build ChatConfig when a generation parameter or Thinking is set.
+	// 配了任一生成参数或思考开关时才构造 ChatConfig，其余情况用驱动默认值。
 	var chatCfg *models.ChatConfig
 	if p.TopP != nil || p.Thinking != "" || p.MaxTokens != nil || p.Temperature != nil {
 		chatCfg = &models.ChatConfig{
@@ -1087,6 +1212,8 @@ func buildAgentChatModel(ctx context.Context, p AgentParam) (*models.EinoChatMod
 			MaxTokens:   p.MaxTokens,
 			Temperature: p.Temperature,
 		}
+		// 思考开关："enabled"/"disabled" 翻成布尔指针；其他值（如 "default"）
+		// 不设置，交给模型默认行为。
 		switch p.Thinking {
 		case "enabled":
 			t := true
@@ -1099,29 +1226,27 @@ func buildAgentChatModel(ctx context.Context, p AgentParam) (*models.EinoChatMod
 	return models.NewEinoChatModel(cm, chatCfg), nil
 }
 
-// artifactEntry is the shape of a single tool-returned artifact
-// surfaced through the Agent's outputs["artifacts"].
+// artifactEntry 单个工具产出的附件，最终会出现在 outputs["artifacts"] 里，形如：
+//
+//	{"name": "report.pdf", "url": "https://..."}
 type artifactEntry struct {
 	Name string `json:"name"`
 	URL  string `json:"url"`
 }
 
-// artifactCollectorKey is the context key used to stash the
-// MessageFuture from react.WithMessageFuture() so the AgentComponent
-// can collect artifacts after the ReAct loop finishes. The collector
-// is created per-invocation in runEinoReActAgent.
+// artifactCollectorKey 是把 react.WithMessageFuture() 的 MessageFuture 存进 ctx
+// 用的键——ReAct 循环跑完后靠它回头收集工具附件。收集器每次调用在
+// runEinoReActAgent 里新建，互不串扰。
 type artifactCollectorKey struct{}
 
-// setArtifactCollector registers the MessageFuture for this agent run
-// in the context. It is called from runEinoReActAgent after
-// react.WithMessageFuture() returns a future.
+// setArtifactCollector 把本次运行的 MessageFuture 登记进 ctx（runEinoReActAgent
+// 拿到 future 后立即调用），供后续的附件收集取用。
 func setArtifactCollector(ctx context.Context, future react.MessageFuture) context.Context {
 	return context.WithValue(ctx, artifactCollectorKey{}, future)
 }
 
-// getArtifactCollector retrieves the MessageFuture registered for the
-// current agent run. Returns nil when no collector was registered
-// (e.g., tests that stub agentRunner).
+// getArtifactCollector 取回本次运行登记的 MessageFuture；没登记过（如用桩替换了
+// agentRunner 的测试）时返回 nil。
 func getArtifactCollector(ctx context.Context) react.MessageFuture {
 	v := ctx.Value(artifactCollectorKey{})
 	if v == nil {
@@ -1133,25 +1258,23 @@ func getArtifactCollector(ctx context.Context) react.MessageFuture {
 	return nil
 }
 
-// collectArtifactsFromToolCalls drains the MessageFuture stored in
-// ctx (if any) and extracts artifact entries from every tool response
-// message that carries a `_ARTIFACTS` payload in its Extra field.
-// The final message is ignored because it is an assistant message and
-// does not contain tool results. Returns a de-duplicated list ordered
-// by first appearance.
+// collectArtifactsFromToolCalls —— 工具附件收割器。把本次运行 MessageFuture 里
+// 记录的所有消息翻一遍，从每条携带 _ARTIFACTS 载荷的工具响应里抽出附件，
+// 按首次出现顺序去重后返回。最终助手消息不含工具结果，自然被跳过。
 //
-// The expected payload shape in each tool response is:
+// 工具响应里期望的载荷形状：
 //
 //	{ "_ARTIFACTS": [{ "name": "report.pdf", "url": "https://..." }, ...] }
 func collectArtifactsFromToolCalls(ctx context.Context, _ *schema.Message) []artifactEntry {
 	future := getArtifactCollector(ctx)
-	if future == nil {
+	if future == nil { // 没登记收集器（如测试桩），无附件可收
 		return nil
 	}
 
-	seen := make(map[string]struct{})
+	seen := make(map[string]struct{}) // 按 URL 去重，同一附件只留第一次出现
 	var out []artifactEntry
 
+	// 逐条遍历本次运行产生的全部消息，只处理 tool 角色的响应。
 	iter := future.GetMessages()
 	for {
 		msg, ok, err := iter.Next()
@@ -1180,20 +1303,20 @@ func collectArtifactsFromToolCalls(ctx context.Context, _ *schema.Message) []art
 	return out
 }
 
-// extractArtifactsFromToolMessage parses the JSON payload of a tool
-// response message and returns the `_ARTIFACTS` list. The payload is
-// read from msg.Content when it is non-empty; otherwise the first text
-// element of msg.UserInputMultiContent is used. This matches the eino
-// tool contract where tool results are delivered as a string.
+// extractArtifactsFromToolMessage 解析单条工具响应消息里的 JSON 载荷，抽出其中的
+// _ARTIFACTS 列表。载荷优先从 msg.Content 读；Content 为空时改用多段内容里的
+// 第一个文本段（eino 的工具结果约定以字符串交付）。载荷不是合法 JSON、或里面
+// 没有 _ARTIFACTS 键时返回 nil——普通文本响应不受影响。
 func extractArtifactsFromToolMessage(msg *schema.Message) []artifactEntry {
 	payload := msg.Content
 	if payload == "" && len(msg.UserInputMultiContent) > 0 {
-		payload = toolMessageTextContent(msg)
+		payload = toolMessageTextContent(msg) // 回退到多段内容里的第一个文本段
 	}
 	if payload == "" {
 		return nil
 	}
 
+	// 载荷必须是 JSON 对象；纯文本响应解析失败直接当没有附件。
 	var envelope map[string]any
 	if err := json.Unmarshal([]byte(payload), &envelope); err != nil {
 		return nil
@@ -1204,6 +1327,7 @@ func extractArtifactsFromToolMessage(msg *schema.Message) []artifactEntry {
 		return nil
 	}
 
+	// 逐项取 name/url，残缺项（缺任一字段）丢弃。
 	out := make([]artifactEntry, 0, len(raw))
 	for _, item := range raw {
 		m, ok := item.(map[string]any)
@@ -1220,8 +1344,8 @@ func extractArtifactsFromToolMessage(msg *schema.Message) []artifactEntry {
 	return out
 }
 
-// toolMessageTextContent returns the first text content part of a tool
-// message, or an empty string if no text part is found.
+// toolMessageTextContent 返回工具消息多段内容里的第一个非空文本段；
+// 一段文本都没有时返回空串。
 func toolMessageTextContent(msg *schema.Message) string {
 	for i := range msg.UserInputMultiContent {
 		part := &msg.UserInputMultiContent[i]
@@ -1232,16 +1356,14 @@ func toolMessageTextContent(msg *schema.Message) string {
 	return ""
 }
 
-// formatArtifactMarkdown renders a slice of artifacts as Markdown
-// links, omitting URLs already present in the existing text (Python's
-// `_collect_tool_artifact_markdown` does the same de-duplication).
+// formatArtifactMarkdown 把附件列表渲染成追加在答案末尾的 Markdown 链接。
+// 对齐 Python 的 _collect_tool_artifact_markdown（同样按 URL 去重）：
 //
-// Format:
-//   - image URL  → ![name](url)
-//   - other URL  → [Download name](url)
+//	图片后缀（.png/.jpg/.jpeg/.gif/.webp） → ![名字](url)
+//	其他文件                             → [Download 名字](url)
 //
-// Returns the empty string when no artifacts are present, so callers
-// can safely concatenate without guarding.
+// existingText 里已出现过的 URL 不再重复输出。没有附件时返回空串，
+// 调用方可以放心直接拼接。
 func formatArtifactMarkdown(artifacts []artifactEntry, existingText string) string {
 	if len(artifacts) == 0 {
 		return ""
@@ -1251,9 +1373,10 @@ func formatArtifactMarkdown(artifacts []artifactEntry, existingText string) stri
 		if a.URL == "" || a.Name == "" {
 			continue
 		}
-		if strings.Contains(existingText, a.URL) {
+		if strings.Contains(existingText, a.URL) { // 答案里已经带了这个链接，不重复贴
 			continue
 		}
+		// 按后缀区分渲染方式：图片直接内联展示，其他文件给下载链接。
 		lower := strings.ToLower(a.URL)
 		if strings.HasSuffix(lower, ".png") || strings.HasSuffix(lower, ".jpg") ||
 			strings.HasSuffix(lower, ".jpeg") || strings.HasSuffix(lower, ".gif") ||
@@ -1266,8 +1389,11 @@ func formatArtifactMarkdown(artifacts []artifactEntry, existingText string) stri
 	return sb.String()
 }
 
-// extractToolCalls converts eino ToolCalls from a message into the
-// output map format.
+// extractToolCalls 把 eino 消息里的 ToolCalls 转成输出用的 map 列表，每条形如：
+//
+//	{"id": "call_1", "type": "function", "name": "retrieval", "arguments": "{...}"}
+//
+// 消息为空或没用过工具时返回 nil。
 func extractToolCalls(msg *schema.Message) []map[string]any {
 	if msg == nil || len(msg.ToolCalls) == 0 {
 		return nil
@@ -1284,17 +1410,27 @@ func extractToolCalls(msg *schema.Message) []map[string]any {
 	return calls
 }
 
-// promptMessagesFromParams extracts the Python DSL `prompts` list into
-// the single system/user prompt shape supported by the Go ReAct runner.
+// promptMessagesFromParams 把 Python DSL 里的 prompts 列表拍成 Go ReAct 运行器只支持的
+// 「单段 system + 单段 user」形状。
+//
+// 输入形如：
+//
+//	{"prompts": [{"role": "system", "content": "..."},
+//	             {"role": "user",   "content": "..."}, ...]}
+//
+// 也兼容直接给字符串（当 user prompt）和 []map[string]any 形态。
+// 多条 system 用换行拼成一段，多条 user 同理；没有 role 的条目当 user 处理。
+// 没有 prompts 键、或解析完两类都是空时返回 ok=false。
 func promptMessagesFromParams(params map[string]any) (systemPrompt, userPrompt string, ok bool) {
 	raw, exists := params["prompts"]
 	if !exists {
 		return "", "", false
 	}
 	switch v := raw.(type) {
-	case string:
+	case string: // 纯字符串形态：直接当 user prompt
 		return "", v, true
 	case []any:
+		// 逐条按 role 分桶：system 进 systems，user/缺 role 进 users。
 		var systems, users []string
 		for _, item := range v {
 			m, ok := item.(map[string]any)
@@ -1318,6 +1454,7 @@ func promptMessagesFromParams(params map[string]any) (systemPrompt, userPrompt s
 		}
 		return strings.Join(systems, "\n"), strings.Join(users, "\n"), true
 	case []map[string]any:
+		// 强类型切片形态：包成 []any 后复用上面的分支，避免重复逻辑。
 		items := make([]any, 0, len(v))
 		for _, item := range v {
 			items = append(items, item)
@@ -1327,6 +1464,8 @@ func promptMessagesFromParams(params map[string]any) (systemPrompt, userPrompt s
 	return "", "", false
 }
 
+// appendPromptText 把 extra 追加到 base 后面（换行分隔）；任一方为空时返回另一方，
+// 避免拼出多余空行。
 func appendPromptText(base, extra string) string {
 	if strings.TrimSpace(extra) == "" {
 		return base
@@ -1337,16 +1476,21 @@ func appendPromptText(base, extra string) string {
 	return base + "\n" + extra
 }
 
+// hasNonEmptyString 判断 inputs[name] 是否为非空字符串（去空白后仍有内容）。
 func hasNonEmptyString(inputs map[string]any, name string) bool {
 	v, ok := stringFrom(inputs, name)
 	return ok && strings.TrimSpace(v) != ""
 }
 
+// shouldFallbackToSysQuery 判断一段 prompt 是否「等于没填」：空串或仍是子 Agent 工具
+// schema 里的默认占位句时，都应该回退用用户原始提问（sys.query）。
 func shouldFallbackToSysQuery(prompt string) bool {
 	p := strings.TrimSpace(prompt)
 	return p == "" || p == agentUserPromptSchemaDefault
 }
 
+// stringFromState 从画布状态的 Sys 字典里取非空字符串值，如 sys.query；
+// 键不存在、不是字符串、或去空白后为空时返回 false。
 func stringFromState(state *runtime.CanvasState, name string) (string, bool) {
 	if state == nil {
 		return "", false
@@ -1358,6 +1502,19 @@ func stringFromState(state *runtime.CanvasState, name string) (string, bool) {
 	return v, true
 }
 
+// formatAgentRuntimePrompt 把父 Agent 调用子 Agent 时附带的 reasoning / context
+// 拼进用户 prompt，拼完形如：
+//
+//	REASONING:
+//	<父 Agent 为什么调这个子 Agent>
+//
+//	CONTEXT:
+//	<背景信息>
+//
+//	QUERY:
+//	<要办的事>
+//
+// reasoning 和 context 都没传时原样返回 userPrompt。
 func formatAgentRuntimePrompt(inputs map[string]any, userPrompt string) string {
 	var b strings.Builder
 	if reasoning, ok := stringFrom(inputs, "reasoning"); ok && reasoning != "" {
@@ -1366,21 +1523,26 @@ func formatAgentRuntimePrompt(inputs map[string]any, userPrompt string) string {
 	if contextText, ok := stringFrom(inputs, "context"); ok && contextText != "" {
 		fmt.Fprintf(&b, "\nCONTEXT:\n%s\n", contextText)
 	}
-	if b.Len() == 0 {
+	if b.Len() == 0 { // 两个附加字段都没有，不改变原 prompt
 		return userPrompt
 	}
 	fmt.Fprintf(&b, "\nQUERY:\n%s\n", userPrompt)
 	return b.String()
 }
 
-// mergeAgentParam layers raw inputs over the receiver's default param set.
+// mergeAgentParam —— 参数叠加器。把运行时输入 inputs 逐字段盖到 base（DSL 静态
+// 参数）之上，得到本次执行用的最终 AgentParam；inputs 里没有的字段保持 base 原值。
 //
-// v1 aliases accepted alongside the v2 names: "llm_id" → "model_id",
-// "sys_prompt" → "system_prompt", "base_url" → "BaseURL". v1 fixtures
-// use the short forms; without these aliases the v1→v2 conversion
-// step would have to run before the factory builds the component.
+// inputs 形如：
+//
+//	{"model_id": "glm-4@zhipu", "user_prompt": "...", "tools": ["retrieval"],
+//	 "top_p": 0.9, "max_rounds": 5, ...}
+//
+// 同时兼容 v1 老画布的别名，免得 v1→v2 转换必须先于工厂构建：
+// "llm_id" → model_id；"sys_prompt" → system_prompt。
 func mergeAgentParam(base AgentParam, inputs map[string]any) AgentParam {
 	p := base
+	// 模型标识：v2 名优先，其次 v1 别名。
 	if v, ok := stringFrom(inputs, "model_id"); ok {
 		p.ModelID = v
 	} else if v, ok := stringFrom(inputs, "llm_id"); ok {
@@ -1389,20 +1551,24 @@ func mergeAgentParam(base AgentParam, inputs map[string]any) AgentParam {
 	if v, ok := stringFrom(inputs, "description"); ok {
 		p.Description = v
 	}
+	// 系统提示：v2 名优先，其次 v1 别名。
 	if v, ok := stringFrom(inputs, "system_prompt"); ok {
 		p.SystemPrompt = v
 	} else if v, ok := stringFrom(inputs, "sys_prompt"); ok {
 		p.SystemPrompt = v
 	}
+	// Python DSL 的 prompts 列表：system 段追加到已有系统提示，user 段直接覆盖。
 	if promptSystem, promptUser, ok := promptMessagesFromParams(inputs); ok {
 		p.SystemPrompt = appendPromptText(p.SystemPrompt, promptSystem)
 		if strings.TrimSpace(promptUser) != "" {
 			p.UserPrompt = promptUser
 		}
 	}
+	// 用户提示：空串/默认占位句不算有效输入，不覆盖（留给后面回退到 sys.query）。
 	if v, ok := stringFrom(inputs, "user_prompt"); ok && !shouldFallbackToSysQuery(v) {
 		p.UserPrompt = v
 	}
+	// 生成参数：逐个取值，配了才覆盖。
 	if v, ok := floatFrom(inputs, "top_p"); ok {
 		f := v
 		p.TopP = &f
@@ -1415,6 +1581,7 @@ func mergeAgentParam(base AgentParam, inputs map[string]any) AgentParam {
 		f := v
 		p.Temperature = &f
 	}
+	// 思考开关：空串和 "default" 表示不干预，保持原值。
 	if v, ok := stringFrom(inputs, "thinking"); ok && v != "" && v != "default" {
 		p.Thinking = v
 	}
@@ -1424,6 +1591,7 @@ func mergeAgentParam(base AgentParam, inputs map[string]any) AgentParam {
 	if v, ok := intFrom(inputs, "message_history_window_size"); ok {
 		p.MessageHistoryWindowSize = v
 	}
+	// 模型连接三件套（显式配了才覆盖租户配置里的默认值）。
 	if v, ok := stringFrom(inputs, "driver"); ok {
 		p.Driver = v
 	}
@@ -1433,11 +1601,13 @@ func mergeAgentParam(base AgentParam, inputs map[string]any) AgentParam {
 	if v, ok := stringFrom(inputs, "base_url"); ok {
 		p.BaseURL = v
 	}
+	// 工具列表：同时抽出静态工具名、工具构造参数、子 Agent 三类。
 	if tools, params, subAgents, ok := agentToolsFrom(inputs, "tools"); ok {
 		p.Tools = tools
 		p.SubAgents = subAgents
 		p.ToolParams = mergeToolParams(p.ToolParams, params)
 	}
+	// 独立的 tool_params 字段再叠加一层（同名工具后来者赢）。
 	if v, ok := nestedMapFrom(inputs, "tool_params"); ok {
 		p.ToolParams = mergeToolParams(p.ToolParams, v)
 	}
@@ -1453,17 +1623,21 @@ func mergeAgentParam(base AgentParam, inputs map[string]any) AgentParam {
 	return p
 }
 
-// agentToolsFrom extracts the Agent tools list. The Go-native shape is
-// []string; the canvas DSL shape stores tool component objects with
-// component_name and params. Child Agent objects are returned separately
-// because they are dynamic tools, not entries in the static tool registry.
+// agentToolsFrom 从 inputs[name] 里抽出工具配置。兼容两种形状：
+//
+//	Go 原生形：[]string{"retrieval", "execute_sql"}
+//	画布 DSL 形：[]any，元素可以是纯字符串工具名，或带 component_name/params 的
+//	              工具对象（子 Agent 对象 component_name="Agent" 单独归类）。
+//
+// 返回 (工具名列表, 按工具名键控的构造参数, 子 Agent 列表, 是否找到该键)。
+// 子 Agent 单独返回，因为它们是动态工具，不在静态工具注册表里。
 func agentToolsFrom(inputs map[string]any, name string) ([]string, map[string]map[string]any, []SubAgentTool, bool) {
 	v, ok := inputs[name]
 	if !ok {
 		return nil, nil, nil, false
 	}
 	switch x := v.(type) {
-	case []string:
+	case []string: // Go 原生形，直接用，无参数无子 Agent
 		return x, nil, nil, true
 	case []any:
 		out := make([]string, 0, len(x))
@@ -1471,12 +1645,13 @@ func agentToolsFrom(inputs map[string]any, name string) ([]string, map[string]ma
 		subAgents := make([]SubAgentTool, 0)
 		for _, item := range x {
 			switch tool := item.(type) {
-			case string:
+			case string: // 纯字符串元素：工具名，空白串跳过
 				if strings.TrimSpace(tool) == "" {
 					continue
 				}
 				out = append(out, tool)
 			case map[string]any:
+				// 先试子 Agent（component_name="Agent"），不是再当普通工具。
 				if subAgent, ok := subAgentToolObject(tool); ok {
 					subAgents = append(subAgents, subAgent)
 					continue
@@ -1487,6 +1662,7 @@ func agentToolsFrom(inputs map[string]any, name string) ([]string, map[string]ma
 				}
 				out = append(out, toolName)
 				if len(toolParams) != 0 {
+					// 构造参数按小写工具名键控，后续查找大小写不敏感。
 					params[strings.ToLower(strings.TrimSpace(toolName))] = toolParams
 				}
 			}
@@ -1496,6 +1672,14 @@ func agentToolsFrom(inputs map[string]any, name string) ([]string, map[string]ma
 	return nil, nil, nil, false
 }
 
+// subAgentToolObject 判断一个工具对象是不是子 Agent（component_name 为 "Agent"，
+// 大小写不敏感），是就把它解成 SubAgentTool：
+//
+//	名字依次取 function_name → name → id，洗完合法化；
+//	描述取外层 description，没有就用子 Agent 参数里的 description；
+//	params 递归走 agentParamFromMap 解成完整 AgentParam。
+//
+// 不是子 Agent 时返回 false。
 func subAgentToolObject(item map[string]any) (SubAgentTool, bool) {
 	componentName, ok := stringFrom(item, "component_name")
 	if !ok || !strings.EqualFold(strings.TrimSpace(componentName), "Agent") {
@@ -1504,6 +1688,7 @@ func subAgentToolObject(item map[string]any) (SubAgentTool, bool) {
 
 	rawParams, _ := item["params"].(map[string]any)
 	param := agentParamFromMap(rawParams)
+	// 工具名候选链：function_name → name → id。
 	name, _ := stringFrom(item, "function_name")
 	if strings.TrimSpace(name) == "" {
 		name, _ = stringFrom(item, "name")
@@ -1523,6 +1708,9 @@ func subAgentToolObject(item map[string]any) (SubAgentTool, bool) {
 	}, true
 }
 
+// agentToolObject 把一个普通工具对象解成 (工具名, 构造参数)。工具名依次从
+// component_name → tool_name → name 里取，三个都没有就返回 false。另外把
+// function_name（部分工具的子功能名，如 HTTP 工具的某个具体接口）塞进构造参数。
 func agentToolObject(item map[string]any) (string, map[string]any, bool) {
 	toolName, ok := stringFrom(item, "component_name")
 	if !ok || strings.TrimSpace(toolName) == "" {
@@ -1536,6 +1724,7 @@ func agentToolObject(item map[string]any) (string, map[string]any, bool) {
 	}
 	toolName = strings.TrimSpace(toolName)
 
+	// 拷贝一份构造参数，避免与调用方共享 map 后被意外篡改。
 	rawParams, _ := item["params"].(map[string]any)
 	toolParams := cloneMap(rawParams)
 	if fn, ok := stringFrom(item, "function_name"); ok && strings.TrimSpace(fn) != "" {
@@ -1547,6 +1736,7 @@ func agentToolObject(item map[string]any) (string, map[string]any, bool) {
 	return toolName, toolParams, true
 }
 
+// cloneMap 浅拷贝 map；空/nil 输入返回 nil。
 func cloneMap(in map[string]any) map[string]any {
 	if len(in) == 0 {
 		return nil
@@ -1558,17 +1748,22 @@ func cloneMap(in map[string]any) map[string]any {
 	return out
 }
 
+// mergeToolParams 把 overrides 里的工具构造参数叠加到 base 上，同名工具后来者赢。
+// 查找大小写不敏感：每个名字同时存原名和小写两份；覆盖时先把两边所有大小写
+// 变体的旧条目删干净再写入，避免残留。两边都是空时返回 nil。
 func mergeToolParams(base, overrides map[string]map[string]any) map[string]map[string]any {
 	if len(base) == 0 && len(overrides) == 0 {
 		return nil
 	}
 	out := make(map[string]map[string]any, len(base)+len(overrides))
+	// 先铺 base：原名 + 小写名双写，方便后续大小写不敏感查找。
 	for name, params := range base {
 		out[name] = cloneMap(params)
 		if lower := strings.ToLower(strings.TrimSpace(name)); lower != "" && lower != name {
 			out[lower] = cloneMap(params)
 		}
 	}
+	// 再盖 overrides：先清除同名（任意大小写）旧条目，再双写新值。
 	for name, params := range overrides {
 		if len(params) == 0 {
 			continue
@@ -1587,7 +1782,7 @@ func mergeToolParams(base, overrides map[string]map[string]any) map[string]map[s
 	return out
 }
 
-// sliceFrom extracts []string from inputs[name].
+// sliceFrom 从 inputs[name] 里取字符串切片；兼容 []string 和 []any（只收其中的字符串元素）。
 func sliceFrom(inputs map[string]any, name string) ([]string, bool) {
 	v, ok := inputs[name]
 	if !ok {
@@ -1608,7 +1803,7 @@ func sliceFrom(inputs map[string]any, name string) ([]string, bool) {
 	return nil, false
 }
 
-// nestedMapFrom extracts map[string]map[string]any from inputs[name].
+// nestedMapFrom 从 inputs[name] 里取两层嵌套 map（如 tool_params）；值不是 map 的键跳过。
 func nestedMapFrom(inputs map[string]any, name string) (map[string]map[string]any, bool) {
 	v, ok := inputs[name]
 	if !ok {
@@ -1629,13 +1824,15 @@ func nestedMapFrom(inputs map[string]any, name string) (map[string]map[string]an
 	return out, true
 }
 
+// agentParamFromMap 把原始 DSL 参数 map 解成 AgentParam，并预置默认历史窗口（13 轮）。
 func agentParamFromMap(params map[string]any) AgentParam {
 	return mergeAgentParam(AgentParam{
 		MessageHistoryWindowSize: defaultAgentMessageHistoryWindowSize,
 	}, params)
 }
 
-// init registers AgentComponent with the orchestrator-owned registry.
+// init 把 AgentComponent 注册进编排器组件注册表：画布工厂遇到 "Agent" 节点时
+// 就用这里的构造函数把 DSL 参数变成组件实例。
 func init() {
 	Register("Agent", func(params map[string]any) (Component, error) {
 		return NewAgentComponent(agentParamFromMap(params)), nil

@@ -1,13 +1,11 @@
-// Package component — LLM (T1).
+// Package component —— LLM（T1）。
 //
-// One-shot LLM call. Reads system_prompt + user_prompt, dispatches to a
-// chat model, and returns the assistant's content. Streaming variant
-// forwards incremental chunks via Stream.
+// 一次性 LLM 调用。读 system_prompt + user_prompt，分发给对话模型，
+// 返回助手内容。流式变体经 Stream 转发增量 chunk。
 //
-// Model invocation is abstracted behind a small ChatInvoker interface so
-// tests can inject a stub without touching the network. The default
-// ChatInvoker is built around models.NewEinoChatModel so production paths
-// flow through the eino bridge (plan §2.11.6 D1).
+// 模型调用抽象在一个小 ChatInvoker 接口后面——测试可注入 stub 不碰
+// 网络。默认 ChatInvoker 围绕 models.NewEinoChatModel 构建，生产路径
+// 走 eino 桥（§2.11.6 D1）。
 package component
 
 import (
@@ -34,73 +32,66 @@ import (
 	"go.uber.org/zap"
 )
 
-// LLMComponent is a one-shot chat call.
+// LLMComponent 一次性对话调用。
 type LLMComponent struct {
 	param LLMParam
 }
 
-// LLMParam captures the (resolved) DSL parameters for an LLM node.
+// LLMParam 承载 LLM 节点（已解析的）DSL 参数。
 type LLMParam struct {
 	ModelID                  string
 	SystemPrompt             string
 	UserPrompt               string
 	Temperature              *float64
 	TopP                     *float64
-	VisualFiles              []string       // extracted data:image URIs from inputs["visual_files"]
-	Cite                     bool           // when true, citation-instruction prompt is appended to system message
-	MessageHistoryWindowSize int            // when >0, the last N turns from state.History are prepended as prior messages
-	ChatTemplateKwargs       map[string]any // optional provider-specific kwargs (e.g. response_format, seed)
+	VisualFiles              []string       // 从 inputs["visual_files"] 抽出的 data:image URI
+	Cite                     bool           // 为 true 时，引用指令 prompt 追加进 system 消息
+	MessageHistoryWindowSize int            // >0 时，把 state.History 的最后 N 轮作为前置消息
+	ChatTemplateKwargs       map[string]any // 可选的厂商专属 kwargs（如 response_format、seed）
 	MaxTokens                *int
 	JSONOutput               bool
-	OutputStructure          map[string]any // when set, LLM is asked for JSON matching this schema (best-effort keys); outputs["structured"] populated
+	OutputStructure          map[string]any // 设置时要求 LLM 产出匹配此 schema 的 JSON（尽力匹配键）；填充 outputs["structured"]
 
-	// PresencePenalty mirrors Python's `presence_penalty` (range -2.0 to 2.0).
-	// Positive values penalize new tokens based on whether they appear in the
-	// text so far, increasing the model's likelihood to talk about new topics.
+	// PresencePenalty 对齐 Python 的 `presence_penalty`（范围 -2.0 到 2.0）。
+	// 正值根据新 token 是否已出现在现有文本中施加惩罚，提高模型谈论
+	// 新话题的概率。
 	PresencePenalty *float64
 
-	// FrequencyPenalty mirrors Python's `frequency_penalty` (range -2.0 to 2.0).
-	// Positive values penalize new tokens based on their existing frequency
-	// in the text so far, decreasing the model's likelihood to repeat the
-	// same line verbatim.
+	// FrequencyPenalty 对齐 Python 的 `frequency_penalty`（范围 -2.0 到 2.0）。
+	// 正值根据新 token 在现有文本中的既有频率施加惩罚，降低模型逐字
+	// 重复同一行的概率。
 	FrequencyPenalty *float64
 
-	// Driver is the configured provider driver to use (e.g. "openai"). When
-	// empty, the default ChatInvoker derives it from ModelID or uses the explicit
-	// test/development-only dummy driver.
+	// Driver 要使用的已配置厂商驱动（如 "openai"）。为空时默认
+	// ChatInvoker 从 ModelID 推导，或使用显式的仅测试/开发 dummy 驱动。
 	Driver string
 
-	// APIKey overrides the default empty key. Tests may set this; prod
-	// reads it from env / secret store at higher layers.
+	// APIKey 覆盖默认的空 key。测试可设置；生产在更高层从环境变量/
+	// 密钥库读取。
 	APIKey string
 
-	// BaseURL overrides the driver default endpoint (e.g. to point the
-	// "openai" driver at a third-party gateway). Empty defers to the
-	// driver's built-in default URL.
+	// BaseURL 覆盖驱动默认端点（如把 "openai" 驱动指向第三方网关）。
+	// 为空则用驱动内置默认 URL。
 	BaseURL string
 
-	// MaxRetries caps the retry loop in retryInvoker. Zero = default
-	// (3). Negative = disable retries entirely (single attempt). The
-	// retry loop honours ctx.Done() so a request cancel aborts on
-	// the next backoff sleep.
+	// MaxRetries 限定 retryInvoker 的重试循环。0 = 默认（3）。负数 =
+	// 完全禁用重试（单次尝试）。重试循环遵守 ctx.Done()，请求取消时
+	// 在下一次退避睡眠处中止。
 	MaxRetries int
 
-	// DelayAfterError is the initial backoff between retry attempts.
-	// Doubles on each retry, capped at 1 minute. Zero = default
-	// (2 seconds). Matches Python's `delay_after_error` param.
+	// DelayAfterError 是重试尝试间的初始退避。每次重试翻倍，上限
+	// 1 分钟。0 = 默认（2 秒）。对齐 Python 的 `delay_after_error` 参数。
 	DelayAfterError time.Duration
 
-	// Thinking mirrors the python `thinking` Agent LLM setting
-	// (PR #15446). When set to "enabled" or "disabled", the LLM
-	// driver is told to turn its reasoning mode on/off
-	// (provider-specific; see chat_model.py for Qwen/Kimi/GLM
-	// policy). Empty string means "system default" — the LLM
-	// driver decides, which today means Qwen3 is sent
-	// `enable_thinking=false` unless overridden.
+	// Thinking 对齐 Python 的 `thinking` Agent LLM 设置（PR #15446）。
+	// 设为 "enabled" 或 "disabled" 时告知 LLM 驱动开/关推理模式
+	// （厂商相关；Qwen/Kimi/GLM 策略见 chat_model.py）。空串表示
+	// "系统默认"——由 LLM 驱动决定，目前意味着 Qwen3 会被发送
+	// `enable_thinking=false`（除非被覆盖）。
 	Thinking string
 }
 
-// LLMInput is the resolved input map the factory / Invoke expects.
+// LLMInput 是工厂 / Invoke 期望的已解析输入 map。
 type LLMInput struct {
 	ModelID                  string
 	SystemPrompt             string
@@ -118,12 +109,12 @@ type LLMInput struct {
 	Thinking                 string // "enabled" | "disabled" | ""
 }
 
-// LLMOutput mirrors the outputs map (per plan §2.11.3 row 5):
+// LLMOutput 对齐输出 map（按 §2.11.3 第 5 行）：
 //
-//	"content" string, "model" string, "stopped" bool, "tokens" int
+//	"content" string、"model" string、"stopped" bool、"tokens" int
 //
-// JSONOutput=true additionally populates "json" (map[string]any) when the
-// content parses as a JSON object.
+// JSONOutput=true 且内容能解析为 JSON 对象时，额外填充 "json"
+// （map[string]any）。
 type LLMOutput struct {
 	Content string
 	Model   string
@@ -131,21 +122,20 @@ type LLMOutput struct {
 	Tokens  int
 }
 
-// ChatInvoker is an alias for the shared chat.Invoker seam. The production
-// eino-based implementation lives in this file; the package-level singleton is
-// owned by internal/agent/chat so agent tools and the harness can also call the
-// LLM without an import cycle.
+// ChatInvoker 是共享 chat.Invoker 接缝的别名。生产级基于 eino 的实现
+// 在本文件；包级单例由 internal/agent/chat 持有——这样 agent 工具和
+// harness 也能调 LLM 而不产生导入环。
 type ChatInvoker = chat.Invoker
 
-// ChatInvokeRequest is an alias for chat.Request.
+// ChatInvokeRequest 是 chat.Request 的别名。
 type ChatInvokeRequest = chat.Request
 
-// ChatInvokeResponse is an alias for chat.Response.
+// ChatInvokeResponse 是 chat.Response 的别名。
 type ChatInvokeResponse = chat.Response
 
-// SetDefaultChatInvoker delegates to the shared chat package singleton (test
-// helper). Pass nil to restore the "not configured" state. The production
-// einoChatInvoker is registered at boot in cmd/server_main.go.
+// SetDefaultChatInvoker 委托给共享 chat 包单例（测试辅助）。传 nil
+// 恢复"未配置"状态。生产级 einoChatInvoker 在 cmd/server_main.go
+// 启动时注册。
 func SetDefaultChatInvoker(inv ChatInvoker) {
 	if inv == nil {
 		chat.SetDefaultInvoker(nil)
@@ -154,14 +144,14 @@ func SetDefaultChatInvoker(inv ChatInvoker) {
 	chat.SetDefaultInvoker(inv)
 }
 
-// GetDefaultChatInvokerForTest exposes the current shared chat invoker so
-// cross-package tests can swap it and restore it safely.
+// GetDefaultChatInvokerForTest 暴露当前共享 chat invoker，跨包测试
+// 可安全替换与恢复。
 func GetDefaultChatInvokerForTest() ChatInvoker {
 	return chat.GetDefaultInvoker()
 }
 
-// getDefaultChatInvoker returns the shared chat invoker, falling back to the
-// production eino invoker when none has been installed.
+// getDefaultChatInvoker 返回共享 chat invoker；未安装时回退生产级
+// eino invoker。
 func getDefaultChatInvoker() ChatInvoker {
 	if inv := chat.GetDefaultInvoker(); inv != nil {
 		return inv
@@ -169,25 +159,25 @@ func getDefaultChatInvoker() ChatInvoker {
 	return &einoChatInvoker{}
 }
 
-// InstallDefaultChatInvoker registers the production eino-based invoker as the
-// shared chat default. Called at server bootstrap so harness/agentic-search LLM
-// calls work in production; without it, chat.GetDefaultInvoker() stays nil and
-// harness falls back gracefully.
+// InstallDefaultChatInvoker 把生产级基于 eino 的 invoker 注册为共享
+// chat 默认。服务器启动时调用——这样生产环境里 harness/智能检索的
+// LLM 调用可用；不注册的话 chat.GetDefaultInvoker() 保持 nil，
+// harness 会优雅降级。
 func InstallDefaultChatInvoker() {
 	chat.SetDefaultInvoker(&einoChatInvoker{})
 }
 
-// einoChatInvoker is the production ChatInvoker — it constructs a fresh
-// models.EinoChatModel per call from the request and dispatches. It is NOT
-// registered as the shared chat default at init (so chat.GetDefaultInvoker()
-// stays nil until bootstrap); cmd registers it via SetDefaultChatInvoker.
+// einoChatInvoker 是生产级 ChatInvoker——每次调用按请求构造全新的
+// models.EinoChatModel 再分发。它不在 init 时注册为共享 chat 默认
+// （所以启动前 chat.GetDefaultInvoker() 保持 nil）；cmd 经
+// SetDefaultChatInvoker 注册。
 type einoChatInvoker struct{}
 
-// Invoke satisfies ChatInvoker.
+// Invoke 实现 ChatInvoker。
 func (e *einoChatInvoker) Invoke(ctx context.Context, db *gorm.DB, req ChatInvokeRequest) (*ChatInvokeResponse, error) {
 	if req.ModelName == "" {
-		// Harness/agentic-search nodes may omit the model; fall back to the
-		// bootstrap-registered tenant default so those calls work in production.
+		// Harness/智能检索节点可能省略模型；回退启动时注册的租户默认
+		// 模型，让那些调用在生产可用。
 		if def := chat.GetDefaultModelName(); def != "" {
 			req.ModelName = def
 		} else {
@@ -218,10 +208,9 @@ func (e *einoChatInvoker) Invoke(ctx context.Context, db *gorm.DB, req ChatInvok
 		TopP:        req.TopP,
 		MaxTokens:   req.MaxTokens,
 	}
-	// Propagate the agent-level Thinking setting to the driver so
-	// providers like DeepSeek can send thinking: {type: "disabled"}
-	// and prevent chain-of-thought from leaking into the answer.
-	// Mirrors the Python agent/component/llm.py behaviour.
+	// 把 agent 级 Thinking 设置传播给驱动——DeepSeek 之类的厂商可以
+	// 发送 thinking: {type: "disabled"}，防止思维链泄漏进答案。
+	// 对齐 Python agent/component/llm.py 行为。
 	switch req.Thinking {
 	case "enabled":
 		t := true
@@ -244,13 +233,12 @@ func (e *einoChatInvoker) Invoke(ctx context.Context, db *gorm.DB, req ChatInvok
 	}, nil
 }
 
-// toEinoMessages converts the LLM component's Message slice to eino's.
+// toEinoMessages 把 LLM 组件的 Message 切片转成 eino 的。
 //
-// Copies Role, Content, AND UserInputMultiContent (multi-modal parts),
-// including a deep copy of the *string URL pointers in each image part
-// so that callers may mutate the returned messages without affecting
-// the source. Without the multi-content copy and pointer deep-copy,
-// vision inputs would be silently dropped or shared with the caller.
+// 拷贝 Role、Content 以及 UserInputMultiContent（多模态部分）——
+// 含每个图像部分里 *string URL 指针的深拷贝——调用方可以随意修改
+// 返回的消息而不影响源。不拷贝多模态内容与指针深拷贝的话，视觉
+// 输入会被静默丢弃或与调用方共享。
 func toEinoMessages(msgs []schema.Message) []*schema.Message {
 	if len(msgs) == 0 {
 		return nil
@@ -282,40 +270,39 @@ func toEinoMessages(msgs []schema.Message) []*schema.Message {
 	return out
 }
 
-// newChatModelDriver returns the provider-configured driver used by regular
-// chat. Provider-specific endpoint suffixes remain owned by conf/models/*.json;
-// a tenant base_url override replaces only the endpoint root.
+// newChatModelDriver 返回常规对话使用的厂商预配置驱动。厂商专属的
+// 端点后缀仍由 conf/models/*.json 负责；租户的 base_url 覆盖只替换
+// 端点根。
 func newChatModelDriver(driver, override string) (models.ModelDriver, error) {
 	return models.GetPreconfiguredDriver(driver, override)
 }
 
-// NewLLMComponent builds an LLMComponent from raw params.
+// NewLLMComponent 从原始参数构建 LLMComponent。
 func NewLLMComponent(p LLMParam) *LLMComponent {
 	return &LLMComponent{param: p}
 }
 
-// Name returns the registered component name.
+// Name 返回注册的组件名。
 func (c *LLMComponent) Name() string { return "LLM" }
 
-// Invoke runs the LLM and returns the output map.
+// Invoke 运行 LLM 并返回输出 map。
 func (c *LLMComponent) Invoke(ctx context.Context, db *gorm.DB, inputs map[string]any) (map[string]any, error) {
 	p := mergeLLMParam(c.param, inputs)
 
-	// Resolve tenant-scoped custom models (and fill missing driver/credentials)
-	// before invoking. Without this, a tenant_model.id or a composite model
-	// reference selected in the agent canvas is passed verbatim to the LLM
-	// driver, causing 400s for custom-added models.
+	// 调用前先解析租户级自定义模型（并补齐缺失的 driver/凭证）。
+	// 不做这一步，画布里选中的 tenant_model.id 或复合模型引用会被
+	// 原样传给 LLM 驱动，自定义添加的模型会收到 400。
 	var err error
 	originalModelID := p.ModelID
 	p.ModelID, p.Driver, p.APIKey, p.BaseURL, err = resolveChatModelRef(ctx, db, p.ModelID, p.Driver, p.APIKey, p.BaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("component: LLM.Invoke: resolve model: %w", err)
 	}
-	// Resolve the model's context window (content_length) for message
-	// fitting. 0 means the model is unknown → fitMessages falls back to
-	// 8192, matching Python's chat_mdl.max_length = model_config.get("max_tokens") or 8192.
-	// tenantID scopes composite-reference resolution to the tenant's own rows
-	// so a per-model "max_tokens" override in tenant_model.extra is honored.
+	// 解析模型的上下文窗口（content_length）用于消息裁剪。0 表示模型
+	// 未知 → fitMessages 回退到 8192，对齐 Python 的
+	// chat_mdl.max_length = model_config.get("max_tokens") or 8192。
+	// tenantID 把复合引用解析限定在租户自己的行内，这样
+	// tenant_model.extra 里的按模型 "max_tokens" 覆盖才生效。
 	tenantID := ""
 	if state, _, err := runtime.GetStateFromContext[*runtime.CanvasState](ctx); err == nil && state != nil {
 		if tid, ok := state.Sys["tenant_id"].(string); ok {
@@ -324,9 +311,8 @@ func (c *LLMComponent) Invoke(ctx context.Context, db *gorm.DB, inputs map[strin
 	}
 	contentLength := dao.ResolveModelContentLength(ctx, db, tenantID, originalModelID, p.Driver, p.ModelID)
 	if contentLength <= 0 {
-		// A 0 makes fitMessages fall back to the 8192 default budget, which can
-		// silently discard most of a large-context prompt, so surface the
-		// resolution failure for diagnosis.
+		// 0 会让 fitMessages 回退到 8192 默认预算，可能静默丢弃大上下文
+		// prompt 的大部分内容，所以把解析失败浮出来便于诊断。
 		common.Warn("llm: content_length not resolved, falling back to 8192",
 			zap.String("model_ref", originalModelID),
 			zap.String("driver", p.Driver),
@@ -338,18 +324,14 @@ func (c *LLMComponent) Invoke(ctx context.Context, db *gorm.DB, inputs map[strin
 	if p.UserPrompt == "" && p.SystemPrompt == "" {
 		return nil, &ParamError{Field: "user_prompt", Reason: "at least one of user_prompt or system_prompt must be set"}
 	}
-	// Resolve {{cpn_id@var}} references in the system and user
-	// prompts against the canvas state attached to ctx. When the
-	// state is absent (e.g. tests that call Invoke directly without
-	// going through the canvas scheduler), the prompts pass through
-	// unchanged — backward compatible.
+	// 对着挂在 ctx 上的画布状态解析 system 与 user prompt 里的
+	// {{cpn_id@var}} 引用。状态缺失时（如测试直接调 Invoke 不经画布
+	// 调度器），prompt 原样通过——向后兼容。
 	if state, _, err := runtime.GetStateFromContext[*runtime.CanvasState](ctx); err == nil && state != nil {
-		// ResolveTemplate returns the partial output (with "" in place
-		// of unresolved refs) even on error — we accept the partial
-		// output and log the error for diagnostics. This matches
-		// Python's silent-soft-fail behavior (canvas.py returns "" for
-		// missing refs) but adds a log line so misconfigured canvases
-		// are still surfaced.
+		// ResolveTemplate 出错时也返回部分输出（未解析的引用位置为 ""）
+		// ——我们接受部分输出并记日志用于诊断。这对齐 Python 的静默软
+		// 失败行为（canvas.py 对缺失引用返回 ""），但加了一行日志让
+		// 配置错误的画布仍能被发现。
 		if resolved, rerr := runtime.ResolveTemplate(p.SystemPrompt, state); resolved != p.SystemPrompt || rerr == nil {
 			p.SystemPrompt = resolved
 			if rerr != nil {
@@ -363,21 +345,17 @@ func (c *LLMComponent) Invoke(ctx context.Context, db *gorm.DB, inputs map[strin
 			}
 		}
 	}
-	// The Anthropic driver (and the openai chat-completions driver
-	// when the system role is dropped) reject a system-only message
-	// list with "messages is empty" / 400. v1 fixtures frequently
-	// ship only a system prompt; fall back to using the system text
-	// as the user message so the call still goes through. The
-	// answer text in that case is the model continuing the
-	// instruction in its reply slot, which is what the v1 fixtures
-	// also expect.
+	// Anthropic 驱动（以及丢弃 system 角色的 openai chat-completions
+	// 驱动）会以 "messages is empty" / 400 拒绝只有 system 的消息列表。
+	// v1 夹具经常只带 system prompt；回退为把 system 文本当 user 消息，
+	// 让调用仍能发出。此时答案文本是模型在回复槽里续写指令——这也
+	// 是 v1 夹具的期望。
 	if p.UserPrompt == "" {
 		p.UserPrompt = p.SystemPrompt
 	}
-	// Collect sys.files from canvas globals and inject their
-	// content into prompts and the image list. Mirrors Python's
-	// _collect_sys_files and the injection path in
-	// _prepare_prompt_variables (llm.py:225-281).
+	// 从画布全局收集 sys.files，把其内容注入 prompt 与图像列表。
+	// 对齐 Python 的 _collect_sys_files 及 _prepare_prompt_variables
+	//（llm.py:225-281）里的注入路径。
 	var sysFileTexts []string
 	var sysFileImgs []string
 	hasSysFilesPlaceholder := strings.Contains(p.SystemPrompt, "{sys.files}") || strings.Contains(p.UserPrompt, "{sys.files}")
@@ -387,9 +365,8 @@ func (c *LLMComponent) Invoke(ctx context.Context, db *gorm.DB, inputs map[strin
 			p.VisualFiles = dedupStrings(append(p.VisualFiles, sysFileImgs...))
 		}
 	}
-	// When the prompt contains an explicit {sys.files} placeholder,
-	// replace it with the collected file text and clear sysFileTexts
-	// so it is not injected again below.
+	// prompt 含显式 {sys.files} 占位符时，用收集到的文件文本替换它，
+	// 并清空 sysFileTexts 防止下面重复注入。
 	if hasSysFilesPlaceholder {
 		joined := strings.Join(sysFileTexts, "\n\n")
 		p.SystemPrompt = strings.ReplaceAll(p.SystemPrompt, "{sys.files}", joined)
@@ -398,7 +375,7 @@ func (c *LLMComponent) Invoke(ctx context.Context, db *gorm.DB, inputs map[strin
 	}
 
 	msgs := buildMessagesWithImages(p.SystemPrompt, p.UserPrompt, p.VisualFiles, p.Cite)
-	// Inject sys.files text content into the last user message.
+	// 把 sys.files 文本内容注入最后一条 user 消息。
 	if len(sysFileTexts) > 0 {
 		joined := strings.Join(sysFileTexts, "\n\n")
 		if len(msgs) > 0 && msgs[len(msgs)-1].Role == schema.User {
@@ -431,26 +408,21 @@ func (c *LLMComponent) Invoke(ctx context.Context, db *gorm.DB, inputs map[strin
 			msgs = append(msgs, schema.Message{Role: schema.User, Content: joined})
 		}
 	}
-	// Prepend the last N turns of conversation history from the
-	// canvas state. Mirrors Python's `_get_chat_template_kwargs` /
-	// `_fit_messages` path. When window size is 0 or history is
-	// empty,
-	// this is a no-op.
+	// 从画布状态前置最近 N 轮对话历史。对齐 Python 的
+	// `_get_chat_template_kwargs` / `_fit_messages` 路径。窗口大小为 0
+	// 或历史为空时是空操作。
 	if p.MessageHistoryWindowSize > 0 {
 		if state, _, sErr := runtime.GetStateFromContext[*runtime.CanvasState](ctx); sErr == nil && state != nil {
 			msgs = prependHistory(msgs, state.SnapshotPriorHistory(), p.MessageHistoryWindowSize)
 		}
 	}
-	// Apply message fitting (trim to context window) after all
-	// prompt/history/sys.files augmentation and before invoking the
-	// LLM. Mirrors Python's message_fit_in in PR #16413. The budget is
-	// the model's context window (content_length), resolved from the
-	// model config above — NOT the canvas max_tokens, which caps
-	// generation length only.
+	// 在所有 prompt/历史/sys.files 增强之后、调 LLM 之前应用消息裁剪
+	//（裁到上下文窗口内）。对齐 Python PR #16413 的 message_fit_in。
+	// 预算是模型的上下文窗口（content_length，上面从模型配置解析）——
+	// 不是画布的 max_tokens（那只限制生成长度）。
 	{
-		// The system prompt is already embedded as the first message
-		// in msgs by buildMessagesWithImages; pass "" so fitMessages
-		// does not duplicate it.
+		// system prompt 已由 buildMessagesWithImages 作为首条消息嵌入
+		// msgs；这里传 "" 防止 fitMessages 重复它。
 		fitted, fitErr := fitMessages("", msgs, contentLength)
 		if fitErr != "" {
 			return map[string]any{"content": fitErr}, nil
@@ -458,35 +430,25 @@ func (c *LLMComponent) Invoke(ctx context.Context, db *gorm.DB, inputs map[strin
 		msgs = fitted
 	}
 	inv := getDefaultChatInvoker()
-	// Param-level retry override. When MaxRetries OR
-	// DelayAfterError is set on LLMParam, the user is asking
-	// for a per-call retry budget. We RE-WRAP the default
-	// invoker in a fresh retryInvoker that respects those
-	// values literally.
+	// 参数级重试覆盖。当 LLMParam 上设置了 MaxRetries 或
+	// DelayAfterError，用户在要求按调用计的重试预算。我们用尊重这些
+	// 值的全新 retryInvoker 重新包装默认 invoker。
 	//
-	// LLM retry normal-absolute-count: when MaxRetries OR
-	// DelayAfterError is explicitly set on LLMParam, the
-	// operator's intent is an ABSOLUTE attempt budget. The
-	// default invoker installed at boot in cmd/server_main.go
-	// is itself a retryInvoker wrapping einoChatInvoker.
-	// Without unwrapping, the two loops would multiplicatively
-	// stack:
+	// LLM 重试归一化为绝对次数：当 LLMParam 显式设置 MaxRetries 或
+	// DelayAfterError 时，操作者的意图是绝对尝试预算。启动时在
+	// cmd/server_main.go 安装的默认 invoker 本身就是包着
+	// einoChatInvoker 的 retryInvoker。不解包的话两个循环会乘性叠加：
 	//
-	//   boot=3, MaxRetries=5 → up to (3+1) × (5+1) = 24
-	//                          invocations, not the 6 the
-	//                          operator almost certainly intended.
+	//   启动=3、MaxRetries=5 → 最多 (3+1) × (5+1) = 24 次调用，
+	//                          而不是操作者几乎肯定想要的 6 次。
 	//
-	// unwrapChatInvoker peels off any retryInvoker layers to
-	// reach the bare invoker, then the param-override branch
-	// wraps that bare invoker in a fresh retryInvoker with the
-	// operator's literal values. Net effect: the absolute attempt
-	// count is exactly (MaxRetries + 1), independent of the boot
-	// layer.
+	// unwrapChatInvoker 剥掉所有 retryInvoker 层拿到裸 invoker，然后
+	// 参数覆盖分支用操作者的字面值把裸 invoker 包进全新
+	// retryInvoker。净效果：绝对尝试次数恰为 (MaxRetries + 1)，与
+	// 启动层无关。
 	//
-	// Operators who do NOT set MaxRetries (both fields zero) get
-	// the boot retry chain unchanged. The unit tests in
-	// llm_retry_test.go pin both the unwrap behaviour and the
-	// stacking-prevention contract.
+	// 不设置 MaxRetries（两个字段都为零）的操作者原样获得启动重试
+	// 链。llm_retry_test.go 的单测钉住了解包行为与防叠加契约。
 	hasOverride := p.MaxRetries > 0 || p.DelayAfterError > 0
 	if hasOverride {
 		maxRetries := p.MaxRetries
@@ -494,9 +456,8 @@ func (c *LLMComponent) Invoke(ctx context.Context, db *gorm.DB, inputs map[strin
 		if delay <= 0 {
 			delay = retryInvokerBackoff
 		}
-		// Normalise the attempt budget: peel off the boot
-		// retryInvoker layer (if any) so the operator's
-		// MaxRetries is an absolute count, not a stacked one.
+		// 归一化尝试预算：剥掉启动的 retryInvoker 层（如有），让操作者
+		// 的 MaxRetries 是绝对计数而非叠加计数。
 		inv = newRetryInvoker(unwrapChatInvoker(inv), maxRetries, delay)
 	}
 	resp, err := inv.Invoke(ctx, db, ChatInvokeRequest{
@@ -516,11 +477,10 @@ func (c *LLMComponent) Invoke(ctx context.Context, db *gorm.DB, inputs map[strin
 		return nil, fmt.Errorf("component: LLM.Invoke: %w", err)
 	}
 
-	// Strip think blocks + JSON fences from the response.
-	// Mirrors Python's clean_formated_answer() exactly
-	// (re.sub(r"^.*</think>", "", ...) + ^.*```json + trailing ```).
-	// Python only cleans for structured output — keep raw content for
-	// regular responses (llm.py:483: self.set_output("content", ans)).
+	// 从响应中剥离 think 块 + JSON 围栏。严格对齐 Python 的
+	// clean_formated_answer()（re.sub(r"^.*</think>", "", ...) +
+	// ^.*```json + 尾部 ```）。Python 只对结构化输出做清理——普通响应
+	// 保留原始内容（llm.py:483: self.set_output("content", ans)）。
 	cleaned := resp.Content
 	if p.OutputStructure != nil || p.JSONOutput {
 		cleaned = cleanFormattedAnswer(resp.Content)
@@ -538,16 +498,14 @@ func (c *LLMComponent) Invoke(ctx context.Context, db *gorm.DB, inputs map[strin
 		if err := json.Unmarshal([]byte(resp.Content), &parsed); err == nil {
 			out["json"] = parsed
 		} else {
-			// Surface a non-fatal warning — caller can still read "content".
+			// 浮出非致命警告——调用方仍可读取 "content"。
 			common.Warn("component: LLM: json_output=true but content is not valid JSON", zap.Error(err))
 		}
 	}
 	if p.OutputStructure != nil {
-		// Best-effort parse: if the first response isn't valid JSON
-		// (or doesn't contain the expected top-level keys), retry once
-		// with a re-prompt. OutputStructure is treated as a key-set
-		// hint; deep schema validation (types, nested objects) is
-		// deferred to a future phase.
+		// 尽力解析：首次响应不是合法 JSON（或不含期望的顶层键）时，
+		// 用重提示重试一次。OutputStructure 当作键集合提示；深度
+		// schema 校验（类型、嵌套对象）留待后续阶段。
 		parsed, ok := matchOutputStructure(resp.Content, p.OutputStructure)
 		if !ok {
 			retryResp, err := inv.Invoke(ctx, db, ChatInvokeRequest{
@@ -572,8 +530,8 @@ func (c *LLMComponent) Invoke(ctx context.Context, db *gorm.DB, inputs map[strin
 		}
 		if ok {
 			out["structured"] = parsed
-			// Also update content to the validated response so
-			// downstream consumers reading "content" get the JSON text.
+			// content 也更新为校验过的响应——这样读 "content" 的下游
+			// 消费者拿到的是 JSON 文本。
 			out["content"] = cleanFormattedAnswer(resp.Content)
 		} else {
 			common.Warn("component: LLM: output_structure set but no parseable JSON after retry")
@@ -583,36 +541,32 @@ func (c *LLMComponent) Invoke(ctx context.Context, db *gorm.DB, inputs map[strin
 	return out, nil
 }
 
-// Stream implements Component.Stream. It yields incremental chunks via
-// the returned channel; the channel is closed when the model finishes.
+// Stream 实现 Component.Stream。它经返回的通道产出增量 chunk；模型
+// 结束时关闭通道。
 //
-// The pattern follows the goroutine + buffered-channel + select-on-ctx
-// idiom: one goroutine produces chunks, the consumer selects between
-// receiving and ctx-cancellation. Backpressure is mitigated by the 16-
-// element channel buffer.
+// 模式遵循 goroutine + 缓冲通道 + select-ctx 惯用法：一个 goroutine
+// 生产 chunk，消费者在接收与 ctx 取消之间 select。16 元素的通道缓冲
+// 缓解背压。
 //
-// Each chunk is a map[string]any with two keys:
-//   - "thinking" (string): the model's reasoning content, empty if absent
-//   - "content"  (string): the model's visible content
+// 每个 chunk 是带两个键的 map[string]any：
+//   - "thinking"（string）：模型的推理内容，没有则为空
+//   - "content"（string）：模型的可见内容
 //
-// A final chunk with key "done" (bool=true) signals end-of-stream so
-// downstream consumers can flush state without relying on channel close
-// alone (close also works; the "done" key is informational).
+// 带 "done" 键（bool=true）的最终 chunk 标记流结束——下游消费者可以
+// 据此冲刷状态，而不只依赖通道关闭（关闭也有效；"done" 键是信息性
+// 的）。
 //
-// Today, the LLM driver layer returns a single non-streamed response,
-// so this v1 emits exactly one chunk + one done. Hooking the actual
-// eino stream (EinoChatModel.Stream at internal/entity/models/llm.go:137)
-// is deferred — the public surface here is correct, only the data
-// source needs to be swapped to a real StreamReader consumer in a
-// follow-up.
+// 目前 LLM 驱动层返回单个非流式响应，所以这个 v1 恰好发一个 chunk +
+// 一个 done。接上真正的 eino 流（EinoChatModel.Stream，
+// internal/entity/models/llm.go:137）被推迟——这里的公共接口是正确
+// 的，后续只需把数据源换成真正的 StreamReader 消费者。
 func (c *LLMComponent) Stream(ctx context.Context, db *gorm.DB, inputs map[string]any) (<-chan map[string]any, error) {
 	out := make(chan map[string]any, 16)
 	go func() {
 		defer close(out)
-		// Early bail-out for pre-cancelled contexts: don't run the
-		// (potentially expensive) LLM call when the consumer has
-		// already given up. Honors the documented select-on-ctx
-		// pattern at the goroutine entry, not just between chunks.
+		// 对预取消的上下文提前退出：消费者已放弃时不再执行（可能昂贵
+		// 的）LLM 调用。在 goroutine 入口就遵守文档化的 select-ctx
+		// 模式，而不只在 chunk 之间。
 		if err := ctx.Err(); err != nil {
 			return
 		}
@@ -624,9 +578,8 @@ func (c *LLMComponent) Stream(ctx context.Context, db *gorm.DB, inputs map[strin
 			}
 			return
 		}
-		// Single non-streamed response — emit as one content chunk.
-		// A real streaming integration would loop over a channel
-		// here and emit multiple chunks with partial content.
+		// 单个非流式响应——作为一个 content chunk 发出。真正的流式集成
+		// 会在这里循环通道、发多个带部分内容的 chunk。
 		chunk := map[string]any{
 			"thinking": result["thinking"],
 			"content":  result["content"],
@@ -636,7 +589,7 @@ func (c *LLMComponent) Stream(ctx context.Context, db *gorm.DB, inputs map[strin
 		case <-ctx.Done():
 			return
 		}
-		// Final done marker.
+		// 最终 done 标记。
 		select {
 		case out <- map[string]any{"done": true, "model": result["model"]}:
 		case <-ctx.Done():
@@ -645,7 +598,7 @@ func (c *LLMComponent) Stream(ctx context.Context, db *gorm.DB, inputs map[strin
 	return out, nil
 }
 
-// Inputs returns parameter metadata for tooling.
+// Inputs 返回供工具使用的参数元数据。
 func (c *LLMComponent) Inputs() map[string]string {
 	return map[string]string{
 		"model_id":          "Provider-side model identifier (e.g. \"gpt-4o-mini\")",
@@ -666,7 +619,7 @@ func (c *LLMComponent) Inputs() map[string]string {
 	}
 }
 
-// Outputs returns output metadata.
+// Outputs 返回输出元数据。
 func (c *LLMComponent) Outputs() map[string]string {
 	return map[string]string{
 		"content": "Assistant text response",
@@ -677,8 +630,8 @@ func (c *LLMComponent) Outputs() map[string]string {
 	}
 }
 
-// buildMessages assembles a system + user message sequence. Order:
-// system first (if set), then user.
+// buildMessages 组装 system + user 消息序列。顺序：system 在前
+// （若设置），然后 user。
 func buildMessages(system, user string) []schema.Message {
 	out := make([]schema.Message, 0, 2)
 	if system != "" {
@@ -690,14 +643,13 @@ func buildMessages(system, user string) []schema.Message {
 	return out
 }
 
-// injectCitationPrompt returns the system message with the canonical
-// citation-instruction text appended. When system is empty, returns
-// the prompt as-is. Two newlines separate the user's system prompt
-// from the citation block so the LLM can parse them distinctly.
-// matchOutputStructure parses the LLM response and returns the
-// parsed map iff it is a JSON object that contains every top-level
-// key in expected. Inner-type validation is deferred — a future
-// phase will use a JSON-schema validator.
+// injectCitationPrompt 返回追加了规范引用指令文本的 system 消息。
+// system 为空时原样返回 prompt。两个换行把用户的 system prompt 与
+// 引用块分开，让 LLM 能区分解析。
+//
+// matchOutputStructure 解析 LLM 响应，仅当它是包含 expected 中全部
+// 顶层键的 JSON 对象时，返回解析出的 map。内部类型校验被推迟——
+// 未来阶段会用 JSON-schema 校验器。
 func matchOutputStructure(content string, expected map[string]any) (map[string]any, bool) {
 	var parsed map[string]any
 	if err := json.Unmarshal([]byte(content), &parsed); err != nil {
@@ -711,11 +663,10 @@ func matchOutputStructure(content string, expected map[string]any) (map[string]a
 	return parsed, true
 }
 
-// buildStructuredRetryMessages rebuilds the message list with a
-// follow-up user turn that surfaces the LLM's first response and
-// asks for valid JSON matching the expected top-level keys. The
-// retry uses the same chat invoker on the next call; the message
-// list returned here is what gets sent on the retry.
+// buildStructuredRetryMessages 重建消息列表：加一个后续 user 轮次，
+// 展示 LLM 的首次响应，并要求产出匹配期望顶层键的合法 JSON。重试
+// 在下一次调用时用同一个 chat invoker；这里返回的消息列表就是重试
+// 时发送的内容。
 func buildStructuredRetryMessages(system, user string, images []string, cite bool, expected map[string]any, prevContent string) []schema.Message {
 	msgs := buildMessagesWithImages(system, user, images, cite)
 	keys := make([]string, 0, len(expected))
@@ -745,29 +696,26 @@ func injectCitationPrompt(system string) string {
 	return system + "\n\n" + prompt
 }
 
-// dataImageRe matches RFC-2397 data URLs of the form
+// dataImageRe 匹配形如
 //
 //	data:image/<subtype>;base64,<payload>
 //
-// where <subtype> is an image MIME subtype (including structured types
-// like "svg+xml" and "vnd.foo") and <payload> is base64 in either the
-// standard alphabet ("+/=") or URL-safe alphabet ("-_=") — the regex
-// accepts both because real-world emitters (browser data URIs, Python
-// base64.urlsafe_b64encode) mix them. Validation of the actual bytes
-// is the driver's job; the regex is intentionally permissive about the
-// alphabet but strict about the "data:image/...;base64," prefix.
+// 的 RFC-2397 data URL。其中 <subtype> 是图像 MIME 子类型（含
+// "svg+xml"、"vnd.foo" 之类的结构化类型），<payload> 是标准字母表
+// （"+/="）或 URL 安全字母表（"-_="）的 base64——正则两种都接受，
+// 因为现实中的发射方（浏览器 data URI、Python base64.urlsafe_b64encode）
+// 混着用。实际字节的校验是驱动的活；正则对字母表刻意宽松，但对
+// "data:image/...;base64," 前缀严格。
 //
-// Note: this regex requires ";base64," immediately after the subtype.
-// It does NOT accept ";charset=utf-8;base64," or other parameter-prefixed
-// forms — those are uncommon in canvas inputs and deferred.
+// 注意：该正则要求 ";base64," 紧跟子类型之后。不接受
+// ";charset=utf-8;base64," 或其他带参数前缀的形式——那些在画布输入
+// 里少见，留待以后。
 var dataImageRe = regexp.MustCompile(`data:image/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=_-]+`)
 
-// extractDataImages scans the input strings for data:image/*
-// base64 URIs and returns the deduplicated set in first-seen
-// order. The current implementation only walks top-level string
-// values; recursive walk over nested structs/lists is a future
-// enhancement (Python's _extract_data_images covers the recursive
-// case).
+// extractDataImages 扫描输入字符串里的 data:image/* base64 URI，
+// 按首次出现顺序返回去重集合。当前实现只遍历顶层字符串值；对嵌套
+// 结构/列表的递归遍历是未来增强（Python 的 _extract_data_images
+// 覆盖了递归情形）。
 func extractDataImages(values []string) []string {
 	seen := make(map[string]struct{})
 	var out []string
@@ -783,9 +731,8 @@ func extractDataImages(values []string) []string {
 	return out
 }
 
-// collectSysFiles splits sys.files from canvas state into text parts
-// and image data URIs. The caller is responsible for handling any
-// {sys.files} placeholder replacement in the prompts.
+// collectSysFiles 把画布状态里的 sys.files 拆成文本部分和图像
+// data URI。{sys.files} 占位符在 prompt 里的替换由调用方负责。
 func collectSysFiles(state *runtime.CanvasState) (textParts, imageURIs []string) {
 	files, ok := state.Sys["files"]
 	if !ok {
@@ -813,7 +760,7 @@ func collectSysFiles(state *runtime.CanvasState) (textParts, imageURIs []string)
 	return textParts, imageURIs
 }
 
-// dedupStrings returns the deduplicated slice in first-seen order.
+// dedupStrings 按首次出现顺序返回去重切片。
 func dedupStrings(vals []string) []string {
 	seen := make(map[string]struct{}, len(vals))
 	out := make([]string, 0, len(vals))
@@ -827,11 +774,10 @@ func dedupStrings(vals []string) []string {
 	return out
 }
 
-// prependHistory inserts up to `window` prior turns from the canvas
-// history before the current system+user messages. Each history entry
-// is a {role, content} map; only the last `window` are kept, with
-// assistant/user roles preserved. Invalid entries (missing role or
-// content) are skipped silently.
+// prependHistory 在当前 system+user 消息之前插入画布历史中最多
+// `window` 条先前轮次。每条历史条目是 {role, content} map；只保留
+// 最后 `window` 条，assistant/user 角色原样保留。非法条目（缺 role
+// 或 content）静默跳过。
 func prependHistory(current []schema.Message, history []map[string]any, window int) []schema.Message {
 	if window <= 0 || len(history) == 0 {
 		return current
@@ -853,24 +799,20 @@ func prependHistory(current []schema.Message, history []map[string]any, window i
 	return append(out, current...)
 }
 
-// buildMessagesWithImages assembles a system + user message sequence,
-// attaching data:image URIs as eino multi-modal content parts when
-// present. Without images the function is identical to buildMessages.
+// buildMessagesWithImages 组装 system + user 消息序列；存在
+// data:image URI 时，把它们作为 eino 多模态内容部分挂上。无图像时
+// 本函数与 buildMessages 完全一致。
 //
-// When cite is true, the citation-instruction prompt is appended to the
-// system message (creating one if it was empty). This mirrors the
-// Python LLM._prepare_prompt_variables path where cite=True
-// triggers `citation_prompt()` injection. The post-stream
-// grounding call (Python's _gen_citations_async) is the
-// RetrievalService-driven citation enhancement.
+// cite 为 true 时，引用指令 prompt 追加进 system 消息（system 为空
+// 则创建一个）。对齐 Python LLM._prepare_prompt_variables 路径：
+// cite=True 触发 `citation_prompt()` 注入。流后的落地调用（Python 的
+// _gen_citations_async）是 RetrievalService 驱动的引用增强。
 //
-// Each image is wrapped in a MessageInputPart{Type: "image_url",
-// Image: &MessageInputImage{MessagePartCommon{URL: dataURI}}}. The
-// driver layer (anthropic.go:254, google.go:168) recognises the
-// "image_url" part type and translates to the provider-native format.
-// Using URL (rather than splitting into Base64Data + MIMEType) keeps the
-// data URI intact, which matches the existing anthropic_test.go:221
-// fixture format.
+// 每张图像包成 MessageInputPart{Type: "image_url",
+// Image: &MessageInputImage{MessagePartCommon{URL: dataURI}}}。
+// 驱动层（anthropic.go:254、google.go:168）识别 "image_url" 部分
+// 类型并翻译成厂商原生格式。用 URL（而非拆成 Base64Data + MIMEType）
+// 保持 data URI 完整——与现有 anthropic_test.go:221 夹具格式一致。
 func buildMessagesWithImages(system, user string, images []string, cite bool) []schema.Message {
 	if cite {
 		system = injectCitationPrompt(system)
@@ -891,10 +833,10 @@ func buildMessagesWithImages(system, user string, images []string, cite bool) []
 	return out
 }
 
-// userMessageWithImages builds a user message carrying the text plus the
-// given data-image URIs as eino multi-modal content parts. Shared by the
-// LLM component (buildMessagesWithImages) and the Agent component
-// (buildAgentInputMessages) so both produce the exact same part shape.
+// userMessageWithImages 构建携带文本及给定 data-image URI（作为 eino
+// 多模态内容部分）的 user 消息。供 LLM 组件（buildMessagesWithImages）
+// 与 Agent 组件（buildAgentInputMessages）共用，保证两者产出完全
+// 相同的部分形状。
 func userMessageWithImages(user string, images []string) schema.Message {
 	parts := make([]schema.MessageInputPart, 0, 1+len(images))
 	if user != "" {
@@ -918,18 +860,17 @@ func userMessageWithImages(user string, images []string) schema.Message {
 	}
 }
 
-// mergeLLMParam layers raw inputs over the receiver's default param set.
+// mergeLLMParam 把原始输入叠加到接收者的默认参数集上。
 //
-// v1 DSL aliases accepted alongside the v2 names:
+// 与 v2 名称并行接受的 v1 DSL 别名：
 //
 //	"llm_id"      → "model_id"
 //	"sys_prompt"  → "system_prompt"
 //	"base_url"    → "BaseURL"
 //
-// The v1 fixtures in internal/agent/dsl/testdata use the
-// short forms; without these aliases the v1→v2 conversion (plan §2.5)
-// would have to be run before the factory builds the component, which
-// the e2e compile+invoke path doesn't do.
+// internal/agent/dsl/testdata 里的 v1 夹具用的是短形式；没有这些
+// 别名的话，工厂构建组件前必须先跑 v1→v2 转换（§2.5）——而 e2e 的
+// 编译+调用路径并不做这一步。
 func mergeLLMParam(base LLMParam, inputs map[string]any) LLMParam {
 	p := base
 	if v, ok := stringFrom(inputs, "model_id"); ok {
@@ -985,9 +926,8 @@ func mergeLLMParam(base LLMParam, inputs map[string]any) LLMParam {
 		f := v
 		p.FrequencyPenalty = &f
 	}
-	// visual_files: accept []string or single string with embedded
-	// data URIs. The current implementation only walks top-level
-	// string values; recursive walk is a future enhancement.
+	// visual_files：接受 []string 或内嵌 data URI 的单个字符串。当前
+	// 实现只遍历顶层字符串值；递归遍历是未来增强。
 	if v, ok := sliceFrom(inputs, "visual_files"); ok {
 		p.VisualFiles = extractDataImages(v)
 	} else if v, ok := stringFrom(inputs, "visual_files"); ok {
@@ -998,12 +938,11 @@ func mergeLLMParam(base LLMParam, inputs map[string]any) LLMParam {
 		p.MaxTokens = &i
 	}
 	if v, ok := stringFrom(inputs, "thinking"); ok {
-		// Forward any non-empty, non-"default" value to match the
-		// lenient Python gate: hasattr(self,"thinking") and
-		// self.thinking and self.thinking != "default".
-		// Downstream (einoChatInvoker) only acts on "enabled" /
-		// "disabled" and silently ignores unknown values, so
-		// this is safe.
+		// 转发任何非空、非 "default" 的值——对齐 Python 的宽松门：
+		// hasattr(self,"thinking") and self.thinking and
+		// self.thinking != "default"。
+		// 下游（einoChatInvoker）只对 "enabled" / "disabled" 生效，
+		// 未知值静默忽略，所以这样安全。
 		if v != "" && v != "default" {
 			p.Thinking = v
 		}
@@ -1011,9 +950,9 @@ func mergeLLMParam(base LLMParam, inputs map[string]any) LLMParam {
 	return p
 }
 
-// effectiveContextLength returns maxLength if positive, otherwise 8192.
-// Mirrors Python's LLM.effective_context_length in PR #16413 — prevents
-// zero/negative context windows from silently trimming all prompt content.
+// effectiveContextLength 返回 maxLength（若为正），否则返回 8192。
+// 对齐 Python PR #16413 的 LLM.effective_context_length——防止零/负
+// 上下文窗口静默裁掉全部 prompt 内容。
 func effectiveContextLength(maxLength int) int {
 	if maxLength > 0 {
 		return maxLength
@@ -1021,19 +960,17 @@ func effectiveContextLength(maxLength int) int {
 	return 8192
 }
 
-// contextFitBudget returns 97% of the effective context length as the
-// token budget for message_fit_in. Mirrors Python's LLM.context_fit_budget
-// in PR #16413.
+// contextFitBudget 返回生效上下文长度的 97% 作为 message_fit_in 的
+// token 预算。对齐 Python PR #16413 的 LLM.context_fit_budget。
 func contextFitBudget(maxLength int) int {
 	return int(float64(effectiveContextLength(maxLength)) * 0.97)
 }
 
-// validateFittedMessages checks that the fitted message list is non-empty
-// and the last message is a non-empty user turn (content or multi-modal
-// parts). Returns an error string on failure, empty string on success.
-// Python requires len >= 2 because the system prompt is always injected
-// upstream; Go allows len >= 1 because the system message may be embedded
-// inside msgs (from buildMessagesWithImages) or absent entirely.
+// validateFittedMessages 检查裁剪后的消息列表非空，且最后一条是非空
+// 的 user 轮次（content 或多模态部分）。失败返回错误字符串，成功
+// 返回空串。Python 要求 len >= 2，因为 system prompt 总在上游注入；
+// Go 允许 len >= 1，因为 system 消息可能已嵌在 msgs 里（来自
+// buildMessagesWithImages）或完全缺席。
 func validateFittedMessages(msgFit []schema.Message) string {
 	if len(msgFit) == 0 {
 		return "**ERROR**: message_fit_in produced insufficient messages for LLM"
@@ -1048,12 +985,11 @@ func validateFittedMessages(msgFit []schema.Message) string {
 	return ""
 }
 
-// fitMessages calls message_fit_in semantics on the given messages and
-// validates that the result ends with a non-empty user turn. Returns the
-// fitted messages and an error string (empty on success).
-// Mirrors Python's LLM.fit_messages in PR #16413.
+// fitMessages 对给定消息执行 message_fit_in 语义，并校验结果以非空
+// user 轮次结尾。返回裁剪后的消息与错误字符串（成功为空）。
+// 对齐 Python PR #16413 的 LLM.fit_messages。
 func fitMessages(systemPrompt string, msgs []schema.Message, maxLength int) ([]schema.Message, string) {
-	// Deep-copy msgs (mirrors Python's deepcopy) to avoid mutating caller's slice.
+	// 深拷贝 msgs（对齐 Python 的 deepcopy），避免修改调用方的切片。
 	copied := make([]schema.Message, len(msgs))
 	for i, m := range msgs {
 		cloned := slices.Clone(m.UserInputMultiContent)
@@ -1074,15 +1010,14 @@ func fitMessages(systemPrompt string, msgs []schema.Message, maxLength int) ([]s
 		}
 	}
 
-	// Convert to messagefit.Message. Track where each entry's text lives
-	// (plain Content or a multi-modal text part) so the fitted text can be
-	// written back to the right field. Entries with no text at all
-	// (image-only turns) carry an empty Content in messagefit and survive
-	// fitting when kept.
+	// 转成 messagefit.Message。记录每条条目的文本原本在哪（纯 Content
+	// 还是某个多模态文本部分），这样裁剪后的文本能写回正确的字段。
+	// 完全没有文本的条目（纯图像轮次）在 messagefit 里携带空
+	// Content，被保留时照常存活。
 	type fitSource struct {
-		copiedIdx     int  // index into copied; -1 for the synthetic system prompt
-		multiIdx      int  // -1 means the text lives in Content
-		textInContent bool // the original message carried text in Content
+		copiedIdx     int  // copied 中的索引；合成的 system prompt 为 -1
+		multiIdx      int  // -1 表示文本在 Content 里
+		textInContent bool // 原消息的文本在 Content 里
 	}
 	all := make([]messagefit.Message, 0, 1+len(copied))
 	sources := make([]fitSource, 0, 1+len(copied))
@@ -1097,9 +1032,8 @@ func fitMessages(systemPrompt string, msgs []schema.Message, maxLength int) ([]s
 		multiIdx := -1
 		hadText := text != ""
 		if !hadText {
-			// Fold every non-empty text part into the token budget: only the
-			// first text part is written back, so leaving later parts out
-			// would let text exceed the fitted budget after reconstruction.
+			// 把每个非空文本部分都折进 token 预算：只有第一个文本部分
+			// 会被写回，若漏掉后面的部分，重建后文本就会超出裁剪预算。
 			var textParts []string
 			for j, p := range copied[i].UserInputMultiContent {
 				if p.Type == schema.ChatMessagePartTypeText && p.Text != "" {
@@ -1118,13 +1052,13 @@ func fitMessages(systemPrompt string, msgs []schema.Message, maxLength int) ([]s
 		sources = append(sources, fitSource{copiedIdx: i, multiIdx: multiIdx, textInContent: copied[i].Content != ""})
 	}
 
-	// Use 97% of effective context as the token budget.
+	// 用生效上下文的 97% 作为 token 预算。
 	budget := contextFitBudget(maxLength)
 	kept, keptIdx, _ := messagefit.Fit(all, budget)
 
-	// Convert back to []schema.Message. messagefit.Fit reports exactly which
-	// entries are kept (keptIdx); dropped entries are simply absent, so no
-	// empty-content sentinel is needed and image-only turns are preserved.
+	// 转回 []schema.Message。messagefit.Fit 精确报告保留了哪些条目
+	//（keptIdx）；被丢弃的条目直接缺席，所以不需要空内容哨兵，
+	// 纯图像轮次也得以保留。
 	result := make([]schema.Message, 0, len(kept))
 	for j, i := range keptIdx {
 		src := sources[i]
@@ -1135,9 +1069,8 @@ func fitMessages(systemPrompt string, msgs []schema.Message, maxLength int) ([]s
 		m := copied[src.copiedIdx]
 		if src.multiIdx >= 0 && src.multiIdx < len(m.UserInputMultiContent) {
 			m.UserInputMultiContent[src.multiIdx].Text = kept[j].Content
-			// Drop any additional text parts: their content was folded into
-			// the first part before fitting, so keeping them would re-introduce
-			// text outside the token budget.
+			// 丢弃其余文本部分：它们的内容在裁剪前已折进第一个部分，
+			// 保留它们会让超出 token 预算的文本重新出现。
 			keptParts := m.UserInputMultiContent[:0]
 			for k, part := range m.UserInputMultiContent {
 				if part.Type == schema.ChatMessagePartTypeText && k != src.multiIdx {
@@ -1147,8 +1080,8 @@ func fitMessages(systemPrompt string, msgs []schema.Message, maxLength int) ([]s
 			}
 			m.UserInputMultiContent = keptParts
 		} else if src.textInContent {
-			// Always write the fitted text back (even when trimmed to empty):
-			// leaving the original would send untrimmed content past the budget.
+			// 始终写回裁剪后的文本（即使被裁成空）：保留原文会把未裁剪
+			// 的内容送出预算。
 			m.Content = kept[j].Content
 		}
 		result = append(result, m)
@@ -1156,8 +1089,8 @@ func fitMessages(systemPrompt string, msgs []schema.Message, maxLength int) ([]s
 	return result, validateFittedMessages(result)
 }
 
-// stringFrom extracts a string from inputs[name], accepting both string and
-// fmt.Stringer-able values.
+// stringFrom 从 inputs[name] 提取字符串，接受 string 及可转为
+// fmt.Stringer 的值。
 func stringFrom(inputs map[string]any, name string) (string, bool) {
 	v, ok := inputs[name]
 	if !ok {
@@ -1169,11 +1102,10 @@ func stringFrom(inputs map[string]any, name string) (string, bool) {
 	return "", false
 }
 
-// mapFrom extracts a map[string]any from inputs[name]. Accepts the
-// canonical map[string]any shape (the shape produced by
-// json.Unmarshal into a map). For OutputStructure we only need the
-// top-level shape — schema-validation against the inner types is
-// deferred to a future phase.
+// mapFrom 从 inputs[name] 提取 map[string]any。接受规范的
+// map[string]any 形状（即 json.Unmarshal 到 map 时产出的形状）。
+// 对 OutputStructure 我们只需要顶层形状——针对内部类型的
+// schema 校验留待未来阶段。
 func mapFrom(inputs map[string]any, name string) (map[string]any, bool) {
 	v, ok := inputs[name]
 	if !ok {
@@ -1183,7 +1115,7 @@ func mapFrom(inputs map[string]any, name string) (map[string]any, bool) {
 	return m, ok
 }
 
-// boolFrom extracts a bool from inputs[name].
+// boolFrom 从 inputs[name] 提取 bool。
 func boolFrom(inputs map[string]any, name string) (bool, bool) {
 	v, ok := inputs[name]
 	if !ok {
@@ -1195,7 +1127,7 @@ func boolFrom(inputs map[string]any, name string) (bool, bool) {
 	return false, false
 }
 
-// floatFrom extracts a float64 from inputs[name], also accepting int.
+// floatFrom 从 inputs[name] 提取 float64，也接受 int。
 func floatFrom(inputs map[string]any, name string) (float64, bool) {
 	v, ok := inputs[name]
 	if !ok {
@@ -1214,7 +1146,7 @@ func floatFrom(inputs map[string]any, name string) (float64, bool) {
 	return 0, false
 }
 
-// intFrom extracts an int from inputs[name], also accepting float64.
+// intFrom 从 inputs[name] 提取 int，也接受 float64。
 func intFrom(inputs map[string]any, name string) (int, bool) {
 	v, ok := inputs[name]
 	if !ok {
@@ -1231,7 +1163,7 @@ func intFrom(inputs map[string]any, name string) (int, bool) {
 	return 0, false
 }
 
-// init registers LLMComponent with the orchestrator-owned registry.
+// init 把 LLMComponent 注册进编排器持有的注册表。
 func init() {
 	Register("LLM", func(params map[string]any) (Component, error) {
 		var p LLMParam
@@ -1274,8 +1206,7 @@ func init() {
 			f := v
 			p.FrequencyPenalty = &f
 		}
-		// cite defaults to true (matches Python) when neither LLMParam
-		// nor inputs set it.
+		// LLMParam 和 inputs 都没设置时，cite 默认为 true（对齐 Python）。
 		p.Cite = true
 		if v, ok := boolFrom(params, "cite"); ok {
 			p.Cite = v

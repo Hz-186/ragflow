@@ -1,42 +1,20 @@
+// interrupt_resume.go —— canvas 层的 eino v0.9.8 中断/恢复封装。
 //
-//  Copyright 2026 The InfiniFlow Authors. All Rights Reserved.
+// 背景（§3）：上一版"等用户"机制是哨兵链（__wait_for_user__ /
+// _user_input_provided），从未真正端到端打通——UserFillUpComponent.Invoke
+// 不发 `__wait_for_user__`，编排器 IsWaitForUser 分支从不触发。本文件用
+// eino 原生中断/恢复 API 取代哨兵链：
 //
-//  Licensed under the Apache License, Version 2.0 (the "License");
-//  you may not use this file except in compliance with the License.
-//  You may obtain a copy of the License at
+//   - UserFillUpNodeBody —— 首次执行 compose.Interrupt 暂停；恢复执行
+//     经 compose.GetResumeContext 读用户输入；
+//   - IsInterruptError / ExtractInterruptContexts —— 错误侧辅助函数，
+//     编排器 Driver 用它们识别"等用户"信号并转发为 waiting_for_user
+//     SSE 事件；
+//   - BuildInputSpec —— 从 DSL params 抠 UserFillUp 表单字段定义，挂在
+//     compose.Interrupt 的 `info` 参数上，编排器由此把表单 schema 递给
+//     前端。
 //
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-//  Unless required by applicable law or agreed to in writing, software
-//  distributed under the License is distributed on an "AS IS" BASIS,
-//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-//  See the License for the specific language governing permissions and
-//  limitations under the License.
-//
-
-// interrupt_resume.go — eino v0.9.8 interrupt/resume wrappers for the
-// canvas layer.
-//
-// Background (plan §3): the previous "wait for user" mechanism was a
-// sentinel chain (`__wait_for_user__` / `_user_input_provided`) that
-// never actually connected end-to-end — UserFillUpComponent.Invoke did
-// not emit `__wait_for_user__`, so the orchestrator's IsWaitForUser
-// branch never fired. This file replaces the sentinel chain with eino's
-// native interrupt/resume API:
-//
-//   - UserFillUpNodeBody — returns a node func that calls
-//     compose.Interrupt on first execution and reads the user's input
-//     via compose.GetResumeContext on resume.
-//   - IsInterruptError / ExtractInterruptContexts — error-side helpers
-//     used by the orchestrator Driver to detect a wait-for-user signal
-//     and forward it as a `waiting_for_user` SSE event.
-//   - BuildInputSpec — extracts the UserFillUp form-field definition
-//     from DSL params; this is what we attach to compose.Interrupt's
-//     `info` argument so the orchestrator can surface the form schema
-//     to the front-end.
-//
-// v0.9.8 API surface used here (file-level diff against v0.9.5 verified
-// identical for these signatures):
+// ★ EINO 中断模版（此处用到的 v0.9.8 API 面）：
 //
 //	compose.Interrupt(ctx, info) error
 //	compose.GetResumeContext[T any](ctx) (isResumeFlow, hasData bool, data T)
@@ -57,18 +35,14 @@ import (
 	"ragflow/internal/agent/runtime"
 )
 
-// BuildInputSpec turns the DSL's UserFillUp params into the user-visible
-// info payload that travels with the interrupt signal. The orchestrator
-// Driver reads this from InterruptCtx.Info on the SSE side and ships it
-// to the front-end so the form renderer knows what fields to render.
+// BuildInputSpec 把 DSL 的 UserFillUp params 变成随中断信号走、用户可见
+// 的 info 载荷。编排器 Driver 在 SSE 侧从 InterruptCtx.Info 读它、发给
+// 前端——表单渲染器由此知道要画哪些字段。
 //
-// We deliberately keep the schema tiny: enable_tips + tips + an
-// `inputs` map for the field definitions. Anything richer would couple
-// the canvas layer to the component package, which is forbidden (the
-// component package already knows the UserFillUp shape — it owns the
-// form-field schema in userfillup.go; this function only carries the
-// minimum the orchestrator needs to round-trip the form schema without
-// re-reading the DSL).
+// schema 有意保持极小：enable_tips + tips + 字段定义的 inputs map。再
+// 丰富就会把 canvas 层和 component 包耦合起来（禁止——component 包在
+// userfillup.go 里拥有表单字段 schema；本函数只携带编排器往返表单
+// schema 所需的最小集，不重读 DSL）。
 func BuildInputSpec(params map[string]any) map[string]any {
 	spec := make(map[string]any, 4)
 	if params != nil {
@@ -82,12 +56,12 @@ func BuildInputSpec(params map[string]any) map[string]any {
 			spec["tips"] = v
 		}
 	}
-	spec["kind"] = "user_fill_up" // tag so cancel-vs-wait can be distinguished in Driver
+	spec["kind"] = "user_fill_up" // 打标签，Driver 里区分取消 vs 等待
 	return spec
 }
 
-// buildUserFillUpInterruptInfo renders a fresh wait prompt from the current
-// canvas state so repeated pauses never reuse an earlier iteration's tips.
+// buildUserFillUpInterruptInfo 用当前画布状态渲染全新的等待提示——
+// 重复暂停绝不复用上一轮迭代的 tips。
 func buildUserFillUpInterruptInfo(ctx context.Context, params map[string]any) map[string]any {
 	info := BuildInputSpec(params)
 	if enabled, ok := info["enable_tips"].(bool); ok && !enabled {
@@ -107,51 +81,41 @@ func buildUserFillUpInterruptInfo(ctx context.Context, params map[string]any) ma
 	return info
 }
 
-// UserFillUpNodeBody returns an eino node function implementing
-// "wait for user input" semantics.
+// UserFillUpNodeBody 返回实现"等用户输入"语义的 eino 节点函数。
 //
-// Flow:
+// 流程：
 //
-//   - First execution (no resume context): build an inputSpec and call
-//     compose.Interrupt, returning the resulting error. The engine
-//     catches the interrupt signal, persists a checkpoint, and surfaces
-//     the error to the orchestrator (which renders it as a
-//     `waiting_for_user` SSE event).
-//   - Resumed execution: compose.GetResumeContext returns
-//     (true, true, userInput). We emit two output keys: `user_input`
-//     (the canonical v1 form-fill output name, mirroring the Python
-//     fillup.py:66 contract) and the cpnID key (so downstream nodes can
-//     reference `{{user_fill_up_1}}`).
+//   - 首次执行（无恢复上下文）：构造 inputSpec 调 compose.Interrupt，
+//     返回其错误。引擎接住中断信号、持久化 checkpoint、把错误冒给
+//     编排器（渲染成 waiting_for_user SSE 事件）；
+//   - 恢复执行：compose.GetResumeContext 返回 (true, true, userInput)。
+//     产出两个输出键：user_input（v1 表单填报的标准输出名，对齐 Python
+//     fillup.py:66 契约）和 cpnID 键（下游节点可引用 {{user_fill_up_1}}）。
 //
-// Idempotency: the resume branch is the very first thing the node does.
-// Anything we did before the Interrupt call on the first run (we did
-// nothing — no LLM calls, no file writes) cannot be repeated. The
-// "node re-execution from start" risk called out in the plan §5 row 1
-// is therefore a non-issue for UserFillUpNodeBody specifically.
+// 幂等性：恢复分支是节点做的第一件事。首次运行 Interrupt 之前没做任何
+// 事（无 LLM 调用、无文件写）——不存在可重复的东西。§5 第 1 行提的
+// "节点从头重执行"风险对 UserFillUpNodeBody 不成立。
 func UserFillUpNodeBody(cpnID string, params map[string]any) func(ctx context.Context, input map[string]any) (map[string]any, error) {
 	inputSpec := BuildInputSpec(params)
 	body := func(ctx context.Context, input map[string]any) (map[string]any, error) {
-		// Resume branch: the orchestrator decorated ctx with
-		// compose.ResumeWithData(ctx, interruptID, userInput).
-		// isResumeFlow is true when THIS node is the explicit target;
-		// hasData is true when the caller supplied non-nil resume data.
+		// 恢复分支：编排器已用 compose.ResumeWithData(ctx, interruptID,
+		// userInput) 装饰 ctx。isResumeFlow 为 true 表示本节点是显式
+		// 恢复目标；hasData 为 true 表示调用方给了非 nil 恢复数据。
 		if isResume, hasData, data := compose.GetResumeContext[any](ctx); isResume && hasData {
 			out := buildUserFillUpResumeOutput(cpnID, inputSpec, data)
 			out["__cpn_id__"] = cpnID
 			return out, nil
 		}
 
-		// First-call branch: emit the interrupt signal. The returned
-		// error implements error; eino's runner catches it, persists a
-		// checkpoint, and bubbles it up.
+		// 首调分支：发中断信号。返回的 error 实现了 error 接口；eino
+		// runner 接住它、持久化 checkpoint、向上冒。
 		if err := compose.Interrupt(ctx, buildUserFillUpInterruptInfo(ctx, params)); err != nil {
 			return nil, err
 		}
 
-		// Unreachable on a healthy eino runner — Interrupt either
-		// returns an interrupt error or panics on engine misuse. Keep
-		// the guard so test runs without a runner surface a clear
-		// message rather than a panic.
+		// 健康 eino runner 上不可达——Interrupt 要么返回中断错误、要么
+		// 引擎误用时 panic。保留守卫：无 runner 的测试跑出清晰报错而非
+		// panic。
 		return nil, fmt.Errorf("canvas: UserFillUp %q: interrupt did not halt execution", cpnID)
 	}
 	return body
@@ -184,20 +148,17 @@ func buildUserFillUpResumeOutput(cpnID string, inputSpec map[string]any, data an
 	return out
 }
 
-// IsInterruptError reports whether err carries an eino interrupt signal.
+// IsInterruptError 判断 err 是否携带 eino 中断信号。
 //
-// Used by the orchestrator Driver to distinguish wait-for-user from
-// genuine run failures. context.Canceled / context.DeadlineExceeded
-// are explicitly excluded so cancel-timeout paths don't trigger
-// `waiting_for_user` events.
+// 编排器 Driver 用它区分"等用户"与真正的运行失败。
+// context.Canceled / DeadlineExceeded 被显式排除——取消/超时路径不触发
+// waiting_for_user 事件。
 //
-// Two detection paths cover the surface:
-//   - compose.ExtractInterruptInfo matches wrapped forms
-//     (`*interruptError` / `*subGraphInterruptError`) — the shapes
-//     the eino runner returns after propagating through the engine.
-//   - compose.IsInterruptRerunError matches the raw `*core.InterruptSignal`
-//     returned by a direct `compose.Interrupt(...)` call. Useful in
-//     unit tests that exercise the helper without spinning up a runner.
+// 两条检测路径覆盖整个面：
+//   - compose.ExtractInterruptInfo 匹配包装形态（*interruptError /
+//     *subGraphInterruptError）——eino runner 传播后返回的形状；
+//   - compose.IsInterruptRerunError 匹配直调 compose.Interrupt(...) 返回
+//     的裸 *core.InterruptSignal。单测不起 runner 直接测辅助函数时用。
 func IsInterruptError(err error) bool {
 	if err == nil {
 		return false
@@ -214,26 +175,21 @@ func IsInterruptError(err error) bool {
 	return false
 }
 
-// ExtractInterruptContexts walks the error chain and returns every
-// InterruptCtx the engine surfaced. Returns nil if err is not an
-// interrupt error.
+// ExtractInterruptContexts 沿错误链遍历，返回引擎浮出的所有
+// InterruptCtx。err 不是中断错误时返回 nil。
 //
-// This handles two wrapping cases that come up in practice:
+// 覆盖实践中出现的包装情况：
 //
-//  1. workflowx.AddLoopNode wraps sub-workflow interrupts as
-//     ErrLoopSubGraphInterrupted (workflowx/loop.go:122-126). The
-//     original interrupt error is reachable via errors.As/Is.
-//  2. Composite interrupts (ToolsNode, parallel branches) carry a
-//     list of nested InterruptCtx — we flatten them so the orchestrator
-//     sees a single flat list to pick a target from.
-//  3. Raw `*core.InterruptSignal` (the form `compose.Interrupt`
-//     returns directly) — handled here so unit tests don't need a
-//     full runner. The engine wraps this into `*interruptError` at
-//     propagation time, so the wrapped path is the production one.
+//  1. workflowx.AddLoopNode 把子工作流中断包成 ErrLoopSubGraphInterrupted
+//     （workflowx/loop.go:122-126）。原中断错误可经 errors.As/Is 触达；
+//  2. 复合中断（ToolsNode、并行分支）带嵌套 InterruptCtx 列表——摊平
+//     成单层，编排器从一张平表里挑目标；
+//  3. 裸 *core.InterruptSignal（compose.Interrupt 直接返回的形态）——
+//     单测不用起完整 runner。引擎传播时把它包成 *interruptError，
+//     包装路径才是生产路径。
 //
-// Single-interrupt vs composite: a plain UserFillUp produces one
-// context. The orchestrator currently uses the first; a future phase
-// that wants multi-target resume would iterate.
+// 单中断 vs 复合：普通 UserFillUp 产出一个上下文。编排器当前用第一个；
+// 将来做多目标恢复的可迭代。
 func ExtractInterruptContexts(err error) []*compose.InterruptCtx {
 	if err == nil {
 		return nil
@@ -244,12 +200,9 @@ func ExtractInterruptContexts(err error) []*compose.InterruptCtx {
 			return ctxs
 		}
 	}
-	// Fallback: raw signal. Use the deprecated IsInterruptRerunError
-	// helper which gives us (info, state, ok). We don't have access
-	// to InterruptCtx here in the raw form (the engine hasn't wrapped
-	// the signal yet), so we return nil — callers that care about
-	// the context list rely on the wrapped form, which is what
-	// production paths see.
+	// 兜底：裸信号。用已废弃的 IsInterruptRerunError 拿 (info, state,
+	// ok)。裸形态下拿不到 InterruptCtx（引擎还没包装信号），返回 nil——
+	// 关心上下文清单的调用方依赖包装形态，即生产路径看到的。
 	if _, ok := compose.IsInterruptRerunError(err); ok {
 		return nil
 	}
@@ -291,10 +244,8 @@ func collectInterruptContexts(info *compose.InterruptInfo) []*compose.InterruptC
 	return out
 }
 
-// FirstInterruptID is a tiny convenience used by the Driver when it
-// picks a single target for the SSE `cpn_id` field. Returns "" when
-// no contexts are present. Keeps the Driver code from doing its own
-// nil-check dance.
+// FirstInterruptID 小工具：Driver 给 SSE cpn_id 字段挑唯一目标时用。
+// 无上下文时返回 ""。让 Driver 代码不用自己做判空舞步。
 func FirstInterruptID(ctxs []*compose.InterruptCtx) string {
 	if ctx := FirstUserFillUpInterrupt(ctxs); ctx != nil {
 		return ctx.ID
@@ -305,10 +256,9 @@ func FirstInterruptID(ctxs []*compose.InterruptCtx) string {
 	return ctxs[0].ID
 }
 
-// RootInterruptID returns the interrupt id that should be passed to
-// compose.ResumeWithData. In composite/subgraph cases this is the
-// root-cause context, which is not necessarily the same leaf context we
-// want to expose to the front-end as the waiting UserFillUp node.
+// RootInterruptID 返回应传给 compose.ResumeWithData 的中断 id。复合/子图
+// 情况下这是根因上下文——不一定是我们想给前端展示为"等待中的
+// UserFillUp 节点"的那个叶子上下文。
 func RootInterruptID(ctxs []*compose.InterruptCtx) string {
 	for _, ctx := range ctxs {
 		for cur := ctx; cur != nil; cur = cur.Parent {
@@ -336,6 +286,8 @@ func FirstUserFillUpInterrupt(ctxs []*compose.InterruptCtx) *compose.InterruptCt
 	return nil
 }
 
+// formatInterruptContexts 把中断上下文列表格式化成单行调试串
+// （{id/kind/addr/parent} 条目），日志里可读。
 func formatInterruptContexts(ctxs []*compose.InterruptCtx) string {
 	if len(ctxs) == 0 {
 		return "[]"
@@ -364,14 +316,12 @@ func formatInterruptContexts(ctxs []*compose.InterruptCtx) string {
 	return "[" + strings.Join(parts, ", ") + "]"
 }
 
-// AutoDiscoverUserFillUpIDs returns the cpnIDs of every component whose
-// name (case-insensitive) is UserFillUp. The compiler option
-// compose.WithInterruptBeforeNodes needs a []string; we compute it
-// here so callers don't have to walk the Canvas twice.
+// AutoDiscoverUserFillUpIDs 返回所有组件名（大小写不敏感）为
+// UserFillUp 的组件 cpnID。编译选项 compose.WithInterruptBeforeNodes
+// 要 []string；在这算好，调用方不用遍历 Canvas 两遍。
 //
-// Centralised here (rather than inlined in compile.go) so any future
-// interrupt-emitting component (e.g. Answer, when ported) can register
-// itself by adding to the switch.
+// 收敛在此（而非内联进 compile.go）：将来任何会发中断的组件（如移植
+// 后的 Answer）往 switch 加一条即可完成注册。
 func AutoDiscoverUserFillUpIDs(c *Canvas) []string {
 	if c == nil {
 		return nil
