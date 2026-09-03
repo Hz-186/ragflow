@@ -300,6 +300,11 @@ func withStateBracket(cpnID, componentName string, body nodeBodyFn) nodeBodyFn {
 			state.SetVar(outputCpnID, k, v)
 		}
 		if runtime.IsDeferredStream(out["content"]) {
+			// ★ 输出是懒流（Agent 还没真正跑）：上面 SetVar 已把懒流指针原样
+			// 摊平进黑板 Outputs[cpn_id]["content"]，Message 稍后解析
+			// {{cpn_id@content}} 拿到的就是它；本节点的 node_finished 挂起——
+			// 「补发 finished」的动作存进延迟登记簿，等 Message 消费完懒流
+			// 调 CompleteDeferredNode 触发；与外层图 nodePost 同款契约。
 			runtime.RegisterDeferredNode(ctx, cpnID, func() {
 				nodeFinishedNow(ctx, state, cpnID, componentName, componentName, nil)
 			})

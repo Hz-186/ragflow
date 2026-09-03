@@ -224,23 +224,23 @@ func buildSubWorkflow(
 	)
 	nodes[loopInitKey] = initNode
 
-	// Body nodes: each member becomes a real factory-built (or
-	// placeholder, when no factory is registered) component invoke
-	// wrapped by withStateBracket so it shares the same state
-	// snapshot / result-persistence contract as outer-graph nodes.
-	// We do NOT use eino's StatePreHandler / StatePostHandler here
-	// because the sub-workflow has no WithGenLocalState of its own:
-	// state flows in through ctx (runtime.WithState) attached by
-	// the caller, and is read back via runtime.GetStateFromContext
-	// inside withStateBracket. This is what lets a Loop body
-	// actually mutate CanvasState (e.g. VariableAssigner
-	// incrementing the loop counter) so the LoopCondition closure
-	// can observe the change on the next iteration.
+	// 循环体节点注册：每个成员都构造成真实组件（工厂没注册的用占位体），
+	// 再包一层 withStateBracket，让它参与和外层图节点一致的「状态快照
+	// 注入 / 结果持久化」契约。这里不用 eino 的 StatePre/PostHandler——
+	// 子工作流没有自己的 WithGenLocalState：状态是调用方经
+	// runtime.WithState 挂在 ctx 上传进来的，withStateBracket 内部再用
+	// runtime.GetStateFromContext 取。正因如此，Loop 体才真的能改写
+	// CanvasState（如 VariableAssigner 递增循环计数器），LoopCondition
+	// 闭包下一轮才看得见变化。
 	for cpnID := range members {
 		name := c.Components[cpnID].Obj.ComponentName
 		if name == "" {
 			return nil, fmt.Errorf("canvas: loop %q member %q has empty component_name", loopID, cpnID)
 		}
+		// ★ 与外层图同款执行模式决策：Agent 直连 Message → 懒执行；
+		// 不直连的 Agent → 抑制消息事件。循环体同样守这套契约：
+		// 包装层 withStateBracket 认出懒流后挂起 node_finished，
+		// Message 消费完再经 CompleteDeferredNode 补发。
 		deferToMessage := directMessageDownstream(c, cpnID)
 		nodeOpts := runtime.ComponentExecutionOptions{
 			DeferAgentToMessage:        deferToMessage,

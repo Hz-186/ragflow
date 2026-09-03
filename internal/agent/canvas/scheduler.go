@@ -562,9 +562,13 @@ func BuildWorkflow(ctx context.Context, c *Canvas) (*compose.Workflow[map[string
 		if name == "" {
 			return nil, fmt.Errorf("canvas: component %q has empty component_name", cpnID)
 		}
-		// Agent 执行模式：直连 Message 子节点才启用"惰性执行"
-		// （Agent 流由 Message 消费）；否则抑制 Agent 的消息事件
-		// （由 Message 统一出口）。
+		// ★ Agent 执行模式决策（懒执行链路的源头）：
+		// 直连 Message 子节点 → 启用懒执行（Agent 不立即跑，输出懒流占位，
+		// 由 Message 打开时才跑）；其余形态的 Agent → 抑制消息事件（可见
+		// 出口统一交给终结 Message 节点，Agent 静默跑完）。两个开关经
+		// buildNodeBodyWithOptions → WithComponentExecutionOptions 写进节点
+		// ctx，Agent.Invoke 开跑时读取。Loop 子图里有同款决策
+		// （见 loop_subgraph.go 的 buildSubWorkflow）。
 		deferToMessage := directMessageDownstream(c, cpnID)
 		nodeOpts := runtime.ComponentExecutionOptions{
 			DeferAgentToMessage:        deferToMessage,
@@ -586,9 +590,11 @@ func BuildWorkflow(ctx context.Context, c *Canvas) (*compose.Workflow[map[string
 		nodePost := func(ctx context.Context, out map[string]any, state *CanvasState) (map[string]any, error) {
 			result, postErr := statePost(ctx, out, state)
 			if postErr == nil && runtime.IsDeferredStream(result["content"]) {
-				// Agent 的输出是延迟流（由下游 Message 消费）：
-				// 挂起 node_finished until 流关闭（Message 会在
-				// 消费完后调用这个回调补发）。对齐 Python 行为。
+				// ★ 输出是懒流（Agent 还没真正跑）：node_finished 不能现在发——
+				// 把「补发 finished」的动作包成闭包存进延迟登记簿
+				// （RegisterDeferredNode）。闭环在消费端：Message 消费完懒流
+				// 调 CompleteDeferredNode 触发它；若 Message 被分支跳过，
+				// 运行收尾的 CompleteAllDeferredNodes 兜底触发。对齐 Python。
 				runtime.RegisterDeferredNode(ctx, cpnID, func() {
 					nodeFinishedNow(ctx, state, cpnID, componentName, componentName, nil)
 				})
@@ -708,8 +714,17 @@ func BuildWorkflow(ctx context.Context, c *Canvas) (*compose.Workflow[map[string
 	return wf, nil
 }
 
-// directMessageDownstream 只有"直连的 Message 子节点"才启用惰性 Agent 执行。
-// 中间隔了别的节点不能意外改变 Agent 的执行模式。
+// directMessageDownstream 判断某节点有没有「直连的 Message 子节点」——
+// 只有直连才启用懒执行。中间隔了别的节点（如 Agent→Switch→Message）
+// 不算：防止中间节点意外改变 Agent 的执行模式。
+//
+// 参数：
+//   - c    ：整幅画布（用它的组件表查下游）；
+//   - cpnID：待判定的节点 ID，形如 "agent:0"。
+//
+// 返回：true = 下游里至少有一个组件名为 "Message"（大小写不敏感）。
+// 本函数对所有组件类型都安全——非 Agent 节点拿到的结果不会被
+// DeferAgentToMessage 消费（只有 Agent.Invoke 读它）。
 func directMessageDownstream(c *Canvas, cpnID string) bool {
 	if c == nil {
 		return false
@@ -718,6 +733,7 @@ func directMessageDownstream(c *Canvas, cpnID string) bool {
 	if !ok {
 		return false
 	}
+	// 只看直接下游，不递归。
 	for _, downID := range comp.Downstream {
 		down, ok := c.Components[downID]
 		if ok && strings.EqualFold(down.Obj.ComponentName, "Message") {

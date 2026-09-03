@@ -401,7 +401,9 @@ func emitAgentModelStreams(ctx context.Context, future react.MessageFuture) <-ch
 				if msg.Content == "" && msg.ReasoningContent == "" { // 空包不转
 					continue
 				}
-				// 已经发过完整消息事件且不是延迟模式的接收器 → 不重复发。
+				// 防重复转发：已经发过消息事件就不再发。但懒模式例外——
+				// ctx 上挂着懒流接收器时，外层「已发射」标志是 Message 收到
+				// 首个增量后置位的，其余增量仍要继续流向接收器，不能停。
 				if runtime.AgentMessageEventsEmitted(ctx) && !runtime.HasDeferredAgentMessageSink(ctx) {
 					continue
 				}
@@ -942,17 +944,36 @@ func NewAgentComponent(p AgentParam) *AgentComponent {
 // Name 返回组件在注册表里的名字："Agent"。
 func (c *AgentComponent) Name() string { return "Agent" }
 
-// Invoke —— Agent 组件的统一入口。根据画布编译期写进 ctx 的开关走两条路：
+// Invoke —— Agent 组件的唯一入口，按编译期模式开关分成「懒执行 / 立即执行」
+// 两条路。开关来自画布编译器写进 ctx 的 ComponentExecutionOptions
+// （scheduler.go 的 directMessageDownstream 判定，不是 DSL 参数）：
+// 本 Agent 直连 Message 下游（DeferAgentToMessage=true）就不立即跑，把一个
+// 懒流占位（DeferredStream）塞进 "content" 槽——等 Message 模板真正引用它、
+// 调 Open 的那一刻，Agent 才启动；其他所有图形状走 invokeNow 立即执行。
 //
-//   - 下游直连 Message 组件（DeferAgentToMessage=true）：不立即执行，返回一个
-//     懒流占位（DeferredStream），等 Message 真正要数据时才启动 Agent；
-//   - 其他所有图形状：立即执行（走 invokeNow）。
+// 参数：
+//   - ctx：节点运行现场的 ctx，节点包装层已在上面挂了黑板状态、事件通道
+//     与执行模式开关；
+//   - db：数据库句柄，用于查租户模型配置等；
+//   - inputs：运行期输入，形如 {"user_prompt": "帮我查天气", "reasoning": "..."}，
+//     会叠加到 DSL 静态参数之上（见 mergeAgentParam）。
 //
-// 模式是画布编译期的决定，经 ctx 传递，不是 DSL 参数。
+// 返回——形状随路径而不同：
+//
+//	懒路径：{"content": *runtime.DeferredStream{Open: ...}}——
+//	        只是「启动拉绳」，Agent 还没跑；
+//	立即路径：invokeNow 的完整结果：
+//	  {"content": "最终答案", "thinking": "...",
+//	   "tool_calls": [...], "artifacts": [...]}
+//
+// 错误：懒路径只组装拉绳、不会出错；立即路径原样透出 invokeNow 的错误。
 func (c *AgentComponent) Invoke(ctx context.Context, db *gorm.DB, inputs map[string]any) (map[string]any, error) {
 	if runtime.ComponentExecutionOptionsFromContext(ctx).DeferAgentToMessage {
-		// 沿用节点包装层给 Agent 装的总时长作为超时基准；没有截止期就用默认 10 分钟。
-		// 计时从 Message 打开懒流那一刻才真正开始。
+		// ===== 懒路径：不跑，组装「启动拉绳」就返回 =====
+		// 先定超时预算：如果运行 ctx 上游设过截止期（如请求层超时），
+		// 取剩余时长当预算；没有截止期（或已过期）就退回默认 10 分钟。
+		// 注意这里算的是「时长」而非绝对时刻——倒计时要到 Message 打开
+		// 懒流那一刻（Open 闭包内）才真正开始。
 		timeout := defaultAgentDeferredTimeout
 		if deadline, ok := ctx.Deadline(); ok {
 			if remaining := time.Until(deadline); remaining > 0 {
@@ -960,16 +981,29 @@ func (c *AgentComponent) Invoke(ctx context.Context, db *gorm.DB, inputs map[str
 			}
 		}
 		deferred := &runtime.DeferredStream{
-			// Message 打开懒流时回调：新建带超时的 ctx、挂上增量接收器，
-			// 然后走和立即执行完全相同的 invokeNow 路径。
+			// Open —— Message 消费懒流时执行的回调
+			// （消费端现场见 message.go 的 resolveDeferredTemplate）。
+			// 闭包捕获了超时预算、db、inputs：Message 何时打开，就用这套
+			// 原样开跑。内部三步：
+			//  1. 从 Message 的 openCtx 派生带超时的新 ctx——倒计时从
+			//     这一刻起算，超时即中断 Agent 全程；
+			//  2. 经 WithAgentDeltaSink 把 Message 的增量接收器挂上新 ctx——
+			//     此后 Agent 产出的每条增量都改道流向 Message，不再碰
+			//     service 层发射器（见 EmitAgentMessage 的「去向 1」）；
+			//  3. 进入 invokeNow——与立即执行完全同一条路径：懒与立即
+			//     只差「何时开跑」，不差「怎么跑」。
 			Open: func(openCtx context.Context, sink runtime.AgentDeltaSink) (map[string]any, error) {
 				agentCtx, cancel := context.WithTimeout(openCtx, timeout)
-				defer cancel()
+				defer cancel() // Open 返回 = Agent 跑完，及时释放定时器
 				return c.invokeNow(runtime.WithAgentDeltaSink(agentCtx, sink), db, inputs)
 			},
 		}
+		// 把「拉绳」塞进输出 "content" 槽。节点包装层看到懒流后不会立即
+		// 发 node_finished，而是把它挂进延迟登记簿（见 RegisterDeferredNode），
+		// 等 Message 消费完才补发。
 		return map[string]any{"content": deferred}, nil
 	}
+	// ===== 立即路径：当场跑完整个 ReAct 流程 =====
 	return c.invokeNow(ctx, db, inputs)
 }
 
@@ -985,15 +1019,22 @@ func (c *AgentComponent) Invoke(ctx context.Context, db *gorm.DB, inputs map[str
 //	{
 //	  "content":  "最终答案文本（含附件 Markdown 链接）",
 //	  "thinking": "模型思考过程（提供方单独返回时才有）",
-//	  "tool_calls": [{"id": "...", "name": "...", "arguments": "..."}],
+//	  "tool_calls": [{"id": "call_1", "type": "function",
+//	                 "name": "retrieval", "arguments": `{...}`}],
 //	  "artifacts":  [{"name": "report.pdf", "url": "https://..."}],
+//	  "grounding_status": "applied",  // 条件键：仅开启 Cite 时才有，
+//	  // 取值 applied / no_chunks / "error: ..."
 //	}
 //
 // 出错分两种：构建/取消类错误直接返回 err；ReAct 图运行失败转成
 // {"_ERROR": "**ERROR**: ..."} 走数据流，交给画布异常分支处理。
 func (c *AgentComponent) invokeNow(ctx context.Context, db *gorm.DB, inputs map[string]any) (map[string]any, error) {
-	// 重置消息发射状态，并在退出前收尾（确保最终消息事件一定发出）。
+	// 重置消息发射状态（懒模式下同时清掉接收器「已喂过增量」的记账）。
+	// 懒模式里本函数由 Open 闭包调进来，每次打开懒流都会先走这一步。
 	runtime.ResetAgentMessageEmission(ctx)
+	// 退出前冲刷 <think> 解析器缓冲的残余片段。注意它不负责「结果必达」：
+	// 最终答案的必达靠函数末尾 !streamed 补发块（以及 service 运行收尾
+	// 的兜底发射），这里只是把思考段的尾巴闭合干净。
 	defer runtime.FinalizeAgentMessage(ctx)
 
 	// 运行时输入叠加到 DSL 静态参数上，得到本次执行用的最终参数。
@@ -1138,8 +1179,11 @@ func (c *AgentComponent) invokeNow(ctx context.Context, db *gorm.DB, inputs map[
 	if groundingStatus != "" {
 		out["grounding_status"] = groundingStatus
 	}
-	// 如果本次运行从未实时流出过消息（比如测试或特殊图形状），补发一次完整
-	// 消息事件，保证前端总能收到最终结果。
+	// ★「结果必达」的第一道保证：如果本次调用从未实时流出过消息（比如
+	// 测试桩或特殊图形状），在这里补发一次完整消息事件；万一这里也没发，
+	// service 运行收尾还有最后一道兜底发射。
+	// 「流出过」要查两本账：常规发射器的 emitted（立即模式）与懒流接收器
+	// 的 emitted（懒模式——增量已经经 Message 逐条发给前端，同样不补发）。
 	streamed := runtime.AgentMessageEventsEmitted(ctx) || runtime.DeferredAgentMessageEventsEmitted(ctx)
 	if !streamed {
 		runtime.EmitAgentMessage(ctx, content+artifactMD, thinking)

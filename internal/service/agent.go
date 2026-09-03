@@ -2308,10 +2308,15 @@ func (s *AgentService) buildRunFunc(canvasID string, versionRow *entity.UserCanv
 			SessionID: sessionID,
 		})
 
-		// Agent 组件的消息有两种发射模式：流式增量（边生成边 emit）与
-		// 延迟汇聚（最终一次性 emit）。接下来的三个注册点分别提供：
-		// 带终结器的增量发射器、纯文本发射器、含思考段标记的发射器。
+		// ★ 懒执行基础设施 1/2：挂「延迟节点完成回调」登记簿。Agent 输出
+		// 懒流时，节点包装层把欠着的 node_finished 动作存进这里，等
+		// Message 消费完懒流再补发（见 RegisterDeferredNode /
+		// CompleteDeferredNode / CompleteAllDeferredNodes）。
 		ctx2 = runtime.WithDeferredNodeRegistry(ctx2)
+		// ★ 懒执行基础设施 2/2 + 消息发射三件套。Agent 组件的消息有两种
+		// 发射模式：流式增量（边生成边 emit）与延迟汇聚（最终一次性
+		// emit）。接下来的三个注册点分别提供：带终结器的增量发射器、
+		// 纯文本发射器、含思考段标记的发射器。
 		agentMessageEmit, agentMessageFinalize, agentMessageReset := makeAgentMessageDeltaEmitterWithFinalizer(emit)
 		ctx2 = runtime.WithAgentMessageEmitterControl(ctx2, agentMessageEmit, agentMessageFinalize, agentMessageReset)
 		ctx2 = runtime.WithCanvasMessageEmitter(ctx2, func(content string) {

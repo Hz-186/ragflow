@@ -164,4 +164,20 @@ func makeSwitchBranchCondition(endNodes map[string]bool) compose.GraphMultiBranc
 
 // fmtBranchRegistrations 小型调试辅助：测试或将来冗长日志路径可直接
 // 打印已装分支的表格。当前未用；与数据类型放一起以求对称。
+//
+// 参数：
+//   - regs：已注册的分支表，形如：
+//     []branchRegistration{{Parent: "switch:0", EndNodes: ["a", "b"]}}
+//
+// 返回：每行一条 "父节点 -> [终点节点...]"，无分支时返回
+// "no multi-branches installed"。
 func fmtBranchRegistrations(regs []branchRegistration) string {
+	if len(regs) == 0 {
+		return "no multi-branches installed"
+	}
+	var b strings.Builder
+	for _, r := range regs {
+		fmt.Fprintf(&b, "%s -> %v\n", r.Parent, r.EndNodes)
+	}
+	return b.String()
+}

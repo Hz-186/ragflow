@@ -197,8 +197,12 @@ func (m *MessageComponent) Invoke(ctx context.Context, db *gorm.DB, inputs map[s
 			Text:   resolved,
 		})
 	}
-	// 运行期发射器负责 Agent→Message 去重：只抑制与上游 Agent 已流式
-	// 发出的内容完全相同的拷贝——有意变换过答案的 Message 节点仍可见。
+	// Agent→Message 直通防重的第一道闸就在这个 !streamed 守卫：模板里
+	// 的懒流刚被打开过（答案已经边生成边发给前端了），这里就整体跳过
+	// 发射，同一段答案不会在前端出现第二次。没打开过懒流（streamed =
+	// false）时才调 EmitCanvasMessage，那里还有第二道运行时层兜底：
+	// 内容与上游 Agent 已流出的完全一致时同样不重发。有意变换过答案
+	// 的 Message 节点两道闸都放行，照常可见。
 	if rendered != "" && !streamed {
 		runtime.EmitCanvasMessage(ctx, rendered)
 	}
@@ -312,17 +316,34 @@ func memorySessionID(state *runtime.CanvasState) string {
 	return state.RunID
 }
 
-// resolveDeferredTemplate ★解析 Message 模板，同时消费它引用的惰性
-// Agent 流。返回完整可见文本 + 是否打开了 DeferredStream 的标志。
+// resolveDeferredTemplate ★解析 Message 模板；模板若引用了懒 Agent 流，
+// 就当场消费它——这里就是懒执行链路的「消费端」：Agent 直到此刻才真正
+// 开跑（对齐 Python 侧 partial(async_generator) 的执行顺序，本节点由此
+// 成为唯一可见的 SSE 生产者）。
+//
+// 参数：
+//   - text ：Message 模板串，可含形如 "{{agent:0@content}}" 的变量引用；
+//   - state：画布黑板，用来把每个 {{...}} 引用解析成真实值
+//     （解析结果可能是普通值，也可能是 *runtime.DeferredStream 懒流）。
+//
+// 返回：
+//   - 完整可见文本：字面量与所有引用解析值按模板顺序拼接的结果；
+//   - 是否打开过懒流：true = 本模板消费过 DeferredStream——Invoke 用它
+//     防重：内容已经逐增量发给前端了，收尾不再整段重发；
+//   - 错误：消费懒流出错（Agent 执行失败等）→ 整个 Message 跟着失败。
+//
+// 行为契约：没引用懒流 → 整模板一次渲染返回、发射留给 Invoke（第二个
+// 返回值 false）；引用了懒流 → 本函数接管呈现、边消费边逐增量发射
+// （返回 true），Invoke 凭 true 不再重发整段。
 func (m *MessageComponent) resolveDeferredTemplate(ctx context.Context, text string, state *runtime.CanvasState) (string, bool, error) {
 	matches := runtime.VarRefPattern.FindAllStringSubmatchIndex(text, -1)
 	if len(matches) == 0 {
 		return text, false, nil
 	}
-	// 普通 Message 模板由 Invoke 一次性渲染发出。只有真正引用了
-	// DeferredStream 的模板才走下面的增量呈现路径——在这里发射字面量/
-	// 普通变量值、又在 Invoke 里发射完整渲染串，每个非延迟模板都会
-	// 产生重复的 SSE message 事件。
+	// 先快速预扫一遍所有引用，看有没有懒流。普通 Message 模板由 Invoke
+	// 一次性渲染发出；只有真正引用了 DeferredStream 的模板才走下面的增量
+	// 呈现路径——否则在这里发射字面量/普通变量值、又在 Invoke 里发射完整
+	// 渲染串，每个非懒流模板都会产生重复的 SSE message 事件。
 	hasDeferred := false
 	for _, match := range matches {
 		ref := text[match[2]:match[3]]
@@ -358,43 +379,52 @@ func (m *MessageComponent) resolveDeferredTemplate(ctx context.Context, text str
 		}
 
 		streamed = true
-		// 思考段与内容段交织：首个思考增量前发 start_to_think；切回内容
-		// 前发 end_to_think；前端用它们括 <think> 块。可见文本只收内容
-		// 增量，思考增量不进最终 content。
+		// ★ 打开懒流：Agent 从这一刻才真正开跑。
+		// 递进去的闭包就是 Agent 的增量接收器（AgentDeltaSink）——Open 内部
+		// 经 WithAgentDeltaSink 把它挂上 Agent 的 ctx，此后 Agent 每产出一对
+		// 答案/思考增量就调它一次。本闭包负责把增量翻译成前端事件：
+		// 思考段与内容段交织，首个思考增量前发 start_to_think、切回内容前发
+		// end_to_think，前端用这两个标记括出 `<think>` 块；可见文本只收内容增量，
+		// 思考增量不进最终 content。
 		inThinking := false
 		visible := strings.Builder{}
 		result, err := deferred.Open(ctx, func(contentDelta, reasoningDelta string) {
 			if reasoningDelta != "" {
 				if !inThinking {
-					runtime.EmitCanvasMessageEvent(ctx, "", true, false)
+					runtime.EmitCanvasMessageEvent(ctx, "", true, false) // 进入思考段
 					inThinking = true
 				}
 				runtime.EmitCanvasMessageEvent(ctx, reasoningDelta, false, false)
 			}
 			if contentDelta != "" {
 				if inThinking {
-					runtime.EmitCanvasMessageEvent(ctx, "", false, true)
+					runtime.EmitCanvasMessageEvent(ctx, "", false, true) // 结束思考段
 					inThinking = false
 				}
 				runtime.EmitCanvasMessageEvent(ctx, contentDelta, false, false)
-				visible.WriteString(contentDelta)
+				visible.WriteString(contentDelta) // 攒最终可见文本
 			}
 		})
+		// 流结束时若仍停留在思考段，补一个 end_to_think 收尾。
 		if inThinking {
 			runtime.EmitCanvasMessageEvent(ctx, "", false, true)
 		}
 		if err != nil {
 			return "", true, fmt.Errorf("Message: consume deferred Agent stream: %w", err)
 		}
-		// Agent 流结束后，用完整结果里的 content 覆盖拼出来的可见文本
-		//（引用落地后最终版本更权威）；引用形如 cpn@key，把最终文本写回
-		// 黑板并通知延迟节点完成（node_finished 此时才发）。
+		// 定稿最终文本：优先用 Agent 完整结果里的 content（引用落地、附件
+		// Markdown 都已拼好的权威版本），没有才退回增量拼出的可见文本。
 		finalText := visible.String()
 		if result != nil {
 			if completedContent, ok := result["content"].(string); ok {
 				finalText = completedContent
 			}
 		}
+		// 写回黑板 + 了结延迟节点。引用形如 cpn@key：
+		//  1. 把黑板里该槽位从懒流占位换成最终文本——下游再引用
+		//     {{cpn@content}} 拿到的就是真实内容；
+		//  2. CompleteDeferredNode 触发挂起的完成回调——Agent 欠着的
+		//     node_finished 事件直到此刻才发出。
 		if strings.Contains(ref, "@") {
 			parts := strings.SplitN(ref, "@", 2)
 			state.SetVar(parts[0], parts[1], finalText)
