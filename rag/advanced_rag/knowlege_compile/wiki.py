@@ -1349,7 +1349,225 @@ async def _wiki_process_batch(
         semaphore: 并发控制信号量（可选），示例：asyncio.Semaphore(20)
         callback: 进度回调函数（可选），示例：lambda prog, msg: print(prog, msg)
         parser_config: 编译模板配置字典（可选），结构示例：{"entity": {...}}
-        chunk_hashes: 分块 ID �# ── REDUCE 阶段（知识库范围全局归约去重） ─────────────────────────────────────
+        chunk_hashes: 分块 ID 到其内容哈希的映射字典，结构示例：{"chunk_1": "3f2a1b4c5d6e7f80"}
+    """
+    if not packed:
+        return _wiki_empty_extract()
+
+    label_to_id = {entry["label"]: entry["chunk_id"] for entry in packed}
+
+    async def _run() -> dict:
+        raw_extract = await _wiki_extract_one_batch(
+            packed,
+            doc_id,
+            chat_mdl,
+            language,
+            llm_timeout,
+            parser_config=parser_config,
+        )
+        if raw_extract is None:
+            # LLM call failed/timed out: leave no resume hash so the next run
+            # re-extracts these chunks instead of locking in an empty result.
+            return _wiki_empty_extract()
+        merged, per_chunk = _wiki_resolve_chunk_ids(raw_extract, label_to_id)
+        await _wiki_persist_extracts(
+            per_chunk,
+            doc_id,
+            tenant_id,
+            kb_id,
+            chunk_hashes=chunk_hashes,
+        )
+        if callback:
+            try:
+                n_items = sum(len(merged.get(k) or []) for k in _EXTRACT_LIST_KEYS)
+                callback(
+                    (batch_idx + 1) / max(1, total_batches),
+                    f"Wiki MAP {batch_idx + 1}/{total_batches}: {n_items} items from {len(packed)} chunks",
+                )
+            except Exception:
+                logging.debug("wiki_map: progress callback failed", exc_info=True)
+        return merged
+
+    if semaphore is not None:
+        async with semaphore:
+            return await _run()
+    return await _run()
+
+
+# ---------------------------------------------------------------------------
+# Public entry
+# ---------------------------------------------------------------------------
+
+
+async def wiki_map_from_chunks(
+    chunks: list[dict],
+    chat_mdl,
+    embd_mdl,
+    doc_id: str,
+    tenant_id: str,
+    kb_id: str,
+    language: str = "en",
+    max_workers: int = DEFAULT_WIKI_MAP_WORKERS,
+    llm_timeout: int = DEFAULT_WIKI_MAP_TIMEOUT,
+    callback: Optional[Callable] = None,
+    parser_config: Optional[dict] = None,
+    batch_size_cap: Optional[int] = None,
+    window_fraction: Optional[float] = None,
+    target_chunk_ids: Optional[set[str]] = None,
+) -> dict:
+    """Phase 1 (MAP) of the artifact compilation pipeline.
+
+    Packs the provided RAGFlow chunks into batches via ``split_chunks``, runs
+    one ``gen_json`` extraction call per batch in parallel (bounded by
+    ``max_workers``), then splits each batch's output back to per-chunk
+    extracts and persists them to ES as non-searchable ``wiki_map_extract``
+    rows so subsequent runs can skip chunks already processed.
+
+    Args:
+        chunks: list of dicts; each must expose ``id`` and ``text`` (with
+            ``content_with_weight`` / ``content`` accepted as fallbacks).
+        chat_mdl: LLMBundle for chat (used via ``gen_json``).
+        embd_mdl: LLMBundle for embeddings — accepted for downstream symmetry
+            with REDUCE/REFINE but **not used in MAP itself**.
+        doc_id: source document id; stamped onto every resume doc and on every
+            extracted item via ``chunk_ids``.
+        tenant_id, kb_id: address the doc-store index for resume reads + writes.
+        language: reserved for future prompt localization.
+        max_workers: maximum concurrent batches. Defaults to 20, matching the
+            task-scoped Wiki LLM pool used by the task executor.
+        llm_timeout: seconds per batch extraction call.
+        callback: optional ``(progress: float, msg: str)`` progress callback.
+        parser_config: optional YAML-style config (same shape that
+            ``compile_structure_from_text`` accepts).
+            ``source_chunk_id`` field is always appended so chunk
+            attribution survives regardless of the user's schema. When
+            omitted, the built-in default artifact schema is used.
+
+    Returns:
+        ``{"entities", "concepts", "claims", "relations", "topics"}`` where
+        every item (except ``topics`` strings) carries a
+        ``chunk_ids=[<source chunk id>]`` field. No entity-level dedup is
+        performed here — that is the REDUCE phase's responsibility.
+    """
+    _ = embd_mdl  # noqa: F841 — accepted for symmetry with downstream phases
+    if not chunks:
+        out = _wiki_empty_extract()
+        out["_meta"] = {
+            "doc_id": str(doc_id),
+            "requested": 0,
+            "cache_hits": 0,
+            "extracted": 0,
+        }
+        return out
+
+    current_chunk_hashes: dict[str, str] = {}
+    for chunk in chunks:
+        cid = chunk.get("id") or chunk.get("chunk_id")
+        if not isinstance(cid, str) or not cid:
+            continue
+        text = _wiki_pick_chunk_text(chunk) or ""
+        current_chunk_hashes[cid] = _chunk_hash(text)
+
+    requested_ids = set(current_chunk_hashes)
+    if target_chunk_ids is not None:
+        requested_ids &= set(target_chunk_ids)
+
+    requested_versions = {chunk_id: current_chunk_hashes[chunk_id] for chunk_id in requested_ids}
+    historical_versions = await _wiki_load_map_versions(doc_id, tenant_id, kb_id, requested_versions)
+    cache_hits: list[dict] = []
+    cache_hit_ids: set[str] = set()
+    for chunk_id in requested_ids:
+        extract = historical_versions.get(chunk_id, {}).get(current_chunk_hashes[chunk_id])
+        if extract is not None:
+            cache_hit_ids.add(chunk_id)
+            cache_hits.append(extract)
+
+    extract_ids = requested_ids - cache_hit_ids
+    # Skip chunks outside this run's delta as well as historical cache hits.
+    resume_set = set(current_chunk_hashes) - extract_ids
+
+    # Defensive scrub: chunkers sometimes embed the chunk_id / doc_id into
+    # the body (e.g. as a header). Without this the extraction LLM tends to
+    # grab the hash as an "entity" — see _wiki_scrub_known_ids.
+    all_known_ids: list[str] = []
+    for chunk in chunks:
+        cid = chunk.get("id") or chunk.get("chunk_id")
+        if isinstance(cid, str) and cid:
+            all_known_ids.append(cid)
+    if doc_id:
+        all_known_ids.append(str(doc_id))
+
+    prompt_overhead = num_tokens_from_string(WIKI_MAP_SYSTEM + WIKI_MAP_USER_TEMPLATE)
+    packed_batches, _info = _build_chunk_batches(
+        chunks,
+        chat_mdl,
+        prompt_overhead_tokens=prompt_overhead,
+        resume_chunk_ids=resume_set,
+        scrub_text=lambda t: _wiki_scrub_known_ids(t, all_known_ids),
+        chunk_text_picker=_wiki_pick_chunk_text,
+        batch_size_cap=batch_size_cap,
+        window_fraction=window_fraction,
+    )
+    cached_merged = _wiki_merge_extracts(cache_hits)
+    if not packed_batches:
+        cached_merged["_meta"] = {
+            "doc_id": str(doc_id),
+            "requested": len(requested_ids),
+            "cache_hits": len(cache_hit_ids),
+            "extracted": 0,
+        }
+        return cached_merged
+
+    async def _process_one(batch: list[dict], bi: int, total: int) -> dict:
+        # ``_run_chunked_pipeline`` already wraps each task in the engine's
+        # semaphore, so pass ``semaphore=None`` here to avoid nesting.
+        return await _wiki_process_batch(
+            packed=batch,
+            batch_idx=bi,
+            total_batches=total,
+            doc_id=doc_id,
+            tenant_id=tenant_id,
+            kb_id=kb_id,
+            chat_mdl=chat_mdl,
+            language=language,
+            llm_timeout=llm_timeout,
+            semaphore=None,
+            callback=callback,
+            parser_config=parser_config,
+            chunk_hashes=current_chunk_hashes,
+        )
+
+    extracted = await _run_chunked_pipeline(
+        packed_batches,
+        process_batch=_process_one,
+        aggregate=_wiki_merge_extracts,
+        max_workers=max_workers,
+        callback=callback,
+        log_prefix="wiki_map",
+    )
+    merged = _wiki_merge_extracts([cached_merged, extracted])
+    logging.info(
+        "wiki_map: doc %s — requested=%d cache_hits=%d extracted=%d entities=%d concepts=%d claims=%d relations=%d topics=%d",
+        doc_id,
+        len(requested_ids),
+        len(cache_hit_ids),
+        len(extract_ids),
+        len(merged["entities"]),
+        len(merged["concepts"]),
+        len(merged["claims"]),
+        len(merged["relations"]),
+        len(merged["topics"]),
+    )
+    merged["_meta"] = {
+        "doc_id": str(doc_id),
+        "requested": len(requested_ids),
+        "cache_hits": len(cache_hit_ids),
+        "extracted": len(extract_ids),
+    }
+    return merged
+
+
+# ── REDUCE 阶段（知识库范围全局归约去重） ────────────────────────────────
 
 WIKI_REDUCE_COMPILE_KWD = "wiki_reduce_result"
 DEFAULT_WIKI_REDUCE_MERGE_THRESHOLD = 0.95
@@ -1829,245 +2047,6 @@ async def wiki_reduce_from_extracts(
     }
 
     # 步骤五：持久化归约结果并上报完成进度
-    if callback:
-        try:
-            callback(0.9, "wiki REDUCE: persisting result")
-        except Exception:
-            pass
-    await _wiki_persist_reduce(reduced, tenant_id, kb_id, input_hash=current_input_hash, source_doc_ids=reduce_source_doc_ids)
-
-    logging.info(
-        "wiki_reduce: kb=%s done — entities=%d concepts=%d claims=%d relations=%d topics=%d",
-        kb_id,
-        len(reduced["entities"]),
-        len(reduced["concepts"]),
-        len(reduced["claims"]),
-        len(reduced["relations"]),
-        len(reduced["topics"]),
-    )
-
-    if callback:
-        try:
-            callback(1.0, "wiki REDUCE: done")
-        except Exception:
-            pass
-
-    return reduced
-ce(content, str) or not content:
-        return None
-    try:
-        cached = json.loads(content)
-    except Exception:
-        logging.debug("wiki_reduce: cached result unparseable; ignoring")
-        return None
-    if not isinstance(cached, dict):
-        return None
-    stored_hash = row.get("input_hash_kwd")
-    if not isinstance(stored_hash, str):
-        stored_hash = ""
-    return cached, stored_hash
-
-
-async def _wiki_persist_reduce(
-    reduced: dict,
-    tenant_id: str,
-    kb_id: str,
-    input_hash: str = "",
-    source_doc_ids: Optional[list[str]] = None,
-) -> None:
-    """Upsert the single non-searchable wiki_reduce_result row for this KB.
-
-    ``input_hash`` records the MAP-state fingerprint this reduction was
-    computed from; the next call compares it before re-running.
-    ``source_doc_ids`` is the set of documents that fed this reduction, used
-    for delete-time reference counting.
-    """
-    from common import settings
-    from rag.nlp import search as _rag_search
-
-    index = _rag_search.index_name(tenant_id)
-    kb_id_str = str(kb_id)
-    content_with_weight = json.dumps(reduced, ensure_ascii=False)
-    # Stable id per KB so a re-run upserts the same row.
-    row_id = _stable_row_id(WIKI_REDUCE_COMPILE_KWD, kb_id_str)
-    doc = {
-        "id": row_id,
-        "doc_id": kb_id_str,  # sentinel — KB-scoped row, not a real document
-        "compile_kwd": WIKI_REDUCE_COMPILE_KWD,
-        "source_id": [kb_id_str],
-        "source_doc_ids": list(source_doc_ids or []),
-        "input_hash_kwd": input_hash,
-        "content_with_weight": content_with_weight,
-        "available_int": 0,
-    }
-    try:
-        # Best-effort delete then insert so re-runs replace cleanly.
-        try:
-            await thread_pool_exec(
-                settings.docStoreConn.delete,
-                {"compile_kwd": WIKI_REDUCE_COMPILE_KWD},
-                index,
-                kb_id,
-            )
-        except Exception:
-            logging.debug("wiki_reduce: prior result delete failed; will overwrite by id")
-        await thread_pool_exec(settings.docStoreConn.insert, [doc], index, kb_id)
-    except Exception:
-        logging.exception("wiki_reduce: failed to persist result row")
-
-
-# --- public entry ----------------------------------------------------------
-
-
-async def wiki_reduce_from_extracts(
-    chat_mdl,
-    embd_mdl,
-    tenant_id: str,
-    kb_id: str,
-    merge_threshold: float = DEFAULT_WIKI_REDUCE_MERGE_THRESHOLD,
-    ambiguous_low: float = DEFAULT_WIKI_REDUCE_AMBIGUOUS_LOW,
-    ambiguous_batch_size: int = DEFAULT_WIKI_REDUCE_AMBIGUOUS_BATCH,
-    llm_timeout: int = DEFAULT_WIKI_REDUCE_TIMEOUT,
-    force_rerun: bool = False,
-    callback: Optional[Callable] = None,
-) -> dict:
-    """Phase 2 (REDUCE/Dedup) — KB-scoped.
-
-    Loads every ``wiki_map_extract`` row in this KB (across all documents) and
-    produces a single canonical dict of entities/concepts via:
-        1. Exact dedup by ``(normalize(name), type)`` for entities and by
-           ``normalize(term)`` for concepts.
-        2. Embedding dedup of entity names: vectorized pairwise cosine over
-           ``embd_mdl.encode(...)`` output. Pairs of the same type with
-           similarity ≥ ``merge_threshold`` auto-merge; pairs in
-           ``[ambiguous_low, merge_threshold)`` go to step 3.
-        3. LLM disambiguation: batches of ambiguous pairs are sent to
-           ``chat_mdl`` via ``gen_json``; true verdicts collapse via union-find.
-        4. Apply merges: sum ``mention_count``, union ``aliases`` and
-           ``chunk_ids`` per canonical entity.
-
-    The result is persisted to ES as a single non-searchable
-    ``wiki_reduce_result`` row per KB. Subsequent calls with
-    ``force_rerun=False`` (default) return the cached row immediately; pass
-    ``force_rerun=True`` after new ``wiki_map_extract`` rows have been added.
-
-    Args:
-        chat_mdl, embd_mdl: ragflow LLMBundle instances.
-        tenant_id, kb_id: address the doc-store index.
-        merge_threshold: cosine ≥ this auto-merges. Default 0.90.
-        ambiguous_low: cosine in [ambiguous_low, merge_threshold) goes to LLM.
-        ambiguous_batch_size: max pairs per LLM disambiguation call.
-        llm_timeout: seconds per LLM disambiguation batch.
-        force_rerun: bypass the cached wiki_reduce_result.
-        callback: optional ``(progress: float, msg: str)`` callback.
-
-    Returns the canonical extract dict::
-
-        {
-          "entities":  [{"name","type","aliases","mention_count","chunk_ids"}, ...],
-          "concepts":  [{"term","definition_excerpt","mention_count","chunk_ids"}, ...],
-          "claims":    [...],   # pass-through from MAP
-          "relations": [...],   # pass-through from MAP
-          "topics":    [...],   # pass-through from MAP
-        }
-    """
-    # Incremental gate: the current MAP-state fingerprint is the union
-    # of every MAP row's (chunk_id, chunk_hash). If a cached REDUCE row
-    # exists AND its stored input_hash equals the current fingerprint,
-    # the upstream chunks haven't changed → cached output is still
-    # correct. ``force_rerun=True`` bypasses both checks for the
-    # legacy / admin "rebuild from scratch" path.
-    current_input_hash = await _wiki_compute_map_input_hash(tenant_id, kb_id)
-    reduce_source_doc_ids = await _wiki_all_map_doc_ids(tenant_id, kb_id)
-    if not force_rerun:
-        cached_pair = await _wiki_load_reduce_resume(tenant_id, kb_id)
-        if cached_pair is not None:
-            cached, stored_hash = cached_pair
-            if stored_hash and stored_hash == current_input_hash:
-                if callback:
-                    try:
-                        callback(1.0, "wiki REDUCE: cache hit (input unchanged)")
-                    except Exception:
-                        pass
-                return cached
-            # Cache present but stale (no hash, or hash mismatch). Fall
-            # through to a full re-reduce and write a fresh stamp.
-
-    if callback:
-        try:
-            callback(0.05, "wiki REDUCE: loading MAP extracts")
-        except Exception:
-            pass
-
-    raw = await _wiki_load_all_map_extracts(tenant_id, kb_id)
-    raw_entities = raw.get("entities") or []
-    raw_concepts = raw.get("concepts") or []
-    logging.info(
-        "wiki_reduce: kb=%s loaded raw entities=%d concepts=%d claims=%d relations=%d",
-        kb_id,
-        len(raw_entities),
-        len(raw_concepts),
-        len(raw.get("claims") or []),
-        len(raw.get("relations") or []),
-    )
-
-    if not raw_entities and not raw_concepts:
-        # Nothing to reduce; persist an empty result so resume can short-circuit.
-        empty = _wiki_empty_extract()
-        await _wiki_persist_reduce(empty, tenant_id, kb_id, input_hash=current_input_hash, source_doc_ids=reduce_source_doc_ids)
-        return empty
-
-    if callback:
-        try:
-            callback(0.25, "wiki REDUCE: dedup (exact + embedding + LLM)")
-        except Exception:
-            pass
-
-    # Entities: full three-phase dedup keyed by (normalized name, type).
-    canonical_entities = await _bulk_dedup_items(
-        raw_entities,
-        name_key="name",
-        type_key="type",
-        chat_mdl=chat_mdl,
-        embd_mdl=embd_mdl,
-        merge_threshold=merge_threshold,
-        ambiguous_low=ambiguous_low,
-        ambiguous_batch_size=ambiguous_batch_size,
-        disambiguate_system_prompt=WIKI_REDUCE_DISAMBIGUATE_SYSTEM,
-        llm_timeout=llm_timeout,
-    )
-
-    # Concepts: exact-dedup only (current behaviour); keep the longest
-    # definition_excerpt across the group via aggregate_extra.
-    def _concept_extras(group: list[dict]) -> dict:
-        best_def = max(
-            ((c.get("definition_excerpt") or "") for c in group if isinstance(c, dict)),
-            key=lambda s: len(s) if isinstance(s, str) else 0,
-            default="",
-        )
-        return {"definition_excerpt": best_def}
-
-    canonical_concepts = await _bulk_dedup_items(
-        raw_concepts,
-        name_key="term",
-        type_key=None,
-        aggregate_extra=_concept_extras,
-    )
-
-    logging.info(
-        "wiki_reduce: after dedup entities=%d concepts=%d",
-        len(canonical_entities),
-        len(canonical_concepts),
-    )
-
-    reduced = {
-        "entities": canonical_entities,
-        "concepts": canonical_concepts,
-        "claims": list(raw.get("claims") or []),
-        "relations": list(raw.get("relations") or []),
-        "topics": list(raw.get("topics") or []),
-    }
-
     if callback:
         try:
             callback(0.9, "wiki REDUCE: persisting result")

@@ -267,11 +267,23 @@ exclude-dependencies = [
     "unclecode-litellm",
     # Transitive dep of agentrun-sdk; not imported anywhere in RAGFlow code.
     "agentrun-mem0ai",
+    # Transitive dep of infinity-sdk; datrie 0.8.3 publishes no prebuilt wheel
+    # (sdist only) and building it on Windows/Python 3.13 needs MSVC, which is
+    # absent on this machine. `import infinity` does not touch datrie; only the
+    # `infinity.rag_tokenizer` Chinese-tokenizer module does, and unit tests
+    # that need it already stub that module in conftest.
+    "datrie",
 ]
 override-dependencies = [
     # moodlepy<=0.24.1 pins attrs<23.0.0, but trio>=0.26.0 requires attrs>=23.2.0.
     # attrs 23.x is backward-compatible; moodlepy works fine at runtime with it.
     "attrs>=23.2.0",
+    # numpy 1.26.4 (locked in the Linux-generated uv.lock) ships no cp313 wheels
+    # on any platform, so a Python 3.13 install would have to build it from
+    # source (needs MSVC on Windows, absent here). numpy>=2.1.0 is the first
+    # release with cp313 win_amd64/manylinux wheels; override so resolution
+    # picks a wheel-installable version on Python 3.13.
+    "numpy>=2.1.0",
 ]
 # trio 0.26+ (Python 3.13 compatible) is not yet on the Aliyun mirror.
 # Mark PyPI as explicit so it is used only for packages listed in [tool.uv.sources].

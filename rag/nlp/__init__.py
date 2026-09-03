@@ -346,7 +346,7 @@ def qbullets_category(sections):
         maximum = h
     return res, QUESTION_PATTERN[res]           # 返回 (风格下标, 该风格的正则)，供后续逐行判断题目用
 
-
+# 标题风格
 BULLET_PATTERN = [
     [
         r"第[零一二三四五六七八九十百0-9]+(分?编|部分)",
