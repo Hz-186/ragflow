@@ -322,6 +322,34 @@ func buildAgentInputMessages(ctx context.Context, p AgentParam) []*schema.Messag
 	return input
 }
 
+/*
+[
+  {
+    "role": "user",
+    "content": "之前我们聊到哪个阶段了？"
+  },
+  {
+    "role": "assistant",
+    "content": "我们上一轮核对完了 Q2 的报表。"
+  },
+  {
+    "role": "user",
+    "user_input_multi_content": [
+      {
+        "type": "text",
+        "text": "请结合这份补充说明，分析这张架构图里的组件交互流程。\n\n【补充说明文本】：网关层接入后会通过 Envoy 转发到后端 RPC 服务集群。"
+      },
+      {
+        "type": "image_url",
+        "image": {
+          "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAA..."
+        }
+      }
+    ]
+  }
+]
+*/
+
 // emitAgentModelStreams —— 思考过程实时转发器。后台 goroutine 盯着
 // eino MessageFuture 吐出的每一轮模型流，把 assistant 的正文/思考增量
 // 逐条转发给前端（runtime.EmitAgentMessage），让用户在模型还没说完时
@@ -388,13 +416,20 @@ func emitAgentModelStreams(ctx context.Context, future react.MessageFuture) <-ch
 
 // addToolCallMemory —— 工具调用记忆压缩器。把本轮 ReAct 里观察到的
 // 工具调用喂给一次小型 LLM 调用，让它压成一句话，作为可写进对话历史
-// 的记忆条目。对齐 Python 的 add_memory(user, assist, func_name,
-// params, results, user_defined_prompt)。
+// 的记忆条目。
 //
 // 参数：
 //   - msg：ReAct 循环结束后的最终消息，里面带 ToolCalls 列表，形如：
-//     msg.ToolCalls = [{ID: "call_1", Function: {Name: "retrieval",
-//     Arguments: `{"query":"..."}`}}, ...]
+//     msg.ToolCalls = [
+//     {
+//     ID: "call_1",
+//     Function: {
+//     Name: "retrieval",
+//     Arguments: `{"query":"..."}`
+//     }
+//     },
+//     ...,
+//     ]
 //   - p：只用来取模型四件套（Driver / ModelID / APIKey / BaseURL）。
 //
 // 返回：
@@ -688,7 +723,9 @@ func optimizeMultiTurnQuestion(ctx context.Context, db *gorm.DB, p AgentParam, h
 // 参数：
 //   - p.Tools：静态工具名列表，如 []string{"retrieval", "execute_sql"}；
 //   - p.ToolParams：按工具名键控的构造参数，如：
-//     {"execute_sql": {"db_url": "..."}}
+//     {
+//     "execute_sql": {"db_url": "..."},
+//     }
 //   - p.SubAgents：子 Agent 规格列表，每个包成一个可调用的工具。
 //
 // 返回：拼好的工具列表（静态工具在前、子 Agent 工具在后）。

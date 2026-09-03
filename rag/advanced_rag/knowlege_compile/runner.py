@@ -13,21 +13,10 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 #
-"""Handler-free core for document-scoped knowledge (structure) compilation.
+"""无依赖的文档级知识结构编译执行调度核心模块。
 
-Extracted from
-``rag/svr/task_executor_refactor/chunk_post_processor.py`` so the same
-template resolution, batching, accumulate / merge-flush and synthesis logic
-can be driven from two places:
-
-* the chunking **task executor**, which streams a document's chunks out of
-  the doc store (``run_document_structure_compile``), and
-* the ``rag.flow`` **Compiler** component, which receives chunks in-memory
-  from an upstream pipeline node.
-
-Only the non-``tree`` template kinds are handled here. ``tree`` templates run
-RAPTOR over the whole document and are still driven from the task executor
-(``run_tree_templates``), which owns the doc-store reload + ``RaptorService``.
+提供模板解析、批次聚合、流式提交与并发合并落库调度。
+支持普通结构提取模板（non-tree）的批量编译与增量合并，并驱动知识图谱全库重构和综合生成阶段（Synthesis）。
 """
 
 from __future__ import annotations
@@ -55,49 +44,43 @@ from rag.advanced_rag.knowlege_compile.structure import (
 )
 
 
-# ----- tunables ------------------------------------------------------
-# Bound how many source chunks are handed to a single
-# ``compile_structure_from_text`` invocation for regular templates.
+# ── 可调超参数配置 ────────────────────────────────────────────────────────
+# 常规模板单次 compile_structure_from_text 调用聚合的切片数上限
 DOC_STRUCTURE_COMPILE_BATCH_CHUNKS = 4
 
-# Structure compilation packs chunks up to half of the model context.
-# ``compile_structure_from_text`` applies the exact prompt-aware packing again
-# before the LLM call.
+# 结构编译向大模型提示词打包切片的上下文预算比例
 STRUCTURE_CONTEXT_FRACTION = 0.5
 STRUCTURE_DEFAULT_CONTEXT = 100_000
 KNOWLEDGE_GRAPH_CONTEXT_FRACTION = 0.1
 KNOWLEDGE_GRAPH_MIN_BATCH_TOKENS = 2048
 KNOWLEDGE_GRAPH_MAX_BATCH_TOKENS = 4096
 
-# Bound the number of batch/template extraction calls in flight. Results are
-# committed in submission order so accumulator updates and merge flushes stay
-# deterministic while the LLM calls run concurrently.
+# 允许并发执行中的批次/模板提取调用最大数量
 DOC_STRUCTURE_COMPILE_MAX_IN_FLIGHT = 15
 
-# Total task-scoped Chat LLM capacity shared by compile, chain validation and
-# merge decisions. A request waits in the priority queue when all slots are busy.
+# 任务级大语言模型并发调用池容量上限
 DOC_STRUCTURE_LLM_POOL_SIZE = 20
 
-# Bound how many compiled ES-ready docs may accumulate before we flush
-# them through ``merge_compiled_structures``. The merger does pairwise
-# cosine + LLM duplicate-judging, so it's the more expensive step; we
-# cap the per-flush set to keep the local-dedup buckets tractable.
+# 触发调用 merge_compiled_structures 批量合并刷盘的文档条数阈值
 DOC_STRUCTURE_MERGE_MAX_DOCS = 512
 
-# Hard wall on the chain-validator LLM correction step.
+# 链式校验器大模型纠错步骤的硬超时秒数
 STRUCTURE_CHAIN_CORRECTION_TIMEOUT_S = 120.0
 
 
-# ----- template resolution -------------------------------------------
+# ── 编译模板解析与配置加载组件 ──────────────────────────────────────────
 
 
 def resolve_template_ids_from_groups(group_ids, tenant_id: str) -> list[str]:
-    """Resolve an ordered, de-duplicated list of compilation-template ids
-    from a list of template-*group* ids.
+    """从模板分组 ID 列表中解析并去重展开具体的编译模板 ID 列表 —— 模板组展开工。
 
-    Mirrors ``_parser_config_compilation_template_ids`` but takes the group
-    ids directly (the ``rag.flow`` Compiler carries them as a component
-    parameter rather than inside ``parser_config``).
+    参数:
+        group_ids: 单个分组 ID 或分组 ID 列表，示例：["group_01", "group_02"]
+        tenant_id: 租户唯一标识 ID，示例："tenant_abc"
+
+    返回值:
+        保序且去重后的编译模板 ID 字符串列表，结构示例：
+            ["tpl_101", "tpl_102"]
     """
     if isinstance(group_ids, str):
         group_ids = [group_ids]
@@ -118,12 +101,15 @@ def resolve_template_ids_from_groups(group_ids, tenant_id: str) -> list[str]:
 
 
 def load_active_templates(template_ids, tenant_id: str) -> list[tuple[str, dict]]:
-    """Load each template's saved config and keep only the ones that drive a
-    real, non-``artifacts`` structure compilation.
+    """加载各个模板的持久化配置并过滤出当前生效的非维基结构编译模板 —— 激活模板加载过滤工。
 
-    Returns ``[(template_id, parser_cfg), ...]`` — templates that are missing,
-    have an invalid config, or resolve to no/``artifacts`` kind are dropped
-    (with a warning for the missing/invalid cases).
+    参数:
+        template_ids: 待加载的模板 ID 列表，结构示例：["tpl_101", "tpl_102"]
+        tenant_id: 租户唯一标识 ID，示例："tenant_abc"
+
+    返回值:
+        二元组 (模板ID, 解析配置字典) 列表，结构示例：
+            [("tpl_101", {"kind": "knowledge_graph", "dataset_merge": True})]
     """
     from api.apps.restful_apis.chunk_api import _compilation_template_kind
 
@@ -147,7 +133,16 @@ def load_active_templates(template_ids, tenant_id: str) -> list[tuple[str, dict]
 def split_tree_templates(
     active_templates: list[tuple[str, dict]],
 ) -> tuple[list[tuple[str, dict]], list[tuple[str, dict]]]:
-    """Partition templates into ``(tree, non_tree)`` by kind."""
+    """根据类型将模板列表拆分为 RAPTOR 聚类树模板和常规扁平结构模板 —— 树/非树模板二分工。
+
+    参数:
+        active_templates: 激活模板二元组列表，结构示例：
+            [("tpl_tree", {"kind": "tree"}), ("tpl_kg", {"kind": "knowledge_graph"})]
+
+    返回值:
+        二元组 (树模板列表, 非树模板列表)，结构示例：
+            ([("tpl_tree", {...})], [("tpl_kg", {...})])
+    """
     from api.apps.restful_apis.chunk_api import _compilation_template_kind
 
     tree_templates: list[tuple[str, dict]] = []
@@ -161,6 +156,14 @@ def split_tree_templates(
 
 
 def _is_page_index_template(parser_cfg: dict) -> bool:
+    """判断模板配置是否为页面索引（PageIndex）类型 —— 页面索引模板判定工。
+
+    参数:
+        parser_cfg: 模板内部解析配置字典，示例：{"kind": "page_index"}
+
+    返回值:
+        布尔值（True 表示是 page_index 模板，False 否则）。
+    """
     kind = (parser_cfg or {}).get("kind")
     if not isinstance(kind, str):
         return False
@@ -168,6 +171,17 @@ def _is_page_index_template(parser_cfg: dict) -> bool:
 
 
 def _page_index_graph_summary(graph: dict, limit: int = 80) -> str:
+    """从页面索引编译图谱中提取实体名称与描述组合生成简要文本大纲 —— 页面索引大纲汇总工。
+
+    参数:
+        graph: 已构建的图谱字典对象，结构示例：
+            {"entities": [{"name": "首页", "description": "系统概览..."}]}
+        limit: 最大收录的实体行数上限（默认 80），示例：80
+
+    返回值:
+        换行拼接的大纲文本字符串，示例：
+            "首页: 系统概览...\n用户指南: 包含注册与登录步骤"
+    """
     entities = graph.get("entities") if isinstance(graph, dict) else None
     if not isinstance(entities, list):
         return ""
@@ -198,6 +212,22 @@ async def _upsert_dataset_nav_from_page_index(
     progress_cb: Callable[..., None],
     cancel_check: Callable[[], bool],
 ) -> None:
+    """基于页面索引大纲汇总生成或更新数据集级别的导航树文档 —— 数据集页面索引导航同步工。
+
+    参数:
+        active_templates: 激活模板配置列表，结构示例：[("tpl_pi", {"kind": "page_index"})]
+        chat_mdl_by_tid: 按模板 ID 索引的模型 Bundle 字典，结构示例：{"tpl_pi": LLMBundle(...)}
+        embedding_model: 用于生成导航向量的嵌入模型 Bundle。
+        tenant_id: 租户 ID，示例："tenant_abc"
+        kb_id: 知识库 ID，示例："kb_01"
+        doc_id: 目标文档 ID，示例："doc_101"
+        doc_name: 目标文档名称，示例："用户手册.pdf"
+        progress_cb: 进度通知回调函数。
+        cancel_check: 任务取消检查回调函数。
+
+    返回值:
+        None。
+    """
     page_index_templates = [(template_id, parser_cfg) for template_id, parser_cfg in active_templates if _is_page_index_template(parser_cfg)]
     if not page_index_templates:
         return
@@ -208,10 +238,7 @@ async def _upsert_dataset_nav_from_page_index(
         if cancel_check():
             raise TaskCanceledException("Task was cancelled before dataset navigation update")
         try:
-            # PageIndex rows use their preserved template kind as the
-            # compile keyword. Older rows were written as ``timeline``
-            # before compilation kinds were kept distinct, so fall back to
-            # the legacy keyword when rebuilding an existing graph.
+            # 优先从 page_index 编译关键字重构图谱；若无则回退到旧版 timeline 关键字
             graph = await rebuild_structure_graph_json(
                 tenant_id,
                 kb_id,
@@ -269,7 +296,7 @@ async def _upsert_dataset_nav_from_page_index(
         logging.exception("page_index: dataset_nav upsert failed for doc %s", doc_id)
 
 
-# ----- non-tree compilation core -------------------------------------
+# ── 非树结构编译调度核心 ───────────────────────────────────────────────
 
 
 async def run_structure_compile_over_batches(
@@ -287,17 +314,34 @@ async def run_structure_compile_over_batches(
     cancel_check: Callable[[], bool] = lambda: False,
     record: Callable[[str, dict], None] | None = None,
 ) -> dict[str, dict]:
-    """Extract + merge structures for every non-``tree`` template over an
-    async stream of chunk batches, then run the optional synthesis phase.
+    """对异步分批输入的切片流驱动多模板并发结构抽取、合并落库与综合生成 —— 文档结构编译并发调度总控器。
 
-    ``active_templates`` must already be the non-tree subset with a resolved
-    chat model in ``chat_mdl_by_tid``. Chunks arrive as an async iterator of
-    batches so callers can stream them from the doc store or hand over an
-    in-memory list; each ``dict`` must expose ``id`` and text
-    (``content_with_weight`` / ``text``).
+    参数:
+        active_templates: 非树激活模板配置二元组列表，结构示例：
+            [("tpl_kg", {"kind": "knowledge_graph", "dataset_merge": True})]
+        chat_mdl_by_tid: 按模板 ID 索引的模型 Bundle 字典，结构示例：{"tpl_kg": LLMBundle(...)}
+        embedding_model: 用于切片与实体向量计算的模型 Bundle。
+        tenant_id: 租户唯一标识，示例："tenant_abc"
+        kb_id: 知识库唯一标识，示例："kb_01"
+        doc_id: 当前正在编译的文档 ID，示例："doc_101"
+        doc_name: 当前正在编译的文档名称，示例："用户手册.pdf"
+        language: 生成目标自然语言，示例："Chinese"
+        chunk_batches: 异步切片批次生成器，每批为切片字典列表，结构示例：
+            [{"id": "c1", "content_with_weight": "正文内容..."}]
+        progress_cb: 进度通知回调函数。
+        cancel_check: 任务是否已被取消检查函数。
+        record: 指标聚合落盘回调函数（可选）。
 
-    Returns ``{template_id: {"inserted", "updated", "duplicates_dropped"}}``.
-    Raises :class:`TaskCanceledException` when ``cancel_check`` trips.
+    返回值:
+        按模板 ID 映射的落库统计信息字典，结构示例：
+            {
+                "tpl_kg": {
+                    "inserted": 12,
+                    "updated": 5,
+                    "duplicates_dropped": 2,
+                    "rechunked_chunks": []
+                }
+            }
     """
     from api.apps.restful_apis.chunk_api import _compilation_template_kind
 
@@ -309,13 +353,10 @@ async def run_structure_compile_over_batches(
 
     accumulators: dict[str, list[dict]] = {tid: [] for tid, _ in active_templates}
     template_kinds: dict[str, str] = {tid: _compilation_template_kind((cfg or {}).get("kind")) for tid, cfg in active_templates}
-    # ``dataset_merge`` hyper-parameter (per template config): when truthy the
-    # merge dedups entities/relations across the whole dataset (KB), collapsing
-    # cross-document duplicates onto one canonical row, instead of merging only
-    # within the current document.
+    # 模板 dataset_merge 参数：为真时将在整个知识库（KB）范围内跨文档合并实体与关系并去重，
+    # 否则仅在当前单篇文档内合并去重。
     merge_scope_by_tid: dict[str, str] = {tid: (MERGE_SCOPE_DATASET if bool((cfg or {}).get("dataset_merge")) else MERGE_SCOPE_DOC) for tid, cfg in active_templates}
-    # compile_kwd(s) each template actually wrote, harvested from flush results
-    # so a dataset-scope template can rebuild its dataset graph once at the end.
+    # 记录每个模板实际产出的 compile_kwd 集合，便于全库级模板在编译完成后一次性重构数据集图谱。
     compile_kwds_by_tid: dict[str, set[str]] = {tid: set() for tid, _ in active_templates}
     agg_infos: dict[str, dict] = {tid: {"inserted": 0, "updated": 0, "duplicates_dropped": 0, "rechunked_chunks": []} for tid, _ in active_templates}
     chunks_by_id: dict[str, str] = {}
@@ -537,6 +578,7 @@ async def run_structure_compile_over_batches(
             await _cancel_pending()
             raise
 
+    # 第一阶段：流式消费切片并分批并发调用大模型进行结构抽取
     await _submit_batches()
 
     while inflight:
@@ -546,6 +588,7 @@ async def run_structure_compile_over_batches(
         await _reap_one()
     await _commit_ready()
 
+    # 第二阶段：清空累积缓冲区，执行最后一轮刷盘合并
     for template_id, _ in active_templates:
         if cancel_check():
             await _cancel_pending()
@@ -560,20 +603,11 @@ async def run_structure_compile_over_batches(
         finally:
             flush_tasks.clear()
 
-    # ── Dataset structure graph ──────────────────────────────────────────
-    # For dataset-scope templates the entity/relation rows are now merged
-    # across documents, so (re)project them into a single KB-wide graph. This
-    # runs once per document-parse completion; the last document to finish
-    # produces the complete dataset graph. Best-effort — a failure here must
-    # not fail the parse.
+    # ── 第三阶段：数据集级别结构图谱重构 ────────────────────────────────
+    # 针对全库范围合并（MERGE_SCOPE_DATASET）的模板，将跨文档融合后的实体与关系投影重构为全知识库统一图谱。
     for template_id, _ in active_templates:
         if merge_scope_by_tid[template_id] != MERGE_SCOPE_DATASET:
             continue
-        # The row is filtered by the template's *top-level* kind (e.g.
-        # ``knowledge_graph``, ``session_graph``), which — unlike ``config.kind``
-        # — distinguishes the knowledge_graph family. Resolve it from the
-        # template record; on failure leave it unstamped (the read side falls
-        # back to resolving kind from the template id).
         structure_kind = None
         try:
             saved_template = CompilationTemplateService.get_saved(template_id, tenant_id)
@@ -603,6 +637,7 @@ async def run_structure_compile_over_batches(
                     template_id,
                 )
 
+    # 第四阶段：同步更新全库页面索引导航树
     await _upsert_dataset_nav_from_page_index(
         active_templates=active_templates,
         chat_mdl_by_tid=chat_mdl_by_tid,
@@ -614,9 +649,8 @@ async def run_structure_compile_over_batches(
         progress_cb=progress_cb,
         cancel_check=cancel_check,
     )
-    # Timeline entity cleanup must happen after every flush has completed;
-    # otherwise an entity can look isolated in one flush and be referenced by
-    # a relation from a later flush. Keep this scoped to timeline templates.
+
+    # 第五阶段：清理时间线孤立实体（必须在所有 flush 任务完全就绪后执行，防止时序错位）
     for template_id, _ in active_templates:
         if template_kinds.get(template_id) != "timeline":
             continue
@@ -634,6 +668,7 @@ async def run_structure_compile_over_batches(
                 template_id,
             )
 
+    # 第六阶段：汇总统计各模板处理结果
     for idx, (template_id, parser_cfg) in enumerate(active_templates):
         if cancel_check():
             raise TaskCanceledException("Task was cancelled during document knowledge compilation")
@@ -660,17 +695,15 @@ async def run_structure_compile_over_batches(
                 )
             )
 
-        # ── Synthesis phase ──────────────────────────────────────────────
-        # If the template has synthesis.enabled, run wiki PLAN+REFINE
-        # to generate output (wiki page, essence paragraph, etc.).
+        # ── 第七阶段：综合生成阶段（Synthesis Phase） ──────────────────────
+        # 若模板启用了 synthesis.enabled，驱动 wiki 规划与精炼生成综合文章或精炼段落
         synthesis_cfg = (parser_cfg or {}).get("synthesis") or {}
         if synthesis_cfg.get("enabled"):
             example = synthesis_cfg.get("example")
             compile_kwd = synthesis_cfg.get("compile_kwd", "wiki_page")
             plan_cfg = synthesis_cfg.get("plan") or {}
 
-            # Reserved for future wiki_plan_from_reduction extension:
-            # entity_type_filter, mention_count_threshold, top_n
+            # 预留给未来 wiki_plan_from_reduction 扩展的配置字段
             if plan_cfg:
                 logging.debug(
                     "synthesis: template %s plan config %r reserved for future use",
@@ -726,8 +759,7 @@ async def run_structure_compile_over_batches(
                             callback=progress_cb,
                             example=example,
                         )
-                        # Overwrite compile_kwd on every output page so the
-                        # synthesis type is tracked correctly in ES.
+                        # 覆写各产出页面的 compile_kwd 以确保存储引擎精确追踪该类型
                         for p in pages or []:
                             p["compile_kwd"] = compile_kwd
                         progress_cb(msg=f"Synthesis done: {len(pages or [])} {compile_kwd} page(s) written.")

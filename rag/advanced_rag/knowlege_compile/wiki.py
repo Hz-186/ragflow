@@ -13,25 +13,15 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 #
-"""WIKI compilation pipeline — MAP phase.
+"""维基知识全景编译管道 —— MAP（分块知识映射提取）阶段。
 
-  - Chunks come from ES (or any pre-chunked list passed in by the caller).
-    No outline-driven chunking; per-chunk byte offsets are not tracked.
-  - The LLM goes through ``rag.prompts.generator.gen_json`` (json_repair-backed).
-    Embeddings go through ``LLMBundle.encode`` via ``thread_pool_exec`` (kept
-    in the signature for symmetry with the downstream REDUCE / REFINE phases
-    even though MAP itself does not embed).
-  - Citation anchor is the source chunk id (``source_chunk_ids`` list per item), not
-    a byte position. The LLM is prompted to tag each extracted item with the
-    ``[CHUNK_ID …]`` of the chunk it came from.
-  - Cache: per-chunk extraction versions are persisted to ES under
-    ``compile_kwd="wiki_map_extract"`` with ``available_int=0`` and no vector
-    / token-list fields, so retrievers ignore them but downstream phases can
-    fetch them by ``doc_id`` + ``source_chunk_ids`` + ``chunk_hash_kwd``.
-    Historical versions are retained so reverted chunk content can reuse its
-    earlier extraction.
+本模块属于知识编译（Knowledge Compilation）的第一个核心阶段：
+1. 分块处理：分块来源于搜索引擎或上游传入的预切分块列表，逐块跟踪内容哈希；
+2. 结构提取：通过大语言模型结构化抽取实体（Entities）、概念（Concepts）、论断（Claims）、关系（Relations）与主题（Topics）；
+3. 证据溯源：以来源分块 ID（source_chunk_ids）作为定位锚点，模型将每个抽取项打上对应分块标签；
+4. 增量断点：分块抽取结果以 compile_kwd="wiki_map_extract" 记录持久化缓存，支持内容未改动时跳过重新抽取。
 
-Public entry: ``wiki_map_from_chunks``.
+公开入口函数：wiki_map_from_chunks。
 """
 
 import asyncio
@@ -57,35 +47,30 @@ from ._common import (
 )
 
 
-# Global pipeline-rev — bumping this constant invalidates every cached
-# wiki_map_extract / wiki_reduce_result / wiki_compilation_plan
-# / wiki_page_draft / wiki_page row on the next re-run. Use it
-# when a prompt or extraction schema changes in a way that should
-# invalidate prior caches.
+# 全局管道版本号 —— 升级该常量将自动使旧版全部缓存失效
 _WIKI_PIPELINE_REV = "v1"
 
 
 def _chunk_hash(content: str) -> str:
-    """xxh64 of a chunk's ``content_with_weight`` mixed with the global
-    pipeline rev. The mix-in means a prompt / schema bump invalidates
-    every cached row without us having to touch each row individually.
+    """计算分块内容与全局管线版本号混合后的确定性 xxHash64 哈希指纹 —— 分块哈希指纹计算工。
+
+    参数:
+        content: 分块正文文本内容，示例："量子力学是研究微观粒子运动规律的物理学分支..."
+
+    返回值:
+        16 位十六进制哈希字符串，示例："3f2a1b4c5d6e7f80"
     """
     body = (content or "") + "|" + _WIKI_PIPELINE_REV
     return _xxhash.xxh64(body.encode("utf-8", "surrogatepass")).hexdigest()
 
 
-# Tiny parser_config helpers shared with the structure pipeline. Pulled in
-# here so the MAP entity/relation schemas and rules can be driven from the
-# same ``parser_config`` shape that ``compile_structure_from_text`` uses.
 from .structure import (
     _struct_get,
     _struct_localize,
 )
 
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
+# ── 常量定义 ─────────────────────────────────────────────────────────────
 
 WIKI_MAP_COMPILE_KWD = "wiki_map_extract"
 WIKI_MAP_STATE_COMPILE_KWD = "wiki_map_state"
@@ -95,7 +80,14 @@ DEFAULT_WIKI_MAP_TIMEOUT = 600
 
 
 async def _wiki_disabled_doc_ids(kb_id: str) -> set[str]:
-    """Return disabled documents so cached MAP rows cannot re-enter a build."""
+    """从数据库中检索指定知识库下已被禁用的文档 ID 集合 —— 禁用文档过滤器。
+
+    参数:
+        kb_id: 知识库唯一 ID，示例："kb_001"
+
+    返回值:
+        已禁用文档 ID 的字符串集合，结构示例：{"doc_disabled_01", "doc_disabled_02"}
+    """
     from api.db.services.document_service import DocumentService
 
     disabled = await thread_pool_exec(DocumentService.get_disabled_doc_ids_by_kb_id, kb_id)
@@ -103,7 +95,14 @@ async def _wiki_disabled_doc_ids(kb_id: str) -> set[str]:
 
 
 def _wiki_doc_ids(value) -> set[str]:
-    """Normalize a scalar or list-valued document-id field."""
+    """将单标量、列表或嵌套容器类型的文档 ID 统一规整为纯字符串集合 —— 文档标识归一化工。
+
+    参数:
+        value: 单个文档 ID、ID 列表或集合，结构示例：["doc_01", "doc_02"] 或 "doc_01"
+
+    返回值:
+        去重且去首尾空格后的文档 ID 集合，结构示例：{"doc_01", "doc_02"}
+    """
     if value is None:
         return set()
     if isinstance(value, str):
@@ -119,7 +118,21 @@ def _wiki_doc_ids(value) -> set[str]:
 
 
 def _wiki_compare_chunk_states(previous: dict[str, dict], current: dict[str, dict]) -> dict[str, set[str]]:
-    """Return the chunk-level delta between two successful Wiki states."""
+    """比对前后两次成功 Wiki 编译的分块状态字典，计算新增、变更、删除及未变动的分块增量 —— 分块增量差异比对工。
+
+    参数:
+        previous: 上一次构建时的分块状态字典，结构示例：{"c1": {"doc_id": "d1", "hash": "h1"}}
+        current: 当前最新的分块状态字典，结构示例：{"c1": {"doc_id": "d1", "hash": "h1_new"}, "c2": {"doc_id": "d1", "hash": "h2"}}
+
+    返回值:
+        包含四个集合的差异字典，结构示例：
+            {
+                "new_chunk_ids": {"c2"},
+                "changed_chunk_ids": {"c1"},
+                "deleted_chunk_ids": set(),
+                "unchanged_chunk_ids": set()
+            }
+    """
     previous_ids = set(previous)
     current_ids = set(current)
     common_ids = previous_ids & current_ids
@@ -245,14 +258,24 @@ Rules:
 {custom_rules}"""
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+# ── 辅助工具 ─────────────────────────────────────────────────────────────
 
 _EXTRACT_LIST_KEYS = ("entities", "concepts", "claims", "relations")
 
 
 def _wiki_empty_extract() -> dict:
+    """创建空的五元提取结构字典（实体、概念、论断、关系与主题） —— 空抽取结果生成工。
+
+    返回值:
+        包含五项空列表的标准字典，结构示例：
+            {
+                "entities": [],
+                "concepts": [],
+                "claims": [],
+                "relations": [],
+                "topics": []
+            }
+    """
     return {
         "entities": [],
         "concepts": [],
@@ -262,31 +285,17 @@ def _wiki_empty_extract() -> dict:
     }
 
 
-# ---- parser_config-driven schema rendering --------------------------------
-#
-# artifact MAP's prompt previously hardcoded the entity & relation field set
-# (name/type/aliases for entities; from/to/type for relations). The shape
-# is now driven by ``parser_config.output.entities.fields`` and
-# ``parser_config.output.relations.fields`` — the same YAML-style config
-# used by ``compile_structure_from_text``. When no fields are configured
-# (or no parser_config is passed) we fall back to the original artifact
-# defaults so existing call sites keep working.
-
-
 def _wiki_render_schema_body(fields, language: str, default_body: str, *, indent: int = 6) -> str:
-    """Render the JSON body for one item in the entity/relation schema.
+    """根据自定义配置字段列表渲染实体或关系的 JSON Schema 格式说明文本 —— 提取模式体渲染工。
 
-    Produces one line per field of the form::
+    参数:
+        fields: 字段配置列表，结构示例：[{"name": "title", "type": "str", "description": "文章标题"}]
+        language: 本地化语言代码，示例："zh"
+        default_body: 默认 Schema 格式文本，示例：_DEFAULT_ENTITY_SCHEMA_BODY
+        indent: 缩进空格数量，默认 6。
 
-        "<field>": <placeholder>
-
-    where ``<placeholder>`` carries a ``string — <description>`` hint for
-    string fields (so the LLM sees the user's intent) or a typed example
-    for list/int/float/bool fields. Always appends ``source_chunk_id`` as
-    the final field — chunk attribution is structural and not user-tunable.
-
-    Falls back to ``default_body`` when ``fields`` is empty or only contains
-    invalid entries.
+    返回值:
+        渲染好的多行 Schema 格式字符串，结构示例：'      "name": "string",\n      "source_chunk_id": "string"'
     """
     if not fields:
         return default_body
@@ -300,8 +309,6 @@ def _wiki_render_schema_body(fields, language: str, default_body: str, *, indent
         name = f.get("name") or ""
         name = name.strip() if isinstance(name, str) else ""
         if not name or name in seen or name == "source_chunk_id":
-            # Skip duplicates and any user-supplied source_chunk_id — we
-            # always append our canonical one below.
             continue
         seen.add(name)
 
@@ -317,8 +324,6 @@ def _wiki_render_schema_body(fields, language: str, default_body: str, *, indent
             placeholder = "false"
         else:
             if desc:
-                # Strip newlines and curly braces from the description so it
-                # doesn't break the prompt's JSON layout or str.format.
                 safe = desc.replace("\n", " ").replace("{", "(").replace("}", ")").strip()
                 placeholder = f'"string — {safe}"'
             else:
@@ -333,12 +338,14 @@ def _wiki_render_schema_body(fields, language: str, default_body: str, *, indent
 
 
 def _wiki_build_custom_rules(parser_config, language: str) -> str:
-    """Concatenate user-provided entity/relation rules into bullet-style
-    sections appended to the prompt's Rules section.
+    """提取知识库配置中关于实体和关系的自定义抽取准则并格式化为分节文本 —— 自定义规则组装工。
 
-    Returns an empty string when no parser_config rules are present so the
-    template's trailing triple-quote closes cleanly without an extra blank
-    line.
+    参数:
+        parser_config: 编译配置字典，结构示例：{"guideline": {"rules_for_entities": "只抽取上市企业"}}
+        language: 本地化语言代码，示例："zh"
+
+    返回值:
+        拼装好的 Markdown 格式规则文本，示例："\n## Entity extraction rules...\n只抽取上市企业\n"
     """
     if not isinstance(parser_config, dict):
         return ""
@@ -359,6 +366,15 @@ def _wiki_build_custom_rules(parser_config, language: str) -> str:
 
 
 def _wiki_template_fields(parser_config, section: str) -> list:
+    """从配置字典中提取指定小节（如 entity/relation）下的字段配置列表 —— 模板字段提取工。
+
+    参数:
+        parser_config: 编译配置字典，结构示例：{"entity": {"fields": [{"name": "n1"}]}}
+        section: 小节名称，示例："entity"
+
+    返回值:
+        包含字段配置字典的列表，结构示例：[{"name": "n1"}]
+    """
     if not isinstance(parser_config, dict):
         return []
     cfg = _struct_get(parser_config, section, default={}) or {}
@@ -367,6 +383,14 @@ def _wiki_template_fields(parser_config, section: str) -> list:
 
 
 def _wiki_type_rules(fields: list) -> str:
+    """将字段定义列表中的类型、描述与规则渲染为提示词文本行 —— 类型规则渲染工。
+
+    参数:
+        fields: 字段字典列表，结构示例：[{"type": "person", "description": "人类", "rule": "排除虚构人物"}]
+
+    返回值:
+        渲染好的多行文本规则，示例："type: person\n  - description: 人类\n  - rule: 排除虚构人物"
+    """
     lines: list[str] = []
     for field in fields:
         if not isinstance(field, dict):
@@ -388,6 +412,15 @@ def _wiki_type_rules(fields: list) -> str:
 
 
 def _wiki_pipe_join(fields: list, key: str) -> str:
+    """提取字段列表中指定键的值并用竖线 '|' 拼接为候选枚举字符串 —— 管道符拼接工。
+
+    参数:
+        fields: 字段字典列表，结构示例：[{"term": "概念A"}, {"term": "概念B"}]
+        key: 需要提取的键名，示例："term"
+
+    返回值:
+        竖线拼接字符串，示例："概念A|概念B"
+    """
     values: list[str] = []
     for field in fields:
         if not isinstance(field, dict):
@@ -400,6 +433,16 @@ def _wiki_pipe_join(fields: list, key: str) -> str:
 
 
 def _wiki_colon_join(fields: list, left_key: str, right_key: str) -> str:
+    """提取字段列表中的左键值与右键值并按 '左:右' 格式逐行拼接 —— 冒号拼接工。
+
+    参数:
+        fields: 字段字典列表，结构示例：[{"term": "A", "definition_excerpt": "定义A"}]
+        left_key: 左侧键名，示例："term"
+        right_key: 右侧键名，示例："definition_excerpt"
+
+    返回值:
+        冒号拼接的多行文本字符串，示例："A:定义A"
+    """
     values: list[str] = []
     for field in fields:
         if not isinstance(field, dict):
@@ -414,6 +457,15 @@ def _wiki_colon_join(fields: list, left_key: str, right_key: str) -> str:
 
 
 def _wiki_named_field_description(fields: list, name: str) -> str:
+    """在字段列表中查找指定名称字段的描述信息 —— 命名说明查找工。
+
+    参数:
+        fields: 字段字典列表，结构示例：[{"name": "statement", "description": "事实陈述"}]
+        name: 目标字段名，示例："statement"
+
+    返回值:
+        查找到的描述文本，示例："事实陈述"
+    """
     for field in fields:
         if not isinstance(field, dict):
             continue
@@ -432,6 +484,14 @@ def _wiki_named_field_description(fields: list, name: str) -> str:
 
 
 def _wiki_template_custom_rules(parser_config) -> str:
+    """从配置字典中提取全局自定义规则字符串 —— 全局规则提取工。
+
+    参数:
+        parser_config: 编译配置字典，结构示例：{"global_rules": "请优先使用中文名称"}
+
+    返回值:
+        去首尾空格后的全局规则文本，示例："请优先使用中文名称"
+    """
     if not isinstance(parser_config, dict):
         return ""
     rules = parser_config.get("global_rules")
@@ -447,8 +507,19 @@ def _wiki_build_user_prompt(
     chunk_id_list: str,
     packed_chunks: str,
 ) -> str:
-    """Fill ``WIKI_MAP_USER_TEMPLATE`` with the dynamic entity / relation
-    schema bodies plus optional rules drawn from ``parser_config``."""
+    """将分块上下文、动态实体/关系 Schema 与自定义规则填充至维基映射提示词模板 —— 用户提示词构建工。
+
+    参数:
+        parser_config: 编译配置字典，结构示例：{"entity": {...}}
+        language: 本地化语言代码，示例："zh"
+        doc_id: 来源文档 ID，示例："doc_101"
+        chunk_count: 当前批次包含的分块总数，示例：4
+        chunk_id_list: 供模型选用的分块 ID 列表文本，示例："- C1\n- C2"
+        packed_chunks: 包含分块正文的组合文本，示例："[CHUNK_ID C1]\n段落A..."
+
+    返回值:
+        组装完成供大模型推理的完整用户提示词字符串。
+    """
     ent_fields = _wiki_template_fields(parser_config, "entity")
     rel_fields = _wiki_template_fields(parser_config, "relation")
     concept_fields = _wiki_template_fields(parser_config, "concept")
@@ -511,29 +582,31 @@ def _wiki_build_user_prompt(
 
 
 def _wiki_pick_chunk_text(chunk: dict) -> str:
+    """从分块字典中安全提取正文内容字符串 —— 分块文本提取工。
+
+    参数:
+        chunk: 分块字典，结构示例：{"id": "c1", "content_with_weight": "正文内容..."}
+
+    返回值:
+        分块正文字符串，示例："正文内容..."
+    """
     text = chunk.get("text") or chunk.get("content_with_weight") or chunk.get("content") or ""
     return text if isinstance(text, str) else ""
 
 
-# Matches a bare 16-char lowercase-hex token bounded by non-word chars on
-# both sides — the shape of an xxh64 hexdigest (chunk_id / row id).
 _HEX16_TOKEN_RE = re.compile(r"(?<![0-9a-zA-Z])[0-9a-f]{16}(?![0-9a-zA-Z])")
-# Similar for the 32-char doc-id / uuid-without-dashes pattern.
 _HEX32_TOKEN_RE = re.compile(r"(?<![0-9a-zA-Z])[0-9a-f]{32}(?![0-9a-zA-Z])")
 
 
 def _wiki_scrub_known_ids(text: str, ids_to_remove) -> str:
-    """Defensive scrub: strip any literal occurrence of known ES ids from
-    chunk text before sending to the extraction LLM.
+    """从输入正文中剔除已知分块 ID、文档 ID 及十六进制哈希标记以防大模型误将其提取为实体 —— 提示词文本去噪清洗工。
 
-    Some chunkers embed the chunk_id / doc_id into the body (e.g. as a
-    header, footer, or breadcrumb). Without this scrub the extraction LLM
-    grabs the hash and reports it as an entity name (commonly mis-typed as
-    "location"). We belt-and-brace by removing:
+    参数:
+        text: 待清洗的原始段落文本，示例："[c1a2b3d4] 量子计算机..."
+        ids_to_remove: 待剔除的显式 ID 集合或列表，结构示例：["c1a2b3d4", "doc_01"]
 
-      1. Every literal id passed in ``ids_to_remove`` (chunk_ids of the
-         batch + the doc_id).
-      2. Any standalone 16-hex or 32-hex token still left over after (1).
+    返回值:
+        清洗后的文本字符串，示例："量子计算机..."
     """
     if not text:
         return text
@@ -547,7 +620,15 @@ def _wiki_scrub_known_ids(text: str, ids_to_remove) -> str:
 
 
 def _wiki_format_batch_prompt(packed: list[dict]) -> tuple[str, list[str]]:
-    """Render the [CHUNK_ID …]-labelled body and return (body_text, label_order)."""
+    """将当前打包批次内的各分块组装为带 [CHUNK_ID C1] 标签的提示词正文 —— 批次文本打包工。
+
+    参数:
+        packed: 打包分块列表，结构示例：[{"label": "C1", "chunk_id": "c_01", "text": "内容1"}]
+
+    返回值:
+        二元组 (组装后的正文字符串, 标签有序列表)，结构示例：
+            ("[CHUNK_ID C1]\n内容1", ["C1"])
+    """
     parts: list[str] = []
     labels: list[str] = []
     for entry in packed:
@@ -557,7 +638,21 @@ def _wiki_format_batch_prompt(packed: list[dict]) -> tuple[str, list[str]]:
 
 
 def _wiki_unwrap_extract(res) -> dict:
-    """Coerce LLM JSON to the canonical 5-key shape with defaulted lists."""
+    """将大语言模型推理返回的 JSON 解析结果解包为标准的五元知识提取字典 —— 提取结果拆包解构工。
+
+    参数:
+        res: 模型返回的字典或反序列化对象，结构示例：{"entities": [{"name": "A"}], "topics": ["T1"]}
+
+    返回值:
+        规范化后的标准五元结构字典，结构示例：
+            {
+                "entities": [{"name": "A"}],
+                "concepts": [],
+                "claims": [],
+                "relations": [],
+                "topics": ["T1"]
+            }
+    """
     out = _wiki_empty_extract()
     if not isinstance(res, dict):
         return out
@@ -571,37 +666,40 @@ def _wiki_unwrap_extract(res) -> dict:
     return out
 
 
-# Matches strings the LLM should NEVER use as an entity / concept / claim name:
-#   - chunk tag scaffolding: C1, C2, c0001, …
-#   - bare hexadecimal hashes (xxh64 16-char, doc-id 32-char)
-#   - UUIDs with or without dashes
-# Anything matching is dropped post-extraction as defensive filtering.
 _WIKI_IDENTIFIER_LIKE_RE = re.compile(
     r"""^\s*(
-        [Cc]\d{1,5}                       # chunk tag like C1, c0001
-        | [0-9a-fA-F]{16}                 # xxh64 hexdigest
-        | [0-9a-fA-F]{32}                 # md5 / doc_id-shaped
-        | [0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}  # UUID
+        [Cc]\d{1,5}                       # 提示词分块脚手架标签，如 C1, c0001
+        | [0-9a-fA-F]{16}                 # xxh64 16 位哈希值
+        | [0-9a-fA-F]{32}                 # 32 位 MD5 或无连字符 UUID
+        | [0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}  # 标准 UUID
     )\s*$""",
     re.VERBOSE,
 )
 
 
 def _wiki_looks_like_identifier(s) -> bool:
-    """True when ``s`` looks like a chunk tag, hash, or UUID rather than a name."""
+    """判断字符串是否呈现分块标签（如 C1）、散列哈希值或 UUID 等系统标识符特征 —— 标识符检测工。
+
+    参数:
+        s: 待检测的名称字符串，示例："C1" 或 "量子力学"
+
+    返回值:
+        若属于机器标识符则返回 True，人类可读名称返回 False，示例：False
+    """
     if not isinstance(s, str):
         return False
     return bool(_WIKI_IDENTIFIER_LIKE_RE.match(s))
 
 
 def _wiki_item_has_identifier_name(key: str, item: dict) -> bool:
-    """Return True when an extracted item's display name is identifier-shaped.
+    """检查知识提取条目的关键展示名称是否误抓取了系统内部标识符 —— 伪条目过滤工。
 
-    Different list keys carry the name field under different keys:
-      - entities  → ``name``
-      - concepts  → ``term``
-      - claims    → ``subject``
-      - relations → ``from`` and ``to`` (drop if either is identifier-shaped)
+    参数:
+        key: 条目类别关键字，取值："entities"|"concepts"|"claims"|"relations"
+        item: 知识条目字典，结构示例：{"name": "C1", "type": "concept"}
+
+    返回值:
+        若条目名称为非法标识符返回 True，否则返回 False，示例：True
     """
     if key == "entities":
         return _wiki_looks_like_identifier(item.get("name", ""))
@@ -618,28 +716,29 @@ def _wiki_resolve_chunk_ids(
     extract: dict,
     label_to_id: dict[str, str],
 ) -> tuple[dict, dict[str, dict]]:
-    """Split a batch extract by source chunk id.
+    """将批次模型输出中的脚手架分块标签映射回真实的分块 ID，并按分块组织局部知识 —— 来源分块归属划分工。
 
-    Returns:
-        merged: the input extract with ``source_chunk_id`` rewritten to
-                ``chunk_ids=[real_id]`` per item, dropping items whose label
-                does not match any in ``label_to_id``.
-        per_chunk: {real_chunk_id: extract-shaped dict containing only the
-                   items attributed to that chunk}. Includes empty extracts
-                   for every label in ``label_to_id`` so resume knows the
-                   chunk was processed even when nothing was extracted.
+    参数:
+        extract: 当前批次解包后的提取结果，结构示例：{"entities": [{"name": "A", "source_chunk_id": "C1"}]}
+        label_to_id: 标签到真实分块 ID 的映射字典，结构示例：{"C1": "chunk_uuid_01"}
+
+    返回值:
+        二元组 (合并后的总提取字典, 分块 ID 到对应局部提取结果的映射字典)，结构示例：
+            (
+                {"entities": [{"name": "A", "chunk_ids": ["chunk_uuid_01"]}]},
+                {"chunk_uuid_01": {"entities": [{"name": "A", "chunk_ids": ["chunk_uuid_01"]}]}}
+            )
     """
     per_chunk: dict[str, dict] = {real_id: _wiki_empty_extract() for real_id in label_to_id.values()}
     merged = _wiki_empty_extract()
     merged["topics"] = list(extract.get("topics") or [])
-    # MAP topics are batch-level strings and carry no source_chunk_id.  Store
-    # them with every chunk version in the batch so a later cache hit or state
-    # reload preserves the same topic pool; downstream deduplicates them.
+    # 步骤一：为每个分块复制主题列表
     for chunk_extract in per_chunk.values():
         chunk_extract["topics"] = list(merged["topics"])
 
     dropped = 0
     dropped_identifier = 0
+    # 步骤二：遍历四类知识条目，校验真实分块并剔除脚手架误报
     for key in _EXTRACT_LIST_KEYS:
         for item in extract.get(key) or []:
             label = item.get("source_chunk_id")
@@ -647,10 +746,6 @@ def _wiki_resolve_chunk_ids(
             if real is None:
                 dropped += 1
                 continue
-            # Drop items whose display name is identifier-shaped — the LLM
-            # occasionally grabs prompt scaffolding (C1, C2, …) or leftover
-            # hash tokens and reports them as entities/concepts/claims. The
-            # prompt forbids this but post-filtering is the bulletproof guard.
             if _wiki_item_has_identifier_name(key, item):
                 dropped_identifier += 1
                 continue
@@ -671,8 +766,14 @@ def _wiki_resolve_chunk_ids(
 
 
 def _wiki_merge_extracts(extracts: list[dict]) -> dict:
-    """Concat the 5 lists across multiple batch extracts (no entity-level
-    dedup — that is the REDUCE phase's job)."""
+    """将多个批次的提取结果字典进行列表级联并去重主题 —— 抽取结果级联汇总工。
+
+    参数:
+        extracts: 提取结果字典列表，结构示例：[{"entities": [...], "topics": ["T1"]}, {"entities": [...], "topics": ["T2"]}]
+
+    返回值:
+        级联汇总后的单知识结构字典，结构示例：{"entities": [...], "topics": ["T1", "T2"]}
+    """
     out = _wiki_empty_extract()
     seen_topics: set[str] = set()
     for ex in extracts:
@@ -693,22 +794,29 @@ def _wiki_build_resume_doc(
     per_chunk_extract: dict,
     chunk_hash: str = "",
 ) -> dict:
-    """Build the non-searchable ES doc that records a per-chunk MAP extract.
+    """构建用于存储单个分块映射抽取结果的搜索引擎不可检索断点行 —— 断点缓存行构建工。
 
-    Intentionally omits ``q_<dim>_vec`` / ``content_ltks`` / ``content_sm_ltks``
-    so retrievers cannot surface this row; also sets ``available_int=0`` which
-    most ragflow retrievers already filter on.
+    参数:
+        chunk_id: 来源分块 ID，示例："chunk_101"
+        doc_id: 文档 ID，示例："doc_01"
+        per_chunk_extract: 该分块对应的提取结果字典，结构示例：{"entities": [...], "concepts": [...]}
+        chunk_hash: 分块当前内容的哈希指纹，示例："3f2a1b4c5d6e7f80"
 
-    ``chunk_hash`` fingerprints the chunk's content as of extraction time.
-    The incremental MAP re-run reads it back and compares against the
-    current chunk's hash to decide whether to re-extract.
+    返回值:
+        可直接写入搜索引擎的行字典，结构示例：
+            {
+                "id": "xxh64_hash",
+                "doc_id": "doc_01",
+                "compile_kwd": "wiki_map_extract",
+                "source_chunk_ids": ["chunk_101"],
+                "chunk_hash_kwd": "3f2a1b4c5d6e7f80",
+                "content_with_weight": "{\"entities\": [...]}",
+                "available_int": 0
+            }
     """
     content_with_weight = json.dumps(per_chunk_extract, ensure_ascii=False)
     doc_id_str = str(doc_id)
     return {
-        # A MAP row is an immutable cache version.  Keeping the hash in the
-        # identity lets A -> B -> A reuse the first extraction instead of
-        # replacing it when B is compiled.
         "id": _stable_row_id(WIKI_MAP_COMPILE_KWD, doc_id_str, chunk_id, chunk_hash),
         "doc_id": doc_id_str,
         "compile_kwd": WIKI_MAP_COMPILE_KWD,
@@ -725,7 +833,28 @@ async def _wiki_load_map_versions(
     kb_id: str,
     requested_versions: Optional[dict[str, str]] = None,
 ) -> dict[str, dict[str, dict]]:
-    """Load historical MAP versions as ``chunk_id -> hash -> extract``."""
+    """从存储层批量加载指定文档和分块历史映射提取结果缓存 —— 映射历史版本检索工。
+
+    参数:
+        doc_ids: 待检索的文档 ID 或集合，示例："doc_01" 或 {"doc_01", "doc_02"}
+        tenant_id: 租户 ID，示例："tenant_01"
+        kb_id: 知识库 ID，示例："kb_001"
+        requested_versions: 可选的期望加载版本字典（分块 ID 到哈希的映射），结构示例：{"chunk_101": "3f2a1b4c5d6e7f80"}
+
+    返回值:
+        嵌套字典形式的历史版本结果（分块 ID -> 分块哈希 -> 提取结果字典），结构示例：
+            {
+                "chunk_101": {
+                    "3f2a1b4c5d6e7f80": {
+                        "entities": [{"name": "量子计算机"}],
+                        "concepts": [],
+                        "claims": [],
+                        "relations": [],
+                        "topics": ["物理学"]
+                    }
+                }
+            }
+    """
     from common import settings
     from common.doc_store.doc_store_base import OrderByExpr
     from rag.nlp import search as _rag_search
@@ -743,6 +872,8 @@ async def _wiki_load_map_versions(
         condition["source_chunk_ids"] = sorted(requested_chunk_ids)
     if requested_hashes:
         condition["chunk_hash_kwd"] = sorted(requested_hashes)
+
+    # 步骤一：分页循环检索匹配的断点缓存行
     while True:
         try:
             res = await thread_pool_exec(
@@ -761,6 +892,8 @@ async def _wiki_load_map_versions(
         except Exception:
             logging.exception("wiki_map: failed to load historical versions for docs %s", sorted(normalized_doc_ids))
             return versions
+
+        # 步骤二：解析反序列化提取结果并挂载到多级版本字典
         for row in field_map.values():
             chunk_ids = _wiki_doc_ids(row.get("source_chunk_ids"))
             chunk_hash = row.get("chunk_hash_kwd")
@@ -793,12 +926,17 @@ async def _wiki_persist_extracts(
     kb_id: str,
     chunk_hashes: Optional[dict[str, str]] = None,
 ) -> None:
-    """Write one non-searchable ES doc per source chunk_id.
+    """将各分块的映射抽取提取结果以不可检索断点记录持久化至知识库存储中 —— 分块断点持久化工。
 
-    ``chunk_hashes`` (``{chunk_id → chunk_hash}``) is stamped onto each
-    row so the next incremental run can decide whether to re-MAP.
-    Missing entries default to '' (treated as "definitely re-MAP" by the
-    resume-map comparator).
+    参数:
+        per_chunk: 各分块提取结果字典（分块 ID -> 提取字典），结构示例：{"chunk_1": {"entities": [...]}}
+        doc_id: 归属文档 ID，示例："doc_01"
+        tenant_id: 租户 ID，示例："tenant_01"
+        kb_id: 知识库 ID，示例："kb_001"
+        chunk_hashes: 分块 ID 到对应内容哈希指纹的字典映射，结构示例：{"chunk_1": "3f2a1b4c5d6e7f80"}
+
+    返回值:
+        无返回值（None）。
     """
     if not per_chunk:
         return
@@ -830,7 +968,22 @@ async def _wiki_scan_current_chunk_state(
     kb_id: str,
     doc_ids: set[str],
 ) -> dict[str, dict]:
-    """Scan enabled source chunks and return their current MAP input hashes."""
+    """全量扫描当前知识库指定文档的有效来源分块及其内容哈希 —— 知识库分块状态扫描工。
+
+    参数:
+        tenant_id: 租户 ID，示例："tenant_01"
+        kb_id: 知识库 ID，示例："kb_001"
+        doc_ids: 待扫描的文档 ID 集合，结构示例：{"doc_01", "doc_02"}
+
+    返回值:
+        分块当前状态字典（分块 ID -> 元信息字典），结构示例：
+            {
+                "chunk_101": {
+                    "doc_id": "doc_01",
+                    "hash": "3f2a1b4c5d6e7f80"
+                }
+            }
+    """
     if not doc_ids:
         return {}
     from common import settings
@@ -876,7 +1029,21 @@ async def _wiki_load_active_map_state(
     tenant_id: str,
     kb_id: str,
 ) -> dict[str, dict]:
-    """Load the chunk versions used by the last successful Wiki build."""
+    """读取上次构建生效并提交的分块版本状态快照 —— 活跃分块快照读取工。
+
+    参数:
+        tenant_id: 租户 ID，示例："tenant_01"
+        kb_id: 知识库 ID，示例："kb_001"
+
+    返回值:
+        已生效分块状态映射字典（分块 ID -> 元信息字典），结构示例：
+            {
+                "chunk_101": {
+                    "doc_id": "doc_01",
+                    "hash": "3f2a1b4c5d6e7f80"
+                }
+            }
+    """
     from common import settings
     from common.doc_store.doc_store_base import OrderByExpr
     from rag.nlp import search as _rag_search
@@ -916,6 +1083,15 @@ async def _wiki_load_active_map_state(
 
 
 async def _wiki_load_active_map_generation(tenant_id: str, kb_id: str) -> str:
+    """读取知识库当前已提交生效的映射状态代际标识符 —— 状态代际标识读取工。
+
+    参数:
+        tenant_id: 租户 ID，示例："tenant_01"
+        kb_id: 知识库 ID，示例："kb_001"
+
+    返回值:
+        当前活跃代际的唯一标识字符串，若未提交过返回空串，示例："a1b2c3d4e5f67890"
+    """
     from common import settings
     from common.doc_store.doc_store_base import OrderByExpr
     from rag.nlp import search as _rag_search
@@ -949,7 +1125,28 @@ async def _wiki_load_map_extracts_for_state(
     state: dict[str, dict],
     chunk_ids: Optional[set[str]] = None,
 ) -> list[dict]:
-    """Load only MAP versions selected by a source-state snapshot."""
+    """根据给定的分块状态快照定向加载对应的映射提取结果列表 —— 状态提取结果加载工。
+
+    参数:
+        tenant_id: 租户 ID，示例："tenant_01"
+        kb_id: 知识库 ID，示例："kb_001"
+        state: 分块状态字典，结构示例：{"chunk_1": {"doc_id": "doc_01", "hash": "h_01"}}
+        chunk_ids: 可选的仅加载子集过滤集合，结构示例：{"chunk_1"}
+
+    返回值:
+        提取结果字典列表（每项包含 doc_id 及 _map_version 版本元数据），结构示例：
+            [
+                {
+                    "doc_id": "doc_01",
+                    "_map_version": {"chunk_id": "chunk_1", "hash": "h_01"},
+                    "entities": [{"name": "量子力学"}],
+                    "concepts": [],
+                    "claims": [],
+                    "relations": [],
+                    "topics": ["物理学"]
+                }
+            ]
+    """
     selected_ids = set(state)
     if chunk_ids is not None:
         selected_ids &= set(chunk_ids)
@@ -986,7 +1183,16 @@ async def _wiki_commit_active_map_state(
     kb_id: str,
     state: dict[str, dict],
 ) -> None:
-    """Commit the source snapshot only after Wiki compilation succeeds."""
+    """在维基知识编译成功后原子提交并持久化当前分块状态快照 —— 活跃状态快照提交工。
+
+    参数:
+        tenant_id: 租户 ID，示例："tenant_01"
+        kb_id: 知识库 ID，示例："kb_001"
+        state: 待提交的分块状态字典，结构示例：{"chunk_1": {"doc_id": "doc_01", "hash": "h_01"}}
+
+    返回值:
+        无返回值（None）。
+    """
     from common import settings
     from rag.nlp import search as _rag_search
 
@@ -999,6 +1205,7 @@ async def _wiki_commit_active_map_state(
 
     generation = uuid.uuid4().hex
     rows = []
+    # 步骤一：封装新一代代际分块快照行
     for chunk_id, item in state.items():
         doc_id = str(item.get("doc_id") or "")
         chunk_hash = str(item.get("hash") or "")
@@ -1016,13 +1223,12 @@ async def _wiki_commit_active_map_state(
                 "available_int": 0,
             }
         )
-    # State rows use generation-qualified IDs so an interrupted write cannot
-    # overwrite the active snapshot. The single marker is switched only after
-    # every row in the new generation has been persisted.
     for row in rows:
         row["id"] = _stable_row_id(WIKI_MAP_STATE_COMPILE_KWD, generation, row["doc_id"], row["source_chunk_ids"][0])
     if rows:
         await thread_pool_exec(settings.docStoreConn.insert, rows, index, kb_id)
+
+    # 步骤二：原子切换写入元数据标记行，使新一代快照生效
     marker = {
         "id": _stable_row_id(WIKI_MAP_STATE_META_COMPILE_KWD, kb_id),
         "doc_id": "",
@@ -1034,6 +1240,8 @@ async def _wiki_commit_active_map_state(
         "available_int": 0,
     }
     await thread_pool_exec(settings.docStoreConn.insert, [marker], index, kb_id)
+
+    # 步骤三：清理上一代已失效的历史状态行
     if previous_generation and previous_generation != generation:
         try:
             await thread_pool_exec(
@@ -1050,9 +1258,7 @@ async def _wiki_commit_active_map_state(
             )
 
 
-# ---------------------------------------------------------------------------
-# Per-batch extraction
-# ---------------------------------------------------------------------------
+# ── 单批次抽取 ─────────────────────────────────────────────────────────────
 
 
 async def _wiki_extract_one_batch(
@@ -1063,14 +1269,26 @@ async def _wiki_extract_one_batch(
     llm_timeout: int,
     parser_config: Optional[dict] = None,
 ) -> Optional[dict]:
-    """Single LLM call for one packed batch. Returns the raw (label-tagged)
-    extract dict, or ``None`` on a transient LLM timeout/error so the caller
-    can avoid persisting a poisoned empty result.
+    """对单个打包的分块批次执行大语言模型知识提取推理调用 —— 单批次知识提取工。
 
-    The entity / relation schemas and the extra rules sections of the
-    prompt are rendered from ``parser_config`` when supplied (mirroring
-    ``compile_structure_from_text``); when omitted, the built-in defaults
-    are used."""
+    参数:
+        packed: 当前批次包含的分块结构列表，结构示例：[{"label": "C1", "chunk_id": "c1", "text": "正文..."}]
+        doc_id: 来源文档 ID，示例："doc_101"
+        chat_mdl: 大语言模型 Bundle，示例：LLMBundle(model_type="chat")
+        language: 本地化语言代码，示例："zh"
+        llm_timeout: 超时秒数，示例：600
+        parser_config: 编译模板配置字典（可选），结构示例：{"entity": {...}}
+
+    返回值:
+        解析出的五元知识字典，发生异常/超时返回 None，结构示例：
+            {
+                "entities": [{"name": "实体名", "type": "other"}],
+                "concepts": [],
+                "claims": [],
+                "relations": [],
+                "topics": []
+            }
+    """
     body, labels = _wiki_format_batch_prompt(packed)
     user_prompt = _wiki_build_user_prompt(
         parser_config=parser_config,
@@ -1097,7 +1315,7 @@ async def _wiki_extract_one_batch(
     except Exception:
         logging.exception("wiki_map: batch extraction failed (%d chunks)", len(packed))
         return None
-    _ = language  # reserved for future localization
+    _ = language
     return _wiki_unwrap_extract(res)
 
 
@@ -1116,240 +1334,22 @@ async def _wiki_process_batch(
     parser_config: Optional[dict] = None,
     chunk_hashes: Optional[dict[str, str]] = None,
 ) -> dict:
-    """Run one batch end-to-end: LLM extract → split by source_chunk_id →
-    persist resume docs → return the merged batch extract.
+    """端到端执行单个分块批次：大模型知识提取、分块归属拆分、断点持久化与进度通知 —— 批次知识处理流水工。
 
-    ``chunk_hashes`` is the ``{chunk_id → chunk_hash}`` map captured at
-    the top of ``wiki_map_from_chunks``; threaded through so the
-    persisted resume rows record the right hash and the next
-    incremental run can compare cleanly.
-
-    On a transient LLM failure/timeout (``_wiki_extract_one_batch`` returns
-    ``None``) the batch is NOT persisted with a resume hash. The next
-    incremental run then sees those chunks as ``new`` and retries, instead of
-    replaying a permanently cached empty extract. Only a genuine LLM response
-    (even one with zero items) is persisted.
-    """
-    if not packed:
-        return _wiki_empty_extract()
-
-    label_to_id = {entry["label"]: entry["chunk_id"] for entry in packed}
-
-    async def _run() -> dict:
-        raw_extract = await _wiki_extract_one_batch(
-            packed,
-            doc_id,
-            chat_mdl,
-            language,
-            llm_timeout,
-            parser_config=parser_config,
-        )
-        if raw_extract is None:
-            # LLM call failed/timed out: leave no resume hash so the next run
-            # re-extracts these chunks instead of locking in an empty result.
-            return _wiki_empty_extract()
-        merged, per_chunk = _wiki_resolve_chunk_ids(raw_extract, label_to_id)
-        await _wiki_persist_extracts(
-            per_chunk,
-            doc_id,
-            tenant_id,
-            kb_id,
-            chunk_hashes=chunk_hashes,
-        )
-        if callback:
-            try:
-                n_items = sum(len(merged.get(k) or []) for k in _EXTRACT_LIST_KEYS)
-                callback(
-                    (batch_idx + 1) / max(1, total_batches),
-                    f"Wiki MAP {batch_idx + 1}/{total_batches}: {n_items} items from {len(packed)} chunks",
-                )
-            except Exception:
-                logging.debug("wiki_map: progress callback failed", exc_info=True)
-        return merged
-
-    if semaphore is not None:
-        async with semaphore:
-            return await _run()
-    return await _run()
-
-
-# ---------------------------------------------------------------------------
-# Public entry
-# ---------------------------------------------------------------------------
-
-
-async def wiki_map_from_chunks(
-    chunks: list[dict],
-    chat_mdl,
-    embd_mdl,
-    doc_id: str,
-    tenant_id: str,
-    kb_id: str,
-    language: str = "en",
-    max_workers: int = DEFAULT_WIKI_MAP_WORKERS,
-    llm_timeout: int = DEFAULT_WIKI_MAP_TIMEOUT,
-    callback: Optional[Callable] = None,
-    parser_config: Optional[dict] = None,
-    batch_size_cap: Optional[int] = None,
-    window_fraction: Optional[float] = None,
-    target_chunk_ids: Optional[set[str]] = None,
-) -> dict:
-    """Phase 1 (MAP) of the artifact compilation pipeline.
-
-    Packs the provided RAGFlow chunks into batches via ``split_chunks``, runs
-    one ``gen_json`` extraction call per batch in parallel (bounded by
-    ``max_workers``), then splits each batch's output back to per-chunk
-    extracts and persists them to ES as non-searchable ``wiki_map_extract``
-    rows so subsequent runs can skip chunks already processed.
-
-    Args:
-        chunks: list of dicts; each must expose ``id`` and ``text`` (with
-            ``content_with_weight`` / ``content`` accepted as fallbacks).
-        chat_mdl: LLMBundle for chat (used via ``gen_json``).
-        embd_mdl: LLMBundle for embeddings — accepted for downstream symmetry
-            with REDUCE/REFINE but **not used in MAP itself**.
-        doc_id: source document id; stamped onto every resume doc and on every
-            extracted item via ``chunk_ids``.
-        tenant_id, kb_id: address the doc-store index for resume reads + writes.
-        language: reserved for future prompt localization.
-        max_workers: maximum concurrent batches. Defaults to 20, matching the
-            task-scoped Wiki LLM pool used by the task executor.
-        llm_timeout: seconds per batch extraction call.
-        callback: optional ``(progress: float, msg: str)`` progress callback.
-        parser_config: optional YAML-style config (same shape that
-            ``compile_structure_from_text`` accepts).
-            ``source_chunk_id`` field is always appended so chunk
-            attribution survives regardless of the user's schema. When
-            omitted, the built-in default artifact schema is used.
-
-    Returns:
-        ``{"entities", "concepts", "claims", "relations", "topics"}`` where
-        every item (except ``topics`` strings) carries a
-        ``chunk_ids=[<source chunk id>]`` field. No entity-level dedup is
-        performed here — that is the REDUCE phase's responsibility.
-    """
-    _ = embd_mdl  # noqa: F841 — accepted for symmetry with downstream phases
-    if not chunks:
-        out = _wiki_empty_extract()
-        out["_meta"] = {
-            "doc_id": str(doc_id),
-            "requested": 0,
-            "cache_hits": 0,
-            "extracted": 0,
-        }
-        return out
-
-    current_chunk_hashes: dict[str, str] = {}
-    for chunk in chunks:
-        cid = chunk.get("id") or chunk.get("chunk_id")
-        if not isinstance(cid, str) or not cid:
-            continue
-        text = _wiki_pick_chunk_text(chunk) or ""
-        current_chunk_hashes[cid] = _chunk_hash(text)
-
-    requested_ids = set(current_chunk_hashes)
-    if target_chunk_ids is not None:
-        requested_ids &= set(target_chunk_ids)
-
-    requested_versions = {chunk_id: current_chunk_hashes[chunk_id] for chunk_id in requested_ids}
-    historical_versions = await _wiki_load_map_versions(doc_id, tenant_id, kb_id, requested_versions)
-    cache_hits: list[dict] = []
-    cache_hit_ids: set[str] = set()
-    for chunk_id in requested_ids:
-        extract = historical_versions.get(chunk_id, {}).get(current_chunk_hashes[chunk_id])
-        if extract is not None:
-            cache_hit_ids.add(chunk_id)
-            cache_hits.append(extract)
-
-    extract_ids = requested_ids - cache_hit_ids
-    # Skip chunks outside this run's delta as well as historical cache hits.
-    resume_set = set(current_chunk_hashes) - extract_ids
-
-    # Defensive scrub: chunkers sometimes embed the chunk_id / doc_id into
-    # the body (e.g. as a header). Without this the extraction LLM tends to
-    # grab the hash as an "entity" — see _wiki_scrub_known_ids.
-    all_known_ids: list[str] = []
-    for chunk in chunks:
-        cid = chunk.get("id") or chunk.get("chunk_id")
-        if isinstance(cid, str) and cid:
-            all_known_ids.append(cid)
-    if doc_id:
-        all_known_ids.append(str(doc_id))
-
-    prompt_overhead = num_tokens_from_string(WIKI_MAP_SYSTEM + WIKI_MAP_USER_TEMPLATE)
-    packed_batches, _info = _build_chunk_batches(
-        chunks,
-        chat_mdl,
-        prompt_overhead_tokens=prompt_overhead,
-        resume_chunk_ids=resume_set,
-        scrub_text=lambda t: _wiki_scrub_known_ids(t, all_known_ids),
-        chunk_text_picker=_wiki_pick_chunk_text,
-        batch_size_cap=batch_size_cap,
-        window_fraction=window_fraction,
-    )
-    cached_merged = _wiki_merge_extracts(cache_hits)
-    if not packed_batches:
-        cached_merged["_meta"] = {
-            "doc_id": str(doc_id),
-            "requested": len(requested_ids),
-            "cache_hits": len(cache_hit_ids),
-            "extracted": 0,
-        }
-        return cached_merged
-
-    async def _process_one(batch: list[dict], bi: int, total: int) -> dict:
-        # ``_run_chunked_pipeline`` already wraps each task in the engine's
-        # semaphore, so pass ``semaphore=None`` here to avoid nesting.
-        return await _wiki_process_batch(
-            packed=batch,
-            batch_idx=bi,
-            total_batches=total,
-            doc_id=doc_id,
-            tenant_id=tenant_id,
-            kb_id=kb_id,
-            chat_mdl=chat_mdl,
-            language=language,
-            llm_timeout=llm_timeout,
-            semaphore=None,
-            callback=callback,
-            parser_config=parser_config,
-            chunk_hashes=current_chunk_hashes,
-        )
-
-    extracted = await _run_chunked_pipeline(
-        packed_batches,
-        process_batch=_process_one,
-        aggregate=_wiki_merge_extracts,
-        max_workers=max_workers,
-        callback=callback,
-        log_prefix="wiki_map",
-    )
-    merged = _wiki_merge_extracts([cached_merged, extracted])
-    logging.info(
-        "wiki_map: doc %s — requested=%d cache_hits=%d extracted=%d entities=%d concepts=%d claims=%d relations=%d topics=%d",
-        doc_id,
-        len(requested_ids),
-        len(cache_hit_ids),
-        len(extract_ids),
-        len(merged["entities"]),
-        len(merged["concepts"]),
-        len(merged["claims"]),
-        len(merged["relations"]),
-        len(merged["topics"]),
-    )
-    merged["_meta"] = {
-        "doc_id": str(doc_id),
-        "requested": len(requested_ids),
-        "cache_hits": len(cache_hit_ids),
-        "extracted": len(extract_ids),
-    }
-    return merged
-
-
-# ---------------------------------------------------------------------------
-# REDUCE phase (KB-scoped)
-# ---------------------------------------------------------------------------
-#
+    参数:
+        packed: 当前批次包含的分块字典列表，结构示例：[{"label": "C1", "chunk_id": "c1", "text": "..."}]
+        batch_idx: 当前批次索引号（从 0 开始），示例：0
+        total_batches: 总批次数量，示例：10
+        doc_id: 来源文档 ID，示例："doc_101"
+        tenant_id: 租户 ID，示例："tenant_01"
+        kb_id: 知识库 ID，示例："kb_001"
+        chat_mdl: 大语言模型 Bundle，示例：LLMBundle(model_type="chat")
+        language: 本地化语言代码，示例："zh"
+        llm_timeout: 单次调用超时秒数，示例：600
+        semaphore: 并发控制信号量（可选），示例：asyncio.Semaphore(20)
+        callback: 进度回调函数（可选），示例：lambda prog, msg: print(prog, msg)
+        parser_config: 编译模板配置字典（可选），结构示例：{"entity": {...}}
+        chunk_hashes: 分块 ID �# ── REDUCE 阶段（知识库范围全局归约去重） ─────────────────────────────────────
 
 WIKI_REDUCE_COMPILE_KWD = "wiki_reduce_result"
 DEFAULT_WIKI_REDUCE_MERGE_THRESHOLD = 0.95
@@ -1357,22 +1357,28 @@ DEFAULT_WIKI_REDUCE_AMBIGUOUS_LOW = 0.75
 DEFAULT_WIKI_REDUCE_AMBIGUOUS_BATCH = 50
 DEFAULT_WIKI_REDUCE_TIMEOUT = 60
 
-
-# System prompt for the LLM disambiguation batch. The shared engine
-# (``_common.bulk_dedup_items``) defaults to the same wording via
-# ``_common.DEFAULT_DISAMBIGUATE_SYSTEM``; we keep the local alias so the
-# constant name stays usable by call sites and external imports.
 WIKI_REDUCE_DISAMBIGUATE_SYSTEM = "You are a named-entity resolution assistant. Return only JSON."
 
 
-# --- ES I/O ----------------------------------------------------------------
+# ── 存储层 I/O 操作 ───────────────────────────────────────────────────────
 
 
 async def _wiki_load_all_map_extracts(tenant_id: str, kb_id: str) -> dict:
-    """Aggregate every wiki_map_extract row in this KB into one merged dict.
+    """从存储层分页扫描并合并聚合指定知识库下所有有效分块的映射抽取提取结果 —— 全库分块提取聚合工。
 
-    Pages through ES if the KB has more than the per-call cap. Returns a dict
-    in the same shape as wiki_map_from_chunks' return value.
+    参数:
+        tenant_id: 租户 ID，示例："tenant_01"
+        kb_id: 知识库 ID，示例："kb_001"
+
+    返回值:
+        知识库全量未去重五元知识字典，结构示例：
+            {
+                "entities": [{"name": "量子计算机", "chunk_ids": ["c1"]}],
+                "concepts": [{"term": "叠加态", "chunk_ids": ["c1"]}],
+                "claims": [{"statement": "量子比特可处于叠加态", "subject": "量子比特"}],
+                "relations": [{"from": "量子计算机", "to": "量子比特", "type": "uses"}],
+                "topics": ["量子物理"]
+            }
     """
     from common import settings
     from common.doc_store.doc_store_base import OrderByExpr
@@ -1388,6 +1394,7 @@ async def _wiki_load_all_map_extracts(tenant_id: str, kb_id: str) -> dict:
     merged = _wiki_empty_extract()
     seen_topics: set[str] = set()
 
+    # 步骤一：分页循环检索全库所有的 wiki_map_extract 记录行
     while True:
         try:
             res = await thread_pool_exec(
@@ -1410,6 +1417,7 @@ async def _wiki_load_all_map_extracts(tenant_id: str, kb_id: str) -> dict:
         if not field_map:
             break
 
+        # 步骤二：跳过已禁用文档，反序列化并合并五元知识条目
         for row in field_map.values():
             if _wiki_doc_ids(row.get("doc_id")) & disabled_doc_ids:
                 continue
@@ -1442,12 +1450,14 @@ async def _wiki_load_all_map_extracts(tenant_id: str, kb_id: str) -> dict:
 
 
 async def _wiki_all_map_doc_ids(tenant_id: str, kb_id: str) -> list[str]:
-    """Distinct ``doc_id`` across every ``wiki_map_extract`` row in this KB.
+    """扫描并收集知识库下所有参与维基映射抽取的非禁用来源文档 ID 列表 —— 知识库文档标识收集工。
 
-    These are the documents that fed the current compilation. Stamped onto
-    the KB-wide aggregate rows (REDUCE / PLAN) as ``source_doc_ids`` so a
-    document delete can reference-count them — the aggregate is dropped only
-    once its last contributing document is gone.
+    参数:
+        tenant_id: 租户 ID，示例："tenant_01"
+        kb_id: 知识库 ID，示例："kb_001"
+
+    返回值:
+        去重后的文档 ID 列表，结构示例：["doc_101", "doc_102"]
     """
     from common import settings
     from common.doc_store.doc_store_base import OrderByExpr
@@ -1494,23 +1504,14 @@ async def _wiki_all_map_doc_ids(tenant_id: str, kb_id: str) -> list[str]:
 
 
 async def _wiki_compute_map_input_hash(tenant_id: str, kb_id: str) -> str:
-    """xxh64 fingerprint of the **current** ``wiki_map_extract`` rows for
-    this KB — used by REDUCE / PLAN to cache-bust when MAP changed.
+    """计算知识库下当前所有映射抽取分块版本集合的全局 xxHash64 聚合指纹 —— 映射输入全局哈希指纹计算工。
 
-    Built from ``sorted((chunk_id, chunk_hash))`` so:
-      * adding a new chunk → new pair appears → hash flips.
-      * editing a chunk → MAP row deleted + re-inserted with new hash → flips.
-      * deleting a chunk → MAP row gone → its pair drops → flips.
-      * everything stable → identical hash.
+    参数:
+        tenant_id: 租户 ID，示例："tenant_01"
+        kb_id: 知识库 ID，示例："kb_001"
 
-    Empty / missing ``chunk_hash_kwd`` (legacy rows) defaults to '' so a
-    legacy KB still produces a stable hash; once those rows are touched
-    by an incremental MAP run, the hash naturally upgrades.
-
-    Pages through ES in windows of ``PAGE_SIZE`` rows — single-shot
-    "give me everything" reads hit doc-store limits on KBs with many
-    chunks. The accumulated ``pairs`` are sorted once at the end so the
-    fingerprint is independent of page order.
+    返回值:
+        16 位十六进制聚合哈希字符串（若发生异常返回空串），示例："7c8d9e0f1a2b3c4d"
     """
     from common import settings
     from common.doc_store.doc_store_base import OrderByExpr
@@ -1524,6 +1525,7 @@ async def _wiki_compute_map_input_hash(tenant_id: str, kb_id: str) -> str:
     PAGE_SIZE = 128
     offset = 0
     pairs: list[tuple[str, str]] = []
+    # 步骤一：分页收集所有有效分块的 (chunk_id, chunk_hash) 二元组
     while True:
         try:
             res = await thread_pool_exec(
@@ -1545,9 +1547,6 @@ async def _wiki_compute_map_input_hash(tenant_id: str, kb_id: str) -> str:
                 kb_id,
                 offset,
             )
-            # Partial scan → cannot trust the resulting hash; return ""
-            # so REDUCE / PLAN fall through to a full re-run rather than
-            # cache-hitting against an incomplete fingerprint.
             return ""
         if not field_map:
             break
@@ -1566,6 +1565,7 @@ async def _wiki_compute_map_input_hash(tenant_id: str, kb_id: str) -> str:
             break
         offset += PAGE_SIZE
 
+    # 步骤二：排序所有二元组并结合管线版本号计算最终哈希指纹
     pairs.sort()
     body = "|".join(f"{cid}:{hh}" for cid, hh in pairs) + "|" + _WIKI_PIPELINE_REV
     return _xxhash.xxh64(body.encode("utf-8", "surrogatepass")).hexdigest()
@@ -1575,7 +1575,22 @@ async def _wiki_load_reduce_resume(
     tenant_id: str,
     kb_id: str,
 ) -> Optional[tuple[dict, str]]:
-    """Return ``(cached_result, stored_input_hash)`` or None."""
+    """从存储层读取该知识库已缓存的归约聚合结果与其输入指纹 —— 归约断点读取工。
+
+    参数:
+        tenant_id: 租户 ID，示例："tenant_01"
+        kb_id: 知识库 ID，示例："kb_001"
+
+    返回值:
+        二元组 (缓存的归约知识字典, 存储的输入哈希指纹) 或 None，结构示例：
+            (
+                {
+                    "entities": [{"name": "量子力学"}],
+                    "concepts": []
+                },
+                "7c8d9e0f1a2b3c4d"
+            )
+    """
     from common import settings
     from common.doc_store.doc_store_base import OrderByExpr
     from rag.nlp import search as _rag_search
@@ -1605,6 +1620,240 @@ async def _wiki_load_reduce_resume(
     row = next(iter(field_map.values()))
     content = row.get("content_with_weight")
     if not isinstance(content, str) or not content:
+        return None
+    try:
+        cached = json.loads(content)
+    except Exception:
+        logging.debug("wiki_reduce: cached result unparseable; ignoring")
+        return None
+    if not isinstance(cached, dict):
+        return None
+    stored_hash = row.get("input_hash_kwd")
+    if not isinstance(stored_hash, str):
+        stored_hash = ""
+    return cached, stored_hash
+
+
+async def _wiki_persist_reduce(
+    reduced: dict,
+    tenant_id: str,
+    kb_id: str,
+    input_hash: str = "",
+    source_doc_ids: Optional[list[str]] = None,
+) -> None:
+    """将知识库归约聚合去重后的全量知识持久化为单条不可检索断点记录 —— 归约结果持久化工。
+
+    参数:
+        reduced: 归约完成的规范化知识字典，结构示例：{"entities": [...], "concepts": [...]}
+        tenant_id: 租户 ID，示例："tenant_01"
+        kb_id: 知识库 ID，示例："kb_001"
+        input_hash: 当前归约所基于的输入哈希指纹，示例："7c8d9e0f1a2b3c4d"
+        source_doc_ids: 参与本次归约的来源文档 ID 列表，结构示例：["doc_101", "doc_102"]
+
+    返回值:
+        无返回值（None）。
+    """
+    from common import settings
+    from rag.nlp import search as _rag_search
+
+    index = _rag_search.index_name(tenant_id)
+    kb_id_str = str(kb_id)
+    content_with_weight = json.dumps(reduced, ensure_ascii=False)
+    row_id = _stable_row_id(WIKI_REDUCE_COMPILE_KWD, kb_id_str)
+    doc = {
+        "id": row_id,
+        "doc_id": kb_id_str,
+        "compile_kwd": WIKI_REDUCE_COMPILE_KWD,
+        "source_id": [kb_id_str],
+        "source_doc_ids": list(source_doc_ids or []),
+        "input_hash_kwd": input_hash,
+        "content_with_weight": content_with_weight,
+        "available_int": 0,
+    }
+    try:
+        try:
+            await thread_pool_exec(
+                settings.docStoreConn.delete,
+                {"compile_kwd": WIKI_REDUCE_COMPILE_KWD},
+                index,
+                kb_id,
+            )
+        except Exception:
+            logging.debug("wiki_reduce: prior result delete failed; will overwrite by id")
+        await thread_pool_exec(settings.docStoreConn.insert, [doc], index, kb_id)
+    except Exception:
+        logging.exception("wiki_reduce: failed to persist result row")
+
+
+# ── 公开入口函数 ─────────────────────────────────────────────────────────
+
+
+async def wiki_reduce_from_extracts(
+    chat_mdl,
+    embd_mdl,
+    tenant_id: str,
+    kb_id: str,
+    merge_threshold: float = DEFAULT_WIKI_REDUCE_MERGE_THRESHOLD,
+    ambiguous_low: float = DEFAULT_WIKI_REDUCE_AMBIGUOUS_LOW,
+    ambiguous_batch_size: int = DEFAULT_WIKI_REDUCE_AMBIGUOUS_BATCH,
+    llm_timeout: int = DEFAULT_WIKI_REDUCE_TIMEOUT,
+    force_rerun: bool = False,
+    callback: Optional[Callable] = None,
+) -> dict:
+    """在知识库范围内对所有分块提取出的实体、概念执行精确、向量余弦与大模型三阶段消歧去重并全局归约 —— 维基知识全局归约去重引擎。
+
+    参数:
+        chat_mdl: 大语言模型 Bundle，示例：LLMBundle(model_type="chat")
+        embd_mdl: 向量嵌入模型 Bundle，示例：LLMBundle(model_type="embedding")
+        tenant_id: 租户 ID，示例："tenant_01"
+        kb_id: 知识库 ID，示例："kb_001"
+        merge_threshold: 余弦相似度自动合并门限（默认 0.95），示例：0.95
+        ambiguous_low: 送入大模型裁决的模糊相似度下限（默认 0.75），示例：0.75
+        ambiguous_batch_size: 单批次大模型裁决的实体对数量（默认 50），示例：50
+        llm_timeout: 单批大模型裁决超时秒数（默认 60 秒），示例：60
+        force_rerun: 是否强制绕过缓存重新计算（默认 False），示例：False
+        callback: 进度通知回调（可选），示例：lambda prog, msg: print(prog, msg)
+
+    返回值:
+        全局消歧去重后的规范化知识总字典，结构示例：
+            {
+                "entities": [
+                    {
+                        "name": "量子力学",
+                        "type": "other",
+                        "aliases": ["量子物理"],
+                        "mention_count": 5,
+                        "chunk_ids": ["c1", "c2"]
+                    }
+                ],
+                "concepts": [
+                    {
+                        "term": "叠加态",
+                        "definition_excerpt": "微观系统同时处于多个可能状态的线性叠加",
+                        "mention_count": 3,
+                        "chunk_ids": ["c1"]
+                    }
+                ],
+                "claims": [{"statement": "...", "subject": "..."}],
+                "relations": [{"from": "A", "to": "B", "type": "uses"}],
+                "topics": ["物理学"]
+            }
+    """
+    # 步骤一：增量校验门禁 —— 比对输入全局哈希指纹，无变动直接复用缓存
+    current_input_hash = await _wiki_compute_map_input_hash(tenant_id, kb_id)
+    reduce_source_doc_ids = await _wiki_all_map_doc_ids(tenant_id, kb_id)
+    if not force_rerun:
+        cached_pair = await _wiki_load_reduce_resume(tenant_id, kb_id)
+        if cached_pair is not None:
+            cached, stored_hash = cached_pair
+            if stored_hash and stored_hash == current_input_hash:
+                if callback:
+                    try:
+                        callback(1.0, "wiki REDUCE: cache hit (input unchanged)")
+                    except Exception:
+                        pass
+                return cached
+
+    if callback:
+        try:
+            callback(0.05, "wiki REDUCE: loading MAP extracts")
+        except Exception:
+            pass
+
+    # 步骤二：全量加载知识库中所有文档的映射提取结果
+    raw = await _wiki_load_all_map_extracts(tenant_id, kb_id)
+    raw_entities = raw.get("entities") or []
+    raw_concepts = raw.get("concepts") or []
+    logging.info(
+        "wiki_reduce: kb=%s loaded raw entities=%d concepts=%d claims=%d relations=%d",
+        kb_id,
+        len(raw_entities),
+        len(raw_concepts),
+        len(raw.get("claims") or []),
+        len(raw.get("relations") or []),
+    )
+
+    if not raw_entities and not raw_concepts:
+        empty = _wiki_empty_extract()
+        await _wiki_persist_reduce(empty, tenant_id, kb_id, input_hash=current_input_hash, source_doc_ids=reduce_source_doc_ids)
+        return empty
+
+    if callback:
+        try:
+            callback(0.25, "wiki REDUCE: dedup (exact + embedding + LLM)")
+        except Exception:
+            pass
+
+    # 步骤三：实体三阶段消歧去重（精确名去重 + 向量特征聚类 + 模糊对大模型成批裁决）
+    canonical_entities = await _bulk_dedup_items(
+        raw_entities,
+        name_key="name",
+        type_key="type",
+        chat_mdl=chat_mdl,
+        embd_mdl=embd_mdl,
+        merge_threshold=merge_threshold,
+        ambiguous_low=ambiguous_low,
+        ambiguous_batch_size=ambiguous_batch_size,
+        disambiguate_system_prompt=WIKI_REDUCE_DISAMBIGUATE_SYSTEM,
+        llm_timeout=llm_timeout,
+    )
+
+    # 步骤四：概念名称精确去重并保留最详尽的定义摘录
+    def _concept_extras(group: list[dict]) -> dict:
+        best_def = max(
+            ((c.get("definition_excerpt") or "") for c in group if isinstance(c, dict)),
+            key=lambda s: len(s) if isinstance(s, str) else 0,
+            default="",
+        )
+        return {"definition_excerpt": best_def}
+
+    canonical_concepts = await _bulk_dedup_items(
+        raw_concepts,
+        name_key="term",
+        type_key=None,
+        aggregate_extra=_concept_extras,
+    )
+
+    logging.info(
+        "wiki_reduce: after dedup entities=%d concepts=%d",
+        len(canonical_entities),
+        len(canonical_concepts),
+    )
+
+    reduced = {
+        "entities": canonical_entities,
+        "concepts": canonical_concepts,
+        "claims": list(raw.get("claims") or []),
+        "relations": list(raw.get("relations") or []),
+        "topics": list(raw.get("topics") or []),
+    }
+
+    # 步骤五：持久化归约结果并上报完成进度
+    if callback:
+        try:
+            callback(0.9, "wiki REDUCE: persisting result")
+        except Exception:
+            pass
+    await _wiki_persist_reduce(reduced, tenant_id, kb_id, input_hash=current_input_hash, source_doc_ids=reduce_source_doc_ids)
+
+    logging.info(
+        "wiki_reduce: kb=%s done — entities=%d concepts=%d claims=%d relations=%d topics=%d",
+        kb_id,
+        len(reduced["entities"]),
+        len(reduced["concepts"]),
+        len(reduced["claims"]),
+        len(reduced["relations"]),
+        len(reduced["topics"]),
+    )
+
+    if callback:
+        try:
+            callback(1.0, "wiki REDUCE: done")
+        except Exception:
+            pass
+
+    return reduced
+ce(content, str) or not content:
         return None
     try:
         cached = json.loads(content)

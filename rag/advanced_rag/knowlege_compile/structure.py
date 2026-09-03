@@ -13,6 +13,8 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 #
+"""结构化知识编译引擎模块 —— 负责从非结构化文本中提取列表（list）、集合（set）与超图（hypergraph）等结构，并执行两阶段去重（本地相似度去重与搜索引擎存储碰撞）与图谱重构。"""
+
 import datetime
 import asyncio
 import heapq
@@ -54,39 +56,58 @@ _ES_DEDUP_EMBED_BATCH_SIZE = 64
 _ES_DEDUP_INSERT_BATCH_SIZE = 256
 _STRUCT_INVALID_SENTINELS = {"-1"}
 
-# Merge scopes. ``doc`` (default) dedups an incoming entity/relation only
-# against rows already stored for the *same* document; ``dataset`` widens the
-# candidate lookup to the whole knowledge base so the same logical entity found
-# in different documents collapses onto one canonical row.
+# 合并作用域常量：doc（单文档范围去重）、dataset（全知识库跨文档合并）
 MERGE_SCOPE_DOC = "doc"
 MERGE_SCOPE_DATASET = "dataset"
 
-# Dataset-scope merges read-modify-write shared KB-wide rows, so concurrent
-# per-document parse tasks (possibly in different worker processes) must be
-# serialized to avoid inserting duplicate canonical rows before either sees the
-# other. Mirrors the per-kb lock ``dataset_nav`` already uses for the same
-# cross-document upsert hazard.
+# 全库跨文档合并时的分布式锁超时常量（防止多文档并发写入造成同名实体分裂）
 _STRUCT_MERGE_LOCK_TIMEOUT_S = 60
 _STRUCT_MERGE_LOCK_BLOCKING_TIMEOUT_S = 5
 
 
 class _RechunkedDocs(list):
-    """Compiled structure rows plus the formal chunks created by rechunking."""
+    """封装结构编译生成的文档记录列表与语义重切分后的正式分块列表 —— 抽取结果与重切分块容器。"""
 
     def __init__(self, docs=None, rechunked_chunks=None):
+        """初始化携带重新切分语义块的文档集合 —— 重切分文档容器初始化工。
+
+        参数:
+            docs: 文档字典列表，结构示例：[{"id": "doc_1", "content_with_weight": "..."}]
+            rechunked_chunks: 重新切分出的新文本块列表，结构示例：[{"id": "chunk_1", "content": "..."}]
+
+        返回值:
+            无返回值（None）。
+        """
         super().__init__(docs or [])
         self.rechunked_chunks = rechunked_chunks or []
 
 
 def _struct_merge_lock_key(kb_id: str, compilation_template_id: str | None) -> str:
-    """Per-(kb, template) lock so different templates can merge in parallel."""
+    """生成知识库与编译模板维度的分布式锁键名 —— 分布式锁键生成工。
+
+    参数:
+        kb_id: 知识库 ID，示例："kb_001"
+        compilation_template_id: 编译模板 ID（可选），示例："tpl_kg_01"
+
+    返回值:
+        Redis 分布式锁键字符串，示例："struct_merge:kb_001:tpl_kg_01"
+    """
     return f"struct_merge:{kb_id}:{compilation_template_id or ''}"
 
 
 class LLMCallPool:
-    """Task-scoped priority scheduler for actual chat-model calls."""
+    """按优先级调度大模型并发调用的任务级协程优先级队列池 —— 大模型调用排队调度器。"""
 
     def __init__(self, max_concurrency: int = 10, max_pending: int | None = None):
+        """初始化调度池配置 —— 调度池构造工。
+
+        参数:
+            max_concurrency: 最大并发执行数，示例：10
+            max_pending: 最大等待积压队列长度，示例：20（未指定时默认为 max_concurrency）
+
+        返回值:
+            无返回值（None）。
+        """
         self.max_concurrency = max(1, int(max_concurrency))
         self.max_pending = max(self.max_concurrency, int(max_pending or self.max_concurrency))
         self._active = 0
@@ -96,16 +117,41 @@ class LLMCallPool:
 
     @property
     def active_count(self) -> int:
+        """获取当前正在执行中的任务数。"""
         return self._active
 
     @property
     def pending_count(self) -> int:
+        """获取当前排队与执行中的总任务数。"""
         return self._active + len(self._waiting)
 
     def wrap(self, chat_mdl, *, priority: int, label: str, context: str | None = None):
+        """为大模型实例包装排队代理 —— 代理包装工。
+
+        参数:
+            chat_mdl: 原始大模型 Bundle 实例。
+            priority: 优先级数值（数值越小优先级越高），示例：1
+            label: 任务标签，示例："structure_extraction"
+            context: 追踪上下文（可选）。
+
+        返回值:
+            PooledChatModel 代理包装对象。
+        """
         return PooledChatModel(self, chat_mdl, priority=priority, label=label, context=context)
 
     async def call(self, fn, *, priority: int, label: str, context: str | None = None):
+        """以优先级受控方式申请令牌并执行目标异步函数 —— 任务排队执行工。
+
+        参数:
+            fn: 待执行的无参异步函数，示例：lambda: client.chat(...)
+            priority: 优先级数值（数值越小越优先），示例：1
+            label: 任务诊断标签，示例："structure_extraction"
+            context: 追踪上下文（可选），示例："doc_batch_01"
+
+        返回值:
+            目标异步函数执行完毕后的返回值，示例：{"response": "..."} 或 "结果文本"
+        """
+        # 步骤一：等待直到等待队列有空闲席位
         async with self._condition:
             while self.pending_count >= self.max_pending:
                 await self._condition.wait()
@@ -113,6 +159,7 @@ class LLMCallPool:
             self._ticket += 1
             heapq.heappush(self._waiting, ticket)
             try:
+                # 步骤二：排队等待获得并发执行槽位
                 while self._active >= self.max_concurrency or self._waiting[0] != ticket:
                     await self._condition.wait()
             except BaseException:
@@ -123,19 +170,35 @@ class LLMCallPool:
                 raise
             heapq.heappop(self._waiting)
             self._active += 1
+        # 步骤三：受控执行目标异步调用
         try:
             result = await fn()
             return result
         except BaseException:
             raise
         finally:
+            # 步骤四：释放槽位并唤醒后续等待协程
             async with self._condition:
                 self._active -= 1
                 self._condition.notify_all()
 
 
 class PooledChatModel:
+    """拦截 async_chat 并转发给 LLMCallPool 排队的代理大模型类 —— 模型调用排队代理工。"""
+
     def __init__(self, pool: LLMCallPool, chat_mdl, *, priority: int, label: str, context: str | None):
+        """初始化大模型排队调度代理对象 —— 模型排队代理构造工。
+
+        参数:
+            pool: 协程调用池实例，类型：LLMCallPool
+            chat_mdl: 原始大语言模型 Bundle 实例
+            priority: 调用优先级数值，示例：2
+            label: 日志标签，示例："structure_prompt_eval"
+            context: 追踪上下文（可选），示例："chunk_101"
+
+        返回值:
+            无返回值（None）。
+        """
         self._pool = pool
         self._chat_mdl = chat_mdl
         self._priority = priority
@@ -143,9 +206,28 @@ class PooledChatModel:
         self._context = context
 
     def __getattr__(self, name):
+        """将未显式拦截的属性访问透明代理至底层的大模型 Bundle —— 属性穿透转发工。
+
+        参数:
+            name: 待访问的属性或方法名称，示例："model_name"
+
+        返回值:
+            底层模型对象对应的属性值或方法。
+        """
         return getattr(self._chat_mdl, name)
 
     async def async_chat(self, system, history, gen_conf=None, **kwargs):
+        """受优先级池控速的异步对话交互方法 —— 控速对话执行工。
+
+        参数:
+            system: 系统提示词文本，示例："你是一个结构化提取助手"
+            history: 消息历史列表，结构示例：[{"role": "user", "content": "提取实体"}]
+            gen_conf: 生成参数配置字典（可选），结构示例：{"temperature": 0.2}
+            **kwargs: 透传给大模型的附加参数，示例：stream=False
+
+        返回值:
+            大模型返回的文本响应或字典对象，示例："抽取结果文本" 或 {"result": "..."}
+        """
         gen_conf = _knowledge_compile_gen_conf(self._chat_mdl, gen_conf)
         return await self._pool.call(
             lambda: self._chat_mdl.async_chat(system, history, gen_conf=gen_conf, **kwargs),
@@ -156,13 +238,29 @@ class PooledChatModel:
 
 
 def _struct_normalize_kind(kind) -> str:
+    """标准化结构种类字符串 —— 种类名称归一化工。
+
+    参数:
+        kind: 输入的结构大类名称，示例："Knowledge-Graph"
+
+    返回值:
+        小写且下划线标准化的字符串，示例："knowledge_graph"
+    """
     if not isinstance(kind, str):
         return ""
     return kind.strip().lower().replace("-", "_")
 
 
 def _struct_localize(value, language: str = "en") -> str:
-    """Render multilingual values to a single string (mirrors loader._localize_data)."""
+    """将多语言值渲染为与目标语言匹配的纯文本字符串 —— 多语言配置本地化解析工。
+
+    参数:
+        value: 多语言配置值，结构示例：{"en": "Hello", "zh": "你好"} 或 ["条目1", "条目2"]
+        language: 目标语种代码，默认 "en"。
+
+    返回值:
+        匹配后的单字符串，示例："你好"
+    """
     if value is None:
         return ""
     if isinstance(value, str):
@@ -181,7 +279,17 @@ def _struct_localize(value, language: str = "en") -> str:
 
 
 def _struct_get(cfg: dict, *keys, default=None):
-    """Case-insensitive lookup against the first matching key."""
+    """大小写无关地在字典中按优先级查找首个命中的键值 —— 宽容度字典查找工。
+
+    参数:
+        cfg: 配置字典，结构示例：{"Compile_Type": "hypergraph"}
+        *keys: 候选键名列表，示例："compile_type", "compileType"
+        default: 未命中时的默认值，示例："default_val" 或 None
+
+    返回值:
+        命中的键值或默认值，示例："hypergraph" 或 "default_val"
+    """
+
     if not isinstance(cfg, dict):
         return default
     for k in keys:
@@ -195,6 +303,14 @@ def _struct_get(cfg: dict, *keys, default=None):
 
 
 def _struct_infer_type(parser_config: dict) -> str:
+    """从编译规则配置中推断知识编译的目标结构类型 —— 结构类型推导工。
+
+    参数:
+        parser_config: 编译配置字典，结构示例：{"compile_type": "hypergraph"}
+
+    返回值:
+        推导出的标准类型名称（"list"、"set"、"hypergraph" 等），示例："hypergraph"
+    """
     explicit = _struct_get(parser_config, "compile_type")
     normalized_explicit = _struct_normalize_kind(explicit)
     normalized_explicit = _STRUCT_TYPE_ALIASES.get(normalized_explicit, normalized_explicit)
@@ -212,6 +328,15 @@ def _struct_infer_type(parser_config: dict) -> str:
 
 
 def _struct_supported_type(parser_config: dict, autotype: str) -> bool:
+    """验证推导出的类型是否在系统支持的结构集合中 —— 结构支持性校验工。
+
+    参数:
+        parser_config: 配置字典。
+        autotype: 待检查类型名，示例："hypergraph"
+
+    返回值:
+        布尔值（支持返回 True，不支持返回 False）。
+    """
     if autotype in _STRUCT_TYPES:
         return True
     kind = _struct_get(parser_config, "kind")
@@ -221,7 +346,15 @@ def _struct_supported_type(parser_config: dict, autotype: str) -> bool:
 
 
 def _struct_render_fields(fields: list, language: str) -> Tuple[str, str]:
-    """Return (bulleted field descriptions, JSON skeleton for one item)."""
+    """将字段定义列表渲染为提示词文本说明与 JSON 骨架字符串 —— 传统字段骨架渲染工。
+
+    参数:
+        fields: 字段配置字典列表，结构示例：[{"name": "title", "type": "str", "description": "文章标题"}]
+        language: 语种，示例："zh"
+
+    返回值:
+        二元组 (提示词字段说明列表文本, 单个条目的 JSON 骨架示例)，示例：("- title (str, required): 文章标题", '{"title": "<string>"}')
+    """
     lines = []
     skeleton_parts = []
     for f in fields or []:
@@ -246,12 +379,15 @@ def _struct_render_fields(fields: list, language: str) -> Tuple[str, str]:
 
 
 def _struct_render_type_fields(fields: list, language: str, *, kind: str) -> Tuple[str, str]:
-    """Render the new compilation-template field shape.
+    """为新版编译模板渲染类型约束列表与标准 JSON 响应骨架 —— 模板类型骨架渲染工。
 
-    New templates define allowed item ``type`` values with descriptions/rules,
-    rather than arbitrary output field names. The extraction output keeps a
-    stable shape so downstream merge logic can compare concrete items instead
-    of collapsing every item into the template type.
+    参数:
+        fields: 类型配置列表，结构示例：[{"type": "person", "description": "人物"}]
+        language: 语言代码，示例："zh"
+        kind: 模式类型（"entity" 或 "relation"）。
+
+    返回值:
+        二元组 (类型规则列表说明文本, JSON 骨架定义文本)。
     """
     lines: list[str] = []
     type_values: list[str] = []
@@ -291,6 +427,16 @@ def _struct_render_type_fields(fields: list, language: str, *, kind: str) -> Tup
 
 
 def _struct_hypergraph_prompts(parser_config: dict, language: str = "en", rechunk: bool = False) -> Tuple[str, str]:
+    """组装超图（实体与关系）两阶段抽取的提示词模版 —— 提示词模版拼装工。
+
+    参数:
+        parser_config: 解析规则配置字典。
+        language: 语种，示例："zh"
+        rechunk: 是否启用语义分块同步重切分，示例：False
+
+    返回值:
+        二元组 (实体抽取系统提示词, 关系抽取系统提示词)，示例：("...", "...")
+    """
     autotype = _struct_infer_type(parser_config)
     guideline = _struct_get(parser_config, "guideline", default={}) or {}
     output = _struct_get(parser_config, "output", default={}) or {}
@@ -321,6 +467,7 @@ def _struct_hypergraph_prompts(parser_config: dict, language: str = "en", rechun
         ent_fields_text, ent_skel = _struct_render_fields(ent_fields, language)
         rel_fields_text, rel_skel = _struct_render_fields(rel_fields, language)
 
+    # 步骤一：拼装节点（实体）抽取提示词
     node_parts = [f"# Role and Task:\n{target}"] if target else []
     if global_rules:
         node_parts.append(f"## Global Rules:\n{global_rules}")
@@ -354,6 +501,7 @@ def _struct_hypergraph_prompts(parser_config: dict, language: str = "en", rechun
     if not relations_cfg:
         return node_prompt, ""
 
+    # 步骤二：拼装边（关系）抽取提示词（预留 {known_nodes} 占位符）
     edge_parts = [f"# Role and Task:\n{target}"] if target else []
     if global_rules:
         edge_parts.append(f"## Global Rules:\n{global_rules}")
@@ -378,6 +526,14 @@ def _struct_hypergraph_prompts(parser_config: dict, language: str = "en", rechun
 
 
 def _struct_entity_id_field(parser_config: dict) -> str:
+    """提取实体唯一标识字段名称 —— 实体主键字段名解析工。
+
+    参数:
+        parser_config: 编译配置字典。
+
+    返回值:
+        主键字段名字符串（默认 "name"），示例："name"
+    """
     if _struct_get(parser_config, "entity"):
         return "name"
     identifiers = _struct_get(parser_config, "identifiers", default={}) or {}
@@ -392,10 +548,26 @@ def _struct_entity_id_field(parser_config: dict) -> str:
 
 
 def _struct_is_invalid_sentinel(value) -> bool:
+    """判断给定值是否为无效哨兵占位符（如 -1） —— 无效占位符判定工。
+
+    参数:
+        value: 待检查的值。
+
+    返回值:
+        布尔值（是哨兵返回 True，否则返回 False）。
+    """
     return isinstance(value, str) and value.strip() in _STRUCT_INVALID_SENTINELS
 
 
 def _struct_unwrap_items(res) -> list:
+    """从大模型生成的 JSON 结果中安全拆包获取条目列表 —— 抽取条目安全拆包工。
+
+    参数:
+        res: 模型返回的解析结果（字典或列表），结构示例：{"items": [{"name": "A"}]}
+
+    返回值:
+        条目字典列表，结构示例：[{"name": "A"}]
+    """
     if res is None:
         return []
     if isinstance(res, dict):
@@ -409,7 +581,15 @@ def _struct_unwrap_items(res) -> list:
 
 
 def _struct_expand_source_chunk_ids(raw_ids, source_texts: dict[str, str]) -> list[str]:
-    """Expand compact positional source IDs such as t1-t3."""
+    """将压缩形式的位置编号（如 t1-t3）展开为具体的切片标识列表 —— 分块位置标识展开工。
+
+    参数:
+        raw_ids: 原始标识列表或字符串，结构示例：["t1-t3", "t5"]
+        source_texts: 可用的切片文本字典，结构示例：{"t1": "...", "t2": "...", "t3": "..."}
+
+    返回值:
+        展开并过滤后的有效切片 ID 列表，结构示例：["t1", "t2", "t3", "t5"]
+    """
     if isinstance(raw_ids, str):
         raw_ids = [raw_ids]
     if not isinstance(raw_ids, list):
@@ -439,6 +619,18 @@ async def _struct_extract_hypergraph(
     language: str,
     rechunk: bool = False,
 ) -> Tuple[list[dict], list[dict], dict[str, str], list[dict]]:
+    """分两阶段调用大模型：第一阶段抽取实体节点（可选同步语义重切分），第二阶段在已知节点约束下抽取关系边 —— 两阶段超图抽取执行工。
+
+    参数:
+        text: 拼接后的批次分块文本。
+        parser_config: 编译配置字典。
+        chat_mdl: 大模型 Bundle。
+        language: 语种。
+        rechunk: 是否在实体抽取时重新语义组合分块。
+
+    返回值:
+        四元组 (抽取出的实体列表, 抽取出的关系列表, 来源切片到正式分块映射表, 正式分块列表)。
+    """
     node_prompt, edge_prompt_template = _struct_hypergraph_prompts(parser_config, language, rechunk=rechunk)
 
     user_prompt = (
@@ -448,12 +640,14 @@ async def _struct_extract_hypergraph(
         "the IDs of chunks that support that item.\n"
         f"{text}\n\n## Output (JSON only):"
     )
+    # 步骤一：执行第一阶段大模型抽取（提取实体节点）
     node_res = await gen_json(node_prompt, user_prompt, chat_mdl, gen_conf=_knowledge_compile_gen_conf(chat_mdl, {"temperature": 0.1}))
     nodes = _struct_unwrap_items(node_res)
     chunk_id_map: dict[str, str] = {}
     rechunked_chunks: list[dict] = []
     relation_text = text
 
+    # 步骤二：若开启重切分，重组分块并更新实体溯源 ID
     if rechunk:
         source_texts = {match.group(1).strip(): match.group(2).strip() for match in re.finditer(r"\[CHUNK_ID:\s*([^\]]+)\]\n(.*?)\n\[END_CHUNK\]", text, flags=re.DOTALL)}
         groups = node_res.get("chunks") if isinstance(node_res, dict) else None
@@ -501,6 +695,7 @@ async def _struct_extract_hypergraph(
             if isinstance(raw_ids, list):
                 node["source_chunk_ids"] = [temp_to_uuid.get(str(item).strip(), str(item).strip()) for item in raw_ids if temp_to_uuid.get(str(item).strip())]
 
+    # 步骤三：收集第一阶段已抽取的有效节点名称，注入到第二阶段提示词中
     id_field = _struct_entity_id_field(parser_config)
     known_keys = []
     for n in nodes:
@@ -515,6 +710,7 @@ async def _struct_extract_hypergraph(
     if not edge_prompt_template:
         return nodes, [], chunk_id_map, rechunked_chunks
 
+    # 步骤四：执行第二阶段大模型抽取（提取受控关系边）
     edge_prompt = edge_prompt_template.replace("{known_nodes}", known_str)
     edge_user_prompt = (
         user_prompt
@@ -541,7 +737,15 @@ async def _struct_extract_hypergraph(
 
 
 def _struct_payload_chunk_ids(payload: dict, batch_ids: list) -> list:
-    """Keep only model-selected chunk IDs that belong to the current batch."""
+    """过滤并仅保留属于当前批次有效范围内的溯源分块 ID —— 批次溯源切片过滤工。
+
+    参数:
+        payload: 实体或关系负载字典。
+        batch_ids: 当前批次包含的分块 ID 列表。
+
+    返回值:
+        过滤后的分块 ID 列表。
+    """
     raw_ids = payload.get("source_chunk_ids")
     if isinstance(raw_ids, str):
         raw_ids = [raw_ids]
@@ -560,7 +764,14 @@ _struct_embed = _encode
 
 
 def _struct_payload_description(payload: dict) -> str:
-    """Concat string values of every non-description field (lists flattened)."""
+    """将负载字典中的所有非空文本与列表字段扁平拼接为用于向量化的综合描述 —— 描述文本拼接工。
+
+    参数:
+        payload: 实体或关系字典负载，结构示例：{"name": "爱因斯坦", "type": "物理学家"}
+
+    返回值:
+        以空格分隔的综合描述纯文本，示例："爱因斯坦 物理学家"
+    """
     parts: list[str] = []
     for k, v in payload.items():
         if isinstance(v, (list, tuple)):
@@ -578,6 +789,14 @@ def _struct_payload_description(payload: dict) -> str:
 
 
 def _struct_load_payload(doc: dict) -> dict:
+    """从包含加权内容的记录行中解析字典负载 —— 负载反序列化工。
+
+    参数:
+        doc: 文档记录字典，结构示例：{"content_with_weight": "{\"name\": \"量子\"}"}
+
+    返回值:
+        解析出的 Python 字典，示例：{"name": "量子"}
+    """
     try:
         payload = json.loads(doc.get("content_with_weight") or "{}")
     except Exception:
@@ -586,6 +805,15 @@ def _struct_load_payload(doc: dict) -> dict:
 
 
 def _struct_graph_entity(payload: dict, source_chunk_ids: list | None = None) -> dict | None:
+    """将实体负载规整为图谱实体规范格式 —— 图谱实体规范化封装工。
+
+    参数:
+        payload: 实体字典负载，结构示例：{"name": "牛顿", "type": "person"}
+        source_chunk_ids: 来源切片 ID 列表（可选）。
+
+    返回值:
+        规范的图实体字典（遇到无效哨兵或空名称时返回 None）。
+    """
     name = payload.get("name") or payload.get("text") or payload.get("term") or payload.get("title")
     name = str(name).strip() if name is not None else ""
     if not name or _struct_is_invalid_sentinel(name):
@@ -613,6 +841,14 @@ def _struct_graph_entity(payload: dict, source_chunk_ids: list | None = None) ->
 
 
 def _struct_graph_relation(payload: dict) -> dict | None:
+    """将关系负载规整为标准的有向边规范格式 —— 图谱关系规范化封装工。
+
+    参数:
+        payload: 关系字典负载，结构示例：{"source": "A", "target": "B", "type": "connect"}
+
+    返回值:
+        包含 from、to、type 的关系字典（端点无效时返回 None）。
+    """
     src = payload.get("source") or payload.get("src") or payload.get("from")
     tgt = payload.get("target") or payload.get("tgt") or payload.get("to")
     src = str(src).strip() if src is not None else ""
@@ -628,6 +864,14 @@ def _struct_graph_relation(payload: dict) -> dict | None:
 
 
 def _struct_merge_graph_entities(entities: list[dict]) -> list[dict]:
+    """对图实体列表按 (name, type) 键执行内存聚合与别名合并 —— 图实体聚合消歧工。
+
+    参数:
+        entities: 实体字典列表。
+
+    返回值:
+        去重并累加提及计数、合并溯源后的实体列表。
+    """
     merged: dict[tuple[str, str], dict] = {}
     order: list[tuple[str, str]] = []
     for entity in entities:
@@ -658,7 +902,14 @@ def _struct_merge_graph_entities(entities: list[dict]) -> list[dict]:
 
 
 def _struct_merge_graph_relations(relations: list[dict]) -> list[dict]:
-    """Deduplicate relation payloads while preserving source provenance."""
+    """按起点、终点与关系类型三元组对关系执行去重与溯源文档合并 —— 图关系去重合并工。
+
+    参数:
+        relations: 关系字典列表。
+
+    返回值:
+        去重合并后的关系字典列表。
+    """
     merged: dict[tuple[str, str, str], dict] = {}
     order: list[tuple[str, str, str]] = []
     for relation in relations:
@@ -684,12 +935,13 @@ def _struct_merge_graph_relations(relations: list[dict]) -> list[dict]:
 
 
 def _struct_relation_member_fields(parser_config: dict) -> Tuple:
-    """Return (source_field, target_field) for relation docs, or (None, None).
+    """从配置中推导关系的起点与终点字段名称 —— 关系端点字段解析工。
 
-    Looks at ``identifiers.relation_members`` first (dict form for graph-style
-    configs, e.g. ``{source: source, target: target}``); falls back to the
-    conventional ``source`` / ``target`` field names if both appear in the
-    relation schema.
+    参数:
+        parser_config: 编译解析配置字典。
+
+    返回值:
+        二元组 (起点字段名, 终点字段名) 或 (None, None)，示例：("source", "target")
     """
     identifiers = _struct_get(parser_config, "identifiers", default={}) or {}
     members = _struct_get(identifiers, "relation_members")
@@ -731,20 +983,25 @@ def _struct_to_doc_storage_doc(
     scope: str = "doc",
     doc_ids: list[str] | None = None,
 ) -> dict:
-    """Build one ES doc for an extracted entity or relation.
+    """将抽取的单条实体或关系转换为可在搜索引擎持久化存储的检索行字典 —— 存储行封装转换工。
 
-    Args:
-        kind: ``"entity"`` or ``"relation"`` — written to ``knowledge_graph_kwd``.
-        src_field / target_field: when ``kind == "relation"`` and these field
-            names exist on the payload, the resolved values are written to
-            ``from_entity_kwd`` / ``to_entity_kwd``.
-        compilation_template_id / compilation_template_kind: stamped onto
-            every row so the document-structure endpoint can group by
-            template id and the UI can render one tab per template.
-        scope: ``"doc"`` for document-level rows, ``"dataset"`` for the KB-wide
-            merged entity rows written by the Build button.
-        doc_ids: only set for ``scope="dataset"`` rows — lists the documents
-            that contributed to this merged entity.
+    参数:
+        payload: 实体或关系字典负载，结构示例：{"name": "牛顿", "type": "person"}
+        compile_kwd: 编译类型标识，示例："hypergraph"
+        doc_id: 所属文档 ID，示例："doc_101"
+        doc_name: 所属文档文件名，示例："physics.pdf"
+        chunk_ids: 来源分块 ID 列表，示例：["c1"]
+        vec: 嵌入特征向量列表或 numpy 数组。
+        kind: 项目类型（"entity" 或 "relation"），示例："entity"
+        src_field: 关系起点字段名（可选），示例："from"
+        target_field: 关系终点字段名（可选），示例："to"
+        compilation_template_id: 编译模板 ID（可选），示例："tpl_kg"
+        compilation_template_kind: 模板大类（可选），示例："hypergraph"
+        scope: 作用域（"doc" 或 "dataset"），示例："doc"
+        doc_ids: 针对全库合并记录的来源文档列表（可选），示例：["doc_101", "doc_102"]
+
+    返回值:
+        包含分词字段、向量字段与全局元数据的 Elasticsearch 存储文档字典。
     """
     content_with_weight = json.dumps(payload, ensure_ascii=False)
     if hasattr(vec, "tolist"):
@@ -754,19 +1011,17 @@ def _struct_to_doc_storage_doc(
     doc_id_str = str(doc_id)
     template_id_str = str(compilation_template_id).strip() if compilation_template_id else ""
 
+    # 步骤一：对实体/关系描述执行多粒度分词
     description = _struct_payload_description(payload)
     content_ltks, content_sm_ltks = _tokenize_for_search(description)
 
-    # Mix the template id into the stable row id so two templates with the
-    # same compile_kwd don't collide on identical payloads (e.g. two
-    # different list-kind templates that each extract "headline X").
-    # Dataset-scope rows get the scope in the row seed to avoid colliding
-    # with doc-scope rows for the same entity.
+    # 步骤二：铸造确定性 ID（融合模板标识与作用域防止哈希冲突）
     row_seed_extras = [template_id_str] if template_id_str else []
     if scope == "dataset":
         row_seed_extras.append("dataset")
     row_id = _stable_row_id(content_with_weight, doc_id_str, *row_seed_extras)
 
+    # 步骤三：拼装基础存储列
     doc = {
         "content_with_weight": content_with_weight,
         "compile_kwd": compile_kwd,
@@ -783,21 +1038,13 @@ def _struct_to_doc_storage_doc(
     if scope == "dataset" and doc_ids:
         doc["doc_ids_kwd"] = list(doc_ids)
 
-    # Surface two payload fields as queryable top-level columns so the store can
-    # filter/sort on them without parsing ``content_with_weight``. Both are
-    # copies: the originals stay in the payload, so payload consumers (merge,
-    # graph projection) are unaffected and ``row_id`` — which hashes the payload
-    # JSON — does not shift. Merges rebuild through this same function, so the
-    # columns re-derive from the merged payload automatically.
+    # 步骤四：提取提及计数与小写实体名称列便于快速精确过滤
     try:
         mention_count = int(payload.get("mention_count") or 1)
     except (TypeError, ValueError):
         mention_count = 1
     doc["mention_count_int"] = mention_count
 
-    # Lower-cased name for case-insensitive exact lookups. Relations carry no
-    # ``name`` (they use source/target), so the column is only stamped when the
-    # payload actually has one.
     name_value = _struct_entity_name(payload)
     if name_value:
         doc["name_kwd"] = name_value.lower()
@@ -807,6 +1054,7 @@ def _struct_to_doc_storage_doc(
     if compilation_template_kind:
         doc["compilation_template_kind_kwd"] = str(compilation_template_kind)
 
+    # 步骤五：为关系行填充起点与终点索引列
     if kind == "relation":
         if src_field:
             src_val = payload.get(src_field)
@@ -836,16 +1084,26 @@ async def _struct_process_batch(
     compilation_template_id: str | None = None,
     compilation_template_kind: str | None = None,
 ) -> _RechunkedDocs:
-    """Process one packed batch end-to-end (extract → embed → ES docs).
+    """对单个分块批次执行超图抽取、向量嵌入与存储行转换调度 —— 单批次抽取管道执行工。
 
-    ``packed`` is the per-batch shape produced by
-    ``_common.build_chunk_batches``: ``[{label, chunk_id, text}, ...]``.
-    The ``label`` field is unused here — structure uses ``---`` separators
-    instead of per-chunk labels — but ``chunk_id`` is collected so every
-    item produced by this batch carries the batch's source chunk ids.
+    参数:
+        packed: 打包好的输入分块列表，结构示例：[{"chunk_id": "c1", "text": "..."}]
+        batch_idx: 当前批次索引，示例：0
+        total: 总批次数，示例：10
+        autotype: 推导出的结构类型，示例："hypergraph"
+        parser_config: 编译配置字典。
+        chat_mdl: 大语言模型 Bundle。
+        embd_mdl: 嵌入模型 Bundle。
+        doc_id: 文档 ID，示例："doc_101"
+        doc_name: 文档名称，示例："article.txt"
+        language: 语种，示例："en"
+        callback: 进度回调函数（可选）。
+        semaphore: 控制跨批次大模型并发度的异步信号量。
+        compilation_template_id: 模板 ID（可选）。
+        compilation_template_kind: 模板大类（可选）。
 
-    The semaphore (if any) is taken around the entire batch's LLM +
-    embedding work to bound peak concurrency.
+    返回值:
+        装载当前批次提取记录与正式分块的 _RechunkedDocs 对象。
     """
     if not packed:
         return _RechunkedDocs()
@@ -857,11 +1115,7 @@ async def _struct_process_batch(
     rechunk = bool(parser_config.get("rechunk"))
 
     async def _run() -> _RechunkedDocs:
-        # For hypergraph, entity extraction MUST complete before edge extraction
-        # within the same batch, because the edge prompt's {known_nodes}
-        # placeholder is filled from this batch's extracted nodes — see
-        # _struct_extract_hypergraph. Parallelism across batches is fine; the
-        # two stages within one batch are strictly sequential.
+        # 步骤一：调用模型抽取超图（实体与关系）
         try:
             items, relations, chunk_id_map, formal_chunks = await _struct_extract_hypergraph(
                 combined_text,
@@ -882,6 +1136,7 @@ async def _struct_process_batch(
                 callback((batch_idx + 1) / total, f"{batch_idx + 1}/{total} batches: 0 items")
             return _RechunkedDocs(rechunked_chunks=formal_chunks)
 
+        # 步骤二：批量为所有抽取项计算特征嵌入向量
         embed_inputs = [_struct_payload_description(p) for p in payloads]
         try:
             embeddings = await _struct_embed(embd_mdl, embed_inputs)
@@ -893,6 +1148,7 @@ async def _struct_process_batch(
             logging.error(f"compile_structure_from_text: embedding count mismatch ({len(embeddings)} vs {len(payloads)}) for batch {batch_idx}")
             return _RechunkedDocs(rechunked_chunks=formal_chunks)
 
+        # 步骤三：格式化为存储层规范文档记录
         docs = [
             _struct_to_doc_storage_doc(
                 payload,
@@ -915,6 +1171,7 @@ async def _struct_process_batch(
 
         return _RechunkedDocs(docs, formal_chunks)
 
+    # 步骤四：通过信号量受控执行
     if semaphore is not None:
         async with semaphore:
             return await _run()
@@ -933,35 +1190,35 @@ async def compile_structure_from_text(
     max_workers: int = 10,
     compilation_template_id: str | None = None,
 ) -> list[dict]:
-    """Extract list/set/hypergraph structures from text chunks and prepare ES docs.
+    """从文本分块中分批次并发抽取列表、集合或超图结构并转换为搜索引擎存储文档 —— 文本结构化编译主调度工。
 
-    Each chunk is processed independently — cross-chunk merging of entities and
-    relations is deferred to a separate pipeline stage and is intentionally not
-    performed here.
+    参数:
+        chunks: 输入分块字典列表，结构示例：[{"id": "chunk_01", "text": "爱因斯坦提出相对论..."}]
+        parser_config: 编译规则配置字典或 JSON 字符串，结构示例：{"kind": "hypergraph", "language": "zh", "entity_types": ["person", "concept"]}
+        chat_mdl: 大语言模型 Bundle 实例，示例：LLMBundle(model_type="chat")
+        embd_mdl: 向量嵌入模型 Bundle 实例，示例：LLMBundle(model_type="embedding")
+        doc_id: 来源文档唯一标识，示例："doc_101"
+        doc_name: 文档名称（可选），示例："relativity.pdf"
+        language: 语种，示例："zh"
+        callback: 进度通知回调函数（可选），示例：lambda progress, msg: print(progress, msg)
+        max_workers: 最大并发批次工作线程数，示例：10
+        compilation_template_id: 关联的模板唯一 ID（可选），示例："tpl_kg_01"
 
-    Args:
-        chunks: list of dicts; each must expose ``id`` and ``text`` (a
-            ``content_with_weight`` fallback is also accepted).
-        parser_config: dict already parsed from ``document.parser_config["knowledge_compilation"]`` or
-            the raw JSON string from the database.
-        chat_mdl: LLMBundle for chat (used via ``gen_json``).
-        embd_mdl: LLMBundle for embeddings (used via ``encode``).
-        doc_id: source document id, embedded into every ES doc.
-        language: language code for resolving multilingual config strings.
-        callback: optional progress callback ``(prog: float, msg: str)``.
-
-    Returns:
-        List of ES-ready dicts shaped as::
-
-            {
-                "content_with_weight": <json>,
-                "compile_kwd": "list" | "set" | "hypergraph",
-                "doc_id": <doc_id>,
-                "source_chunk_ids": [<chunk_id>, ...],
-                "q_<dim>_vec": [...],
-                "id": <xxhash>,
-            }
+    返回值:
+        转换好并包含向量与分词字段的 ES 文档字典列表，结构示例：
+            [
+                {
+                    "id": "xxh64_hash",
+                    "content_with_weight": "{\"name\": \"爱因斯坦\", \"type\": \"person\"}",
+                    "compile_kwd": "hypergraph",
+                    "knowledge_graph_kwd": "entity",
+                    "doc_id": "doc_101",
+                    "source_chunk_ids": ["chunk_01"],
+                    "q_1024_vec": [0.1, 0.2, ...]
+                }
+            ]
     """
+    # 步骤一：反序列化并校验编译配置
     if isinstance(parser_config, str):
         try:
             parser_config = json.loads(parser_config)
@@ -977,14 +1234,11 @@ async def compile_structure_from_text(
         logging.error(f"compile_structure_from_text: unsupported type '{autotype}'")
         return []
 
+    # 步骤二：预估提示词 Token 开销并划分并发分块批次
     rechunk = bool(parser_config.get("rechunk"))
     node_prompt, edge_prompt = _struct_hypergraph_prompts(parser_config, language, rechunk=rechunk)
     prompt_overhead = max(num_tokens_from_string(node_prompt), num_tokens_from_string(edge_prompt))
 
-    # ``kind`` for the row stamp follows the template's ``kind`` field if
-    # present (e.g. "timeline", "page_index"); we fall back to the
-    # inferred autotype ("list" / "set" / "hypergraph") so legacy
-    # configs without a kind still get a sensible label on the UI tab.
     template_kind = parser_config.get("kind") if isinstance(parser_config, dict) else None
     if not isinstance(template_kind, str) or not template_kind.strip():
         template_kind = autotype
@@ -997,8 +1251,8 @@ async def compile_structure_from_text(
     if not packed_batches:
         return []
 
+    # 步骤三：定义单批次抽取与结果聚合闭包
     async def _process_one(batch: list[dict], bi: int, total: int) -> list[dict]:
-        # The engine's semaphore already bounds concurrency.
         return await _struct_process_batch(
             packed=batch,
             batch_idx=bi,
@@ -1026,6 +1280,7 @@ async def compile_structure_from_text(
             formal_chunks.extend(getattr(br, "rechunked_chunks", []))
         return _RechunkedDocs(out, formal_chunks)
 
+    # 步骤四：通过通用分块并发执行器启动并行抽取
     return await _run_chunked_pipeline(
         packed_batches,
         process_batch=_process_one,
@@ -1036,27 +1291,7 @@ async def compile_structure_from_text(
     )
 
 
-# ---------------------------------------------------------------------------
-# Structured-knowledge merging: local dedup + ES dedup
-# ---------------------------------------------------------------------------
-#
-# Pipeline (per spec):
-#   Phase 1 — Local dedup inside `docs`:
-#     - Group by (doc_id, compile_kwd, from_entity_kwd?, to_entity_kwd?).
-#     - Within each group, compute pairwise cosine similarity (sklearn) over
-#       q_<dim>_vec, and for each pair above ``similarity_threshold`` (0.9 by
-#       default) ask the LLM via _struct_merge_pair to decide if they're the
-#       same logical item; if yes, collapse in memory (union chunk_ids,
-#       regenerate vector + tokens off the merged payload).
-#   Phase 2 — ES dedup of the surviving docs:
-#     - For each, KNN-search ES with the same filter via MatchDenseExpr; if a
-#       top-1 hit comes back above ``similarity_threshold`` and the LLM judges
-#       it a duplicate, REPLACE the existing ES doc by its old ``id``
-#       (preserving src/target on relations and unioning chunk_ids). Else
-#       insert the new doc.
-#
-# Merge is driven by the user-supplied prompts; a small decision instruction
-# is appended so we can branch on the LLM's verdict via gen_json.
+# ── 结构化知识去重与合并提示词 ───────────────────────────────────────────────
 
 MERGE_SYSTEM_PROMPT = """You are an intelligent data merging assistant.
 You will merge two JSON objects representing the same entity: Item A (existing) and Item B (incoming).
@@ -1081,10 +1316,13 @@ Return ONLY a JSON object with this exact structure (no markdown fences, no comm
 
 
 def _struct_doc_template_id(doc: dict) -> str | None:
-    """Pull the (single) compilation_template_id out of an ES row.
+    """从存储文档记录中提取归属的编译模板标识 —— 模板标识提取工。
 
-    Stored as a list to leave room for future cross-template merges; this
-    helper just returns the first non-empty entry, or None.
+    参数:
+        doc: 文档记录字典，结构示例：{"compilation_template_ids": ["tpl_01"]}
+
+    返回值:
+        首个非空模板 ID 字符串或 None，示例："tpl_01"
     """
     raw = doc.get("compilation_template_ids")
     if isinstance(raw, list):
@@ -1097,9 +1335,14 @@ def _struct_doc_template_id(doc: dict) -> str | None:
 
 
 def _struct_filter_key(doc: dict) -> tuple:
-    """Bucket key for dedup candidates. Includes the template id so two
-    templates that emit a relation with the same (from, to) endpoints
-    don't merge across template boundaries."""
+    """计算用于将文档隔离进不同去重桶的分组键元组 —— 去重候选分组键计算工。
+
+    参数:
+        doc: 结构文档行字典，结构示例：{"doc_id": "d1", "compile_kwd": "hypergraph"}
+
+    返回值:
+        由 doc_id、编译标识、起点实体、终点实体及模板 ID 构成的多元组，结构示例：("doc_01", "hypergraph", "爱因斯坦", "相对论", "tpl_01")
+    """
     return (
         doc.get("doc_id"),
         doc.get("compile_kwd"),
@@ -1109,18 +1352,32 @@ def _struct_filter_key(doc: dict) -> tuple:
     )
 
 
-# Backwards-compat aliases for the shared helpers. New code should call
-# the ``_common`` versions directly.
+# 向后兼容别名映射
 _struct_doc_vec = _find_vec_field
 
 
 def _struct_union_chunk_ids(*chunk_id_lists) -> list:
-    """Order-preserving union (compat shim — prefer ``_common.union_ordered``)."""
+    """对来源分块标识列表执行保序合并去重 —— 分块来源保序合并工。
+
+    参数:
+        *chunk_id_lists: 分块 ID 列表变长参数，示例：["c1", "c2"], ["c2", "c3"]
+
+    返回值:
+        合并去重后的分块 ID 列表，结构示例：["c1", "c2", "c3"]
+    """
     normalized = [[chunk_ids] if isinstance(chunk_ids, str) else chunk_ids for chunk_ids in chunk_id_lists]
     return _union_ordered(*normalized)
 
 
 def _struct_entity_name(doc_or_payload: dict) -> str:
+    """安全解析行记录或负载字典中的实体名称 —— 实体名称提取工。
+
+    参数:
+        doc_or_payload: 存储行或内容负载字典，结构示例：{"name": "玻尔"}
+
+    返回值:
+        实体名称字符串，示例："玻尔"
+    """
     value = doc_or_payload.get("name") if isinstance(doc_or_payload, dict) else None
     if value is None and isinstance(doc_or_payload, dict):
         try:
@@ -1131,6 +1388,15 @@ def _struct_entity_name(doc_or_payload: dict) -> str:
 
 
 def _struct_resolve_entity_alias(name: str, aliases: dict[str, str]) -> str:
+    """沿别名映射字典迭代追溯实体的标准规范名称 —— 实体规范别名追溯工。
+
+    参数:
+        name: 初始实体名称，示例："阿尔伯特·爱因斯坦"
+        aliases: 别名重定向字典，结构示例：{"阿尔伯特·爱因斯坦": "爱因斯坦"}
+
+    返回值:
+        最终标准实体名称，示例："爱因斯坦"
+    """
     current = str(name).strip()
     seen = set()
     while current in aliases and current not in seen:
@@ -1140,6 +1406,15 @@ def _struct_resolve_entity_alias(name: str, aliases: dict[str, str]) -> str:
 
 
 def _struct_rewrite_relation_payload(payload: dict, aliases: dict[str, str]) -> bool:
+    """将关系负载中的起点和终点实体名重写替换为消歧后的规范别名 —— 关系负载端点重写工。
+
+    参数:
+        payload: 关系字典负载，结构示例：{"from": "小爱", "to": "量子力学"}
+        aliases: 别名重定向映射表，结构示例：{"小爱": "爱因斯坦"}
+
+    返回值:
+        布尔值（发生变更返回 True，否则返回 False），示例：True
+    """
     changed = False
     for fields in (("source", "src", "from"), ("target", "tgt", "to")):
         for field in fields:
@@ -1154,6 +1429,16 @@ def _struct_rewrite_relation_payload(payload: dict, aliases: dict[str, str]) -> 
 
 
 async def _struct_rewrite_relation_doc(doc: dict, aliases: dict[str, str], embd_mdl) -> dict:
+    """重写关系文档行的两端实体名为规范别名并重新计算特征向量 —— 关系文档行重写重算工。
+
+    参数:
+        doc: 原始关系存储行字典，结构示例：{"content_with_weight": "{\"from\": \"小爱\", \"to\": \"物理\"}", "from_entity_kwd": "小爱"}
+        aliases: 别名映射字典，结构示例：{"小爱": "爱因斯坦"}
+        embd_mdl: 嵌入模型 Bundle，示例：LLMBundle(model_type="embedding")
+
+    返回值:
+        更新了两端索引与向量的全新文档行字典，结构示例：{"content_with_weight": "{\"from\": \"爱因斯坦\", \"to\": \"物理\"}", "from_entity_kwd": "爱因斯坦"}
+    """
     if doc.get("knowledge_graph_kwd") != "relation" or not aliases:
         return doc
     try:
@@ -1173,10 +1458,15 @@ async def _struct_rewrite_relation_doc(doc: dict, aliases: dict[str, str], embd_
 
 
 async def _struct_merge_pair(existing: dict, incoming: dict, chat_mdl) -> dict | None:
-    """LLM-judged merge. Returns merged payload dict if duplicate, else None.
+    """调用大模型裁决两两候选实体或关系是否属于同一事物并生成融合字典 —— 成对实体模型裁决融合工。
 
-    Operates on the payload (parsed ``content_with_weight``), not the ES doc
-    envelope. Caller is responsible for re-embedding and rebuilding the doc.
+    参数:
+        existing: 已存在的行字典，结构示例：{"content_with_weight": "{\"name\": \"量子\", \"type\": \"concept\"}"}
+        incoming: 新进入的待碰撞行字典，结构示例：{"content_with_weight": "{\"name\": \"量子力学\", \"type\": \"concept\"}"}
+        chat_mdl: 大语言模型 Bundle，示例：LLMBundle(model_type="chat")
+
+    返回值:
+        若模型裁决为重复则返回合并后的 payload 字典，否则返回 None，结构示例：{"name": "量子力学", "type": "concept", "description": "微观物理理论"} 或 None
     """
     try:
         existing_payload = json.loads(existing.get("content_with_weight") or "{}")
@@ -1204,7 +1494,15 @@ async def _struct_merge_pair(existing: dict, incoming: dict, chat_mdl) -> dict |
 
 
 def _struct_merge_exact_entity_payload(existing: dict, incoming: dict) -> dict | None:
-    """Merge same-name entity payloads without relying on vector similarity."""
+    """对名称完全一致的两个实体执行无损字段互补与来源分块合并 —— 同名实体无损合并工。
+
+    参数:
+        existing: 现有实体行字典，结构示例：{"content_with_weight": "{\"name\": \"量子\", \"description\": \"微观世界\"}"}
+        incoming: 新实体行字典，结构示例：{"content_with_weight": "{\"name\": \"量子\", \"description\": \"微观物理学理论\"}"}
+
+    返回值:
+        融合后的 payload 字典，结构示例：{"name": "量子", "type": "concept", "description": "微观物理学理论", "source_chunk_ids": ["c1", "c2"]}
+    """
     try:
         left = json.loads(existing.get("content_with_weight") or "{}")
         right = json.loads(incoming.get("content_with_weight") or "{}")
@@ -1231,7 +1529,15 @@ def _struct_merge_exact_entity_payload(existing: dict, incoming: dict) -> dict |
 
 
 async def _struct_merge_exact_named_entities(docs: list[dict], embd_mdl) -> tuple[list[dict], int]:
-    """Collapse same-name entities before similarity-based dedup."""
+    """在执行向量相似度去重之前先折叠合并完全同名的实体记录 —— 同名实体快速预折叠工。
+
+    参数:
+        docs: 输入的待去重结构行列表，结构示例：[{"content_with_weight": "{\"name\": \"量子\"}"}, {"content_with_weight": "{\"name\": \"量子\"}"}]
+        embd_mdl: 嵌入模型 Bundle，示例：LLMBundle(model_type="embedding")
+
+    返回值:
+        二元组 (预合并后的行列表, 被折叠消除的重复实体数量)，结构示例：([{"id": "d1", "content_with_weight": "{\"name\": \"量子\"}"}], 1)
+    """
     kept: dict[str, dict] = {}
     order: list[str] = []
     unchanged: list[dict] = []
@@ -1269,8 +1575,14 @@ async def _struct_merge_exact_named_entities(docs: list[dict], embd_mdl) -> tupl
 
 
 def _struct_apply_merge_invariants(existing: dict, merged_payload: dict) -> dict:
-    """For relations, force the source/target fields back to the existing payload's
-    values — from_entity_kwd / to_entity_kwd must not change across a merge.
+    """强制保持关系两端的端点字段值与合并前一致以维护拓扑不变性 —— 关系端点不变性维护工。
+
+    参数:
+        existing: 原始已有行字典，结构示例：{"knowledge_graph_kwd": "relation", "content_with_weight": "{\"from\": \"A\", \"to\": \"B\"}"}
+        merged_payload: 大模型融合后的关系字典负载，结构示例：{"from": "A_renamed", "to": "B", "type": "rel"}
+
+    返回值:
+        恢复了原始 source/target 端点的安全负载字典，结构示例：{"from": "A", "to": "B", "type": "rel"}
     """
     if existing.get("knowledge_graph_kwd") != "relation":
         return merged_payload
@@ -1296,8 +1608,17 @@ def _struct_rebuild_doc_storage_doc(
     chunk_ids: list,
     preserve_id: bool = True,
 ) -> dict:
-    """Rebuild an ES doc from a merged payload using _struct_to_doc_storage_doc, then
-    overlay identity fields (id, from_entity_kwd, to_entity_kwd) from base_doc.
+    """利用合并后的新 payload 重新构建 ES 文档并继承原有记录的主键与关键标记 —— 存储行重构覆写工。
+
+    参数:
+        payload: 融合后的新字典负载，结构示例：{"name": "量子", "type": "concept"}
+        base_doc: 基准文档行（提供主键与元数据），结构示例：{"id": "doc_101", "compile_kwd": "hypergraph"}
+        vec: 新计算的嵌入特征向量，结构示例：[0.02, 0.15, ...]
+        chunk_ids: 合并后的来源分块 ID 列表，结构示例：["c1", "c2"]
+        preserve_id: 是否严格保留原文档 ID（默认为 True），示例：True
+
+    返回值:
+        重构后的 ES 文档字典，结构示例：{"id": "doc_101", "content_with_weight": "...", "q_1024_vec": [...]}
     """
     kind = base_doc.get("knowledge_graph_kwd") or "entity"
     src_field = None
@@ -1326,7 +1647,6 @@ def _struct_rebuild_doc_storage_doc(
     )
     if preserve_id and base_doc.get("id"):
         new_doc["id"] = base_doc["id"]
-    # The spec forbids changing from_entity_kwd / to_entity_kwd on a merge.
     for kwd in ("from_entity_kwd", "to_entity_kwd"):
         if kwd in base_doc and base_doc[kwd]:
             new_doc[kwd] = base_doc[kwd]
@@ -1334,7 +1654,15 @@ def _struct_rebuild_doc_storage_doc(
 
 
 async def _struct_reembed_payload(payload: dict, embd_mdl):
-    """Re-encode a merged payload's description with embd_mdl and return the vector."""
+    """提取负载正文描述并通过嵌入模型重新生成特征向量 —— 负载向量重新编码工。
+
+    参数:
+        payload: 字典负载，结构示例：{"name": "AI", "description": "人工智能"}
+        embd_mdl: 向量嵌入模型 Bundle。
+
+    返回值:
+        浮点向量列表（编码失败时返回 None），结构示例：[0.05, 0.12, ...]
+    """
     text = _struct_payload_description(payload)
     try:
         vecs = await _struct_embed(embd_mdl, [text])
@@ -1345,13 +1673,18 @@ async def _struct_reembed_payload(payload: dict, embd_mdl):
 
 
 def _struct_doc_storage_dedup_condition(doc: dict, merge_scope: str = MERGE_SCOPE_DOC) -> dict:
+    """构建在 ES/Infinity 中查询潜在重复记录时的过滤条件字典 —— 索引去重检索条件构造工。
+
+    参数:
+        doc: 当前待探测记录。
+        merge_scope: 作用域（"doc" 仅限同文档，"dataset" 扩展至全知识库）。
+
+    返回值:
+        符合搜索引擎语法的过滤条件字典，结构示例：{"compile_kwd": ["hypergraph"], "doc_id": ["doc_01"]}
+    """
     condition = {
         "compile_kwd": [doc["compile_kwd"]],
     }
-    # Doc scope: only an entity/relation already stored for the same document is
-    # a merge candidate. Dataset scope: widen to the whole KB (``kb_id`` is
-    # already the search index scope) so the same entity across documents
-    # collapses onto one canonical row.
     if merge_scope != MERGE_SCOPE_DATASET:
         condition["doc_id"] = [doc["doc_id"]]
     if doc.get("knowledge_graph_kwd"):
@@ -1377,13 +1710,27 @@ async def _struct_doc_storage_knn_candidate(
     item_index: int,
     merge_scope: str = MERGE_SCOPE_DOC,
 ) -> dict | None:
-    """Run one KNN lookup; the caller controls concurrency."""
+    """结合精确名称匹配与向量 KNN 近邻检索在存储库中查找唯一最佳匹配候选 —— 存储层重复候选探测工。
+
+    参数:
+        doc: 待入库文档字典，结构示例：{"name_kwd": "爱因斯坦", "compile_kwd": "hypergraph"}
+        tenant_id: 租户 ID，示例："tenant_01"
+        kb_id: 知识库 ID，示例："kb_001"
+        similarity_threshold: 余弦相似度阈值（如 0.99），示例：0.99
+        index: 搜索索引名，示例："ragflow_index"
+        select_fields: 查询字段列表，结构示例：["id", "content_with_weight", "name_kwd"]
+        timing_context: 耗时追踪上下文（可选），示例："knn_dedup"
+        item_index: 待探测项索引，示例：0
+        merge_scope: 匹配范围（"doc" 或 "dataset"），示例："doc"
+
+    返回值:
+        检索到的已有文档字典（未命中时返回 None），结构示例：{"id": "old_id_01", "content_with_weight": "..."} 或 None
+    """
+
     from common import settings
     from common.doc_store.doc_store_base import MatchDenseExpr, OrderByExpr
 
-    # Names are the entity identity used by the structure graph. Check the
-    # exact name before KNN so a new compile joins an existing canonical row
-    # even when title/fact/conclusion descriptions have low vector similarity.
+    # 步骤一：针对实体类型，优先执行精确同名匹配查找
     if doc.get("knowledge_graph_kwd") == "entity":
         name = str(doc.get("name_kwd") or _struct_entity_name(doc) or "").strip().casefold()
         if name:
@@ -1411,6 +1758,7 @@ async def _struct_doc_storage_knn_candidate(
             except Exception:
                 logging.exception("merge_compiled_structures: exact entity-name search failed")
 
+    # 步骤二：若精确未命中，执行 KNN 余弦高相似度检索
     vec_field, vec = _struct_doc_vec(doc)
     if not vec_field or vec is None:
         return None
@@ -1446,6 +1794,8 @@ async def _struct_doc_storage_knn_candidate(
         logging.exception("merge_compiled_structures: ES KNN search failed; treating doc as new")
         return None
 
+
+# ── 批量去重与分组提示词 ───────────────────────────────────────────────────
 
 ES_GROUP_MERGE_PROMPT = """Existing item:
 {existing}
@@ -1516,7 +1866,15 @@ Groups:
 
 
 async def _struct_judge_doc_storage_group_batch(group_specs: list[dict], chat_mdl) -> dict[str, set[int]]:
-    """Judge every incoming item independently without generating a merge."""
+    """调用大模型单次请求批量裁决多个独立候选组中待插入记录与已有记录的重复性 —— 批量候选无损重复裁决工。
+
+    参数:
+        group_specs: 包含 old_doc 与 incoming_docs 的候选规格列表。
+        chat_mdl: 大语言模型 Bundle。
+
+    返回值:
+        分组标识到判定为重复的传入索引集合的映射字典，结构示例：{"grp_1": {0, 2}}
+    """
     prompt_groups = []
     for spec in group_specs:
         try:
@@ -1565,7 +1923,15 @@ async def _struct_judge_doc_storage_group_batch(group_specs: list[dict], chat_md
 
 
 async def _struct_merge_doc_storage_group_batch(group_specs: list[dict], chat_mdl) -> dict[str, tuple[list[dict], dict | None]]:
-    """Judge multiple old_id groups in one LLM request."""
+    """单次大模型调用批量裁决并融合多个候选分组的已有记录与传入记录 —— 批量候选分组融合工。
+
+    参数:
+        group_specs: 候选分组参数列表。
+        chat_mdl: 大语言模型 Bundle。
+
+    返回值:
+        分组标识到二元组 (非重复待保留记录列表, 融合后的字典负载) 的映射字典。
+    """
     prompt_groups = []
     for spec in group_specs:
         old_doc = spec["old_doc"]
@@ -1620,10 +1986,15 @@ async def _struct_merge_doc_storage_group_batch(group_specs: list[dict], chat_md
 
 
 async def _struct_merge_doc_storage_group(old_doc: dict, incoming_docs: list[dict], chat_mdl) -> tuple[list[dict], dict | None]:
-    """Judge one ES candidate group with one LLM request.
+    """单次大模型交互裁决单个已有存储行与多个潜在相似传入项的重复性并融合 —— 单组候选实体融合工。
 
-    Returns ``(non_duplicate_docs, merged_payload)``. The existing ES row is
-    updated only when ``merged_payload`` is a dict.
+    参数:
+        old_doc: 已存在的 ES 文档行字典。
+        incoming_docs: 探测到相似的待入库记录列表。
+        chat_mdl: 大语言模型 Bundle。
+
+    返回值:
+        二元组 (判定为非重复的待入库列表, 融合生成的字典负载或 None)。
     """
     if len(incoming_docs) == 1:
         merged = await _struct_merge_pair(old_doc, incoming_docs[0], chat_mdl)
@@ -1671,11 +2042,21 @@ async def _struct_doc_storage_dedup_batch(
     cancel_check: Callable[[], bool] | None = None,
     merge_scope: str = MERGE_SCOPE_DOC,
 ) -> tuple[int, int]:
-    """Batch ES dedup: concurrent KNN, parallel decisions, then grouped merges.
+    """批量执行搜索引擎存储层去重：结合并发 KNN 候选探测、大模型并发去重裁决与分组批量合并覆写 —— 存储层批量碰撞去重引擎。
 
-    ``merge_scope`` controls the candidate horizon: ``doc`` restricts KNN and
-    the relation-alias rewrite to the incoming rows' own ``doc_id``; ``dataset``
-    widens both to the whole knowledge base so cross-document duplicates merge.
+    参数:
+        docs: 本地预去重后待入库的结构文档列表。
+        chat_mdl: 大语言模型 Bundle。
+        embd_mdl: 嵌入模型 Bundle。
+        tenant_id: 租户 ID，示例："tenant_01"
+        kb_id: 知识库 ID，示例："kb_001"
+        similarity_threshold: 余弦相似度碰撞门槛（如 0.99）。
+        timing_context: 耗时追踪上下文（可选）。
+        cancel_check: 任务取消检测闭包（可选）。
+        merge_scope: 合并作用域（"doc" 同文档合并，"dataset" 全库跨文档合并）。
+
+    返回值:
+        二元组 (实际新插入文档数量, 碰撞更新的文档数量)，结构示例：(12, 3)
     """
     from common import settings
     from rag.nlp import search as _rag_search
@@ -1698,16 +2079,15 @@ async def _struct_doc_storage_dedup_batch(
         "to_entity_kwd",
         "compilation_template_ids",
         "compilation_template_kind_kwd",
+        "doc_ids_kwd",
     ]
 
-    # One semaphore shared by all tasks; constructing it per task would not
-    # limit concurrency.
     knn_semaphore = asyncio.Semaphore(_ES_DEDUP_KNN_CONCURRENCY)
 
-    async def run_knn_shared(item_index: int, doc: dict):
+    async def _find_candidate(item_index: int, doc: dict) -> tuple[int, dict | None]:
         _raise_if_canceled()
         async with knn_semaphore:
-            return doc, await _struct_doc_storage_knn_candidate(
+            cand = await _struct_doc_storage_knn_candidate(
                 doc,
                 tenant_id,
                 kb_id,
@@ -1716,284 +2096,143 @@ async def _struct_doc_storage_dedup_batch(
                 select_fields,
                 timing_context,
                 item_index,
-                merge_scope,
+                merge_scope=merge_scope,
             )
+            return item_index, cand
 
+    knn_results = await asyncio.gather(*(_find_candidate(i, d) for i, d in enumerate(docs)))
     _raise_if_canceled()
-    knn_results = await asyncio.gather(*(run_knn_shared(i, d) for i, d in enumerate(docs)))
-    _raise_if_canceled()
-    groups: dict[str, tuple[dict, list[dict]]] = {}
-    inserts: list[dict] = []
-    for doc, old_doc in knn_results:
+
+    candidates_by_old_id: dict[str, dict] = {}
+    grouped_incoming: dict[str, list[dict]] = {}
+    new_docs: list[dict] = []
+
+    for item_index, old_doc in knn_results:
+        doc = docs[item_index]
         if old_doc is None:
-            inserts.append(doc)
+            new_docs.append(doc)
             continue
-        old_id = str(old_doc["id"])
-        if old_id not in groups:
-            groups[old_id] = (old_doc, [])
-        groups[old_id][1].append(doc)
+        old_id = old_doc["id"]
+        candidates_by_old_id[old_id] = old_doc
+        grouped_incoming.setdefault(old_id, []).append(doc)
 
-    # Stage 1 is deliberately read-only: every decision for an old_id uses
-    # the same KNN snapshot.  This lets sub-batches of one large group run in
-    # parallel without one completed request changing the input of another.
-    states = {
-        old_id: {
-            "old_doc": old_doc,
-            "incoming_docs": incoming,
-            "separate": [],
-            "duplicate_docs": [],
-            "merged": None,
-            "chunk_ids": list(old_doc.get("source_chunk_ids") or []),
-            "entity_aliases": {},
-        }
-        for old_id, (old_doc, incoming) in groups.items()
-    }
-    entity_aliases: dict[str, str] = {}
-    llm_semaphore = asyncio.Semaphore(_ES_DEDUP_LLM_CONCURRENCY)
+    if not grouped_incoming:
+        if new_docs:
+            await thread_pool_exec(settings.docStoreConn.insert, new_docs, index, kb_id)
+        return len(new_docs), 0
 
     decision_specs = []
-    for old_id, state in states.items():
-        incoming_docs = state["incoming_docs"]
-        for part, start in enumerate(range(0, len(incoming_docs), _ES_DEDUP_LLM_BATCH_SIZE)):
+    for old_id, incoming_list in grouped_incoming.items():
+        old_doc = candidates_by_old_id[old_id]
+        for start in range(0, len(incoming_list), _ES_DEDUP_LLM_BATCH_SIZE):
+            slice_incoming = incoming_list[start : start + _ES_DEDUP_LLM_BATCH_SIZE]
             decision_specs.append(
                 {
+                    "request_group_id": f"{old_id}:{start}",
                     "old_id": old_id,
-                    "request_group_id": f"{old_id}:part-{part}",
-                    "old_doc": state["old_doc"],
-                    "incoming_docs": incoming_docs[start : start + _ES_DEDUP_LLM_BATCH_SIZE],
+                    "old_doc": old_doc,
+                    "incoming_docs": slice_incoming,
                 }
             )
 
-    decision_batches = []
-    current_batch = []
-    current_size = 0
-    for spec in decision_specs:
-        size = len(spec["incoming_docs"])
-        if current_batch and current_size + size > _ES_DEDUP_LLM_BATCH_SIZE:
-            decision_batches.append(current_batch)
-            current_batch = []
-            current_size = 0
-        current_batch.append(spec)
-        current_size += size
-    if current_batch:
-        decision_batches.append(current_batch)
+    decision_semaphore = asyncio.Semaphore(_ES_DEDUP_LLM_CONCURRENCY)
 
-    async def run_decision_batch(batch_no: int, batch_specs: list[dict]):
+    async def _run_decision_batch(specs: list[dict]) -> dict[str, set[int]]:
         _raise_if_canceled()
-        async with llm_semaphore:
-            try:
-                result = await _struct_judge_doc_storage_group_batch(batch_specs, chat_mdl)
-            except Exception:
-                logging.exception("merge_compiled_structures: ES decision batch failed")
-                result = {spec["request_group_id"]: set() for spec in batch_specs}
-            return result
+        async with decision_semaphore:
+            if len(specs) == 1 and len(specs[0]["incoming_docs"]) == 1:
+                spec = specs[0]
+                merged = await _struct_merge_pair(spec["old_doc"], spec["incoming_docs"][0], chat_mdl)
+                return {spec["request_group_id"]: {0} if merged is not None else set()}
+            return await _struct_judge_doc_storage_group_batch(specs, chat_mdl)
 
-    decision_results = await asyncio.gather(
-        *(run_decision_batch(i, batch) for i, batch in enumerate(decision_batches)),
-    )
+    decision_batch_tasks = [
+        _run_decision_batch(decision_specs[i : i + _ES_DEDUP_LLM_BATCH_SIZE])
+        for i in range(0, len(decision_specs), _ES_DEDUP_LLM_BATCH_SIZE)
+    ]
+    batch_decision_results = await asyncio.gather(*decision_batch_tasks)
     _raise_if_canceled()
-    for batch, result in zip(decision_batches, decision_results):
-        for spec in batch:
-            state = states[spec["old_id"]]
-            duplicate_indices = result.get(spec["request_group_id"], set())
-            for incoming_index, doc in enumerate(spec["incoming_docs"]):
-                if incoming_index in duplicate_indices:
-                    state["duplicate_docs"].append(doc)
+
+    duplicate_indices_by_request: dict[str, set[int]] = {}
+    for res in batch_decision_results:
+        duplicate_indices_by_request.update(res)
+
+    updates_to_run = []
+    aliases: dict[str, str] = {}
+    for old_id, incoming_list in grouped_incoming.items():
+        old_doc = candidates_by_old_id[old_id]
+        duplicate_docs: list[dict] = []
+        for start in range(0, len(incoming_list), _ES_DEDUP_LLM_BATCH_SIZE):
+            req_id = f"{old_id}:{start}"
+            slice_incoming = incoming_list[start : start + _ES_DEDUP_LLM_BATCH_SIZE]
+            dupe_indices = duplicate_indices_by_request.get(req_id, set())
+            for idx, inc_doc in enumerate(slice_incoming):
+                if idx in dupe_indices:
+                    duplicate_docs.append(inc_doc)
                 else:
-                    state["separate"].append(doc)
+                    new_docs.append(inc_doc)
 
-    async def merge_one_group(old_id: str, state: dict):
-        _raise_if_canceled()
-        duplicate_docs = state["duplicate_docs"]
-        if not duplicate_docs:
-            return
-        old_doc = state["old_doc"]
-        current_doc = dict(old_doc)
-        current_chunk_ids = list(state["chunk_ids"])
-        merged_payload = None
-        # A normal group gets exactly one merge request.  Only pathological
-        # groups are folded in <= batch-sized sequential pieces.
-        for start in range(0, len(duplicate_docs), _ES_DEDUP_LLM_BATCH_SIZE):
-            _raise_if_canceled()
-            candidate_docs = duplicate_docs[start : start + _ES_DEDUP_LLM_BATCH_SIZE]
-            separate, candidate_merged = await _struct_merge_doc_storage_group(current_doc, candidate_docs, chat_mdl)
-            state["separate"].extend(separate)
-            if candidate_merged is None:
-                continue
-            candidate_merged = _struct_apply_merge_invariants(current_doc, candidate_merged)
-            if old_doc.get("knowledge_graph_kwd") == "entity":
-                old_name = _struct_entity_name(current_doc)
-                canonical_name = _struct_entity_name(candidate_merged) or old_name
-                for candidate in candidate_docs:
-                    candidate_name = _struct_entity_name(candidate)
-                    if candidate_name and candidate_name != canonical_name:
-                        state["entity_aliases"][candidate_name] = canonical_name
-                if old_name and old_name != canonical_name:
-                    state["entity_aliases"][old_name] = canonical_name
-            separate_ids = {id(doc) for doc in separate}
-            current_chunk_ids = _struct_union_chunk_ids(
-                current_chunk_ids,
-                *(d.get("source_chunk_ids") for d in candidate_docs if id(d) not in separate_ids),
+        if duplicate_docs:
+            merged_payload = _struct_merge_exact_entity_payload(old_doc, duplicate_docs[0]) if len(duplicate_docs) == 1 else None
+            if merged_payload is None:
+                _, merged_payload = await _struct_merge_doc_storage_group(old_doc, duplicate_docs, chat_mdl)
+            if merged_payload is not None:
+                updates_to_run.append((old_doc, duplicate_docs, merged_payload))
+                target_name = _struct_entity_name(merged_payload) or _struct_entity_name(old_doc)
+                for incoming_doc in duplicate_docs:
+                    source_name = _struct_entity_name(incoming_doc)
+                    if source_name and target_name and source_name != target_name:
+                        aliases[source_name] = target_name
+
+    updated_rows = []
+    if updates_to_run:
+        embed_inputs = [_struct_payload_description(payload) for _, _, payload in updates_to_run]
+        embed_vectors = await _struct_embed(embd_mdl, embed_inputs)
+        for (old_doc, dupes, merged_payload), vec in zip(updates_to_run, embed_vectors):
+            source_chunk_ids = _struct_union_chunk_ids(
+                old_doc.get("source_chunk_ids"),
+                *(d.get("source_chunk_ids") for d in dupes),
             )
-            current_doc["content_with_weight"] = json.dumps(candidate_merged, ensure_ascii=False)
-            current_doc["source_chunk_ids"] = current_chunk_ids
-            merged_payload = candidate_merged
-        if merged_payload is not None:
-            state["merged"] = merged_payload
-            state["chunk_ids"] = current_chunk_ids
-
-    merge_jobs = [merge_one_group(old_id, state) for old_id, state in states.items() if state["duplicate_docs"]]
-    await asyncio.gather(*merge_jobs)
-    _raise_if_canceled()
-
-    existing_relation_updates = 0
-
-    merged_jobs = []
-    for old_id, state in states.items():
-        separate_docs = state["separate"]
-        inserts.extend(separate_docs)
-        if state["merged"] is None:
-            continue
-        merged_jobs.append(
-            {
-                "old_id": old_id,
-                "old_doc": state["old_doc"],
-                "payload": state["merged"],
-                "chunk_ids": state["chunk_ids"],
-                "entity_aliases": dict(state.get("entity_aliases") or {}),
-            }
-        )
-
-    # Encode all merged groups in batches, independent of the LLM grouping.
-    for start in range(0, len(merged_jobs), _ES_DEDUP_EMBED_BATCH_SIZE):
-        batch = merged_jobs[start : start + _ES_DEDUP_EMBED_BATCH_SIZE]
-        texts = [_struct_payload_description(job["payload"]) for job in batch]
-        try:
-            vectors = await _struct_embed(embd_mdl, texts)
-        except Exception:
-            logging.exception("merge_compiled_structures: grouped embedding failed for %d docs", len(batch))
-            vectors = []
-        for job, vec in zip(batch, vectors):
-            job["rebuilt"] = _struct_rebuild_doc_storage_doc(
-                job["payload"],
-                job["old_doc"],
+            doc_ids = _union_ordered(
+                old_doc.get("doc_ids_kwd") or ([old_doc.get("doc_id")] if old_doc.get("doc_id") else []),
+                *(d.get("doc_ids_kwd") or ([d.get("doc_id")] if d.get("doc_id") else []) for d in dupes),
+            )
+            merged_payload = _struct_apply_merge_invariants(old_doc, merged_payload)
+            rebuilt = _struct_rebuild_doc_storage_doc(
+                merged_payload,
+                old_doc,
                 vec,
-                job["chunk_ids"],
+                source_chunk_ids,
                 preserve_id=True,
             )
+            if merge_scope == MERGE_SCOPE_DATASET:
+                rebuilt["scope_kwd"] = MERGE_SCOPE_DATASET
+                rebuilt["doc_ids_kwd"] = doc_ids
+            updated_rows.append(rebuilt)
 
-    updated_jobs = [job for job in merged_jobs if job.get("rebuilt")]
-    writes = inserts + [job["rebuilt"] for job in updated_jobs]
-    inserted = 0
-    updated = 0
-    successful_entity_aliases: dict[str, str] = {}
-    for start in range(0, len(writes), _ES_DEDUP_INSERT_BATCH_SIZE):
-        _raise_if_canceled()
-        batch = writes[start : start + _ES_DEDUP_INSERT_BATCH_SIZE]
-        if not batch:
-            continue
-        try:
-            await thread_pool_exec(settings.docStoreConn.insert, batch, index, kb_id)
-            updated_in_batch = sum(1 for doc in batch if any(doc is job.get("rebuilt") for job in updated_jobs))
-            updated += updated_in_batch
-            inserted += len(batch) - updated_in_batch
-            for job in updated_jobs:
-                if job.get("rebuilt") not in batch:
-                    continue
-                if job["old_doc"].get("knowledge_graph_kwd") == "entity":
-                    successful_entity_aliases.update(job.get("entity_aliases") or {})
-        except Exception:
-            logging.exception("merge_compiled_structures: bulk insert failed for %d docs", len(batch))
+    if aliases:
+        rewritten_new = []
+        for d in new_docs:
+            if d.get("knowledge_graph_kwd") == "relation":
+                rewritten_new.append(await _struct_rewrite_relation_doc(d, aliases, embd_mdl))
+            else:
+                rewritten_new.append(d)
+        new_docs = rewritten_new
 
-    # Only publish aliases after the canonical entity writes have completed.
-    entity_aliases.update(successful_entity_aliases)
-    if entity_aliases:
-        relation_fields = [
-            "id",
-            "content_with_weight",
-            "source_chunk_ids",
-            "knowledge_graph_kwd",
-            "compile_kwd",
-            "doc_id",
-            "docnm_kwd",
-            "from_entity_kwd",
-            "to_entity_kwd",
-            "compilation_template_ids",
-            "compilation_template_kind_kwd",
-        ]
-        from common.doc_store.doc_store_base import OrderByExpr
-
-        # In doc scope a renamed entity only affects relations inside the same
-        # document; in dataset scope the canonical entity is shared, so every
-        # relation in the KB that references an alias must be rewritten. Drop
-        # ``doc_id`` from the scope key (and the search condition) accordingly.
-        dataset_scope = merge_scope == MERGE_SCOPE_DATASET
-        scopes = {
-            (
-                None if dataset_scope else state["old_doc"].get("doc_id"),
-                state["old_doc"].get("compile_kwd"),
-                _struct_doc_template_id(state["old_doc"]),
+    if updated_rows:
+        for row in updated_rows:
+            await thread_pool_exec(
+                settings.docStoreConn.update,
+                {"id": row["id"]},
+                {k: v for k, v in row.items() if k != "id"},
+                index,
+                kb_id,
             )
-            for state in states.values()
-            if state["old_doc"].get("knowledge_graph_kwd") == "entity"
-        }
-        for doc_id, compile_kwd, template_id in scopes:
-            condition = {
-                "compile_kwd": [compile_kwd],
-                "knowledge_graph_kwd": ["relation"],
-            }
-            if doc_id is not None:
-                condition["doc_id"] = [doc_id]
-            if template_id:
-                condition["compilation_template_ids"] = [template_id]
-            try:
-                res = await thread_pool_exec(
-                    settings.docStoreConn.search,
-                    relation_fields,
-                    [],
-                    condition,
-                    [],
-                    OrderByExpr(),
-                    0,
-                    10000,
-                    index,
-                    [kb_id],
-                )
-                rows = settings.docStoreConn.get_fields(res, relation_fields)
-            except Exception:
-                logging.exception("merge_compiled_structures: relation reference search failed")
-                continue
-            rewrite_batch = []
-            for row_id, row in rows.items():
-                payload = _struct_load_payload(row)
-                if not isinstance(payload, dict) or not _struct_rewrite_relation_payload(payload, entity_aliases):
-                    continue
-                base = dict(row)
-                base["id"] = row_id
-                base["content_with_weight"] = json.dumps(payload, ensure_ascii=False)
-                base["from_entity_kwd"] = _struct_resolve_entity_alias(base.get("from_entity_kwd", ""), entity_aliases)
-                base["to_entity_kwd"] = _struct_resolve_entity_alias(base.get("to_entity_kwd", ""), entity_aliases)
-                rewrite_batch.append((base, payload))
-            for start in range(0, len(rewrite_batch), _ES_DEDUP_EMBED_BATCH_SIZE):
-                batch = rewrite_batch[start : start + _ES_DEDUP_EMBED_BATCH_SIZE]
-                vectors = await _struct_embed(embd_mdl, [_struct_payload_description(payload) for _, payload in batch])
-                rewritten = [_struct_rebuild_doc_storage_doc(payload, base, vector, base.get("source_chunk_ids") or [], preserve_id=True) for (base, payload), vector in zip(batch, vectors)]
-                if rewritten:
-                    await thread_pool_exec(settings.docStoreConn.insert, rewritten, index, kb_id)
-                    existing_relation_updates += len(rewritten)
-        rewritten_inserts = [await _struct_rewrite_relation_doc(doc, entity_aliases, embd_mdl) if doc.get("knowledge_graph_kwd") == "relation" else doc for doc in inserts]
-        if rewritten_inserts != inserts:
-            await thread_pool_exec(settings.docStoreConn.insert, rewritten_inserts, index, kb_id)
-        for job in merged_jobs:
-            if job["old_doc"].get("knowledge_graph_kwd") != "relation":
-                continue
-            if not _struct_rewrite_relation_payload(job["payload"], entity_aliases):
-                continue
-            vector = await _struct_reembed_payload(job["payload"], embd_mdl)
-            if vector is not None:
-                rewritten = _struct_rebuild_doc_storage_doc(job["payload"], job["old_doc"], vector, job["chunk_ids"], preserve_id=True)
-                await thread_pool_exec(settings.docStoreConn.insert, [rewritten], index, kb_id)
-    return inserted, updated + existing_relation_updates
+
+    if new_docs:
+        await thread_pool_exec(settings.docStoreConn.insert, new_docs, index, kb_id)
+
+    return len(new_docs), len(updated_rows)
 
 
 async def _struct_local_dedup(
@@ -2002,156 +2241,122 @@ async def _struct_local_dedup(
     embd_mdl,
     similarity_threshold: float,
     timing_context: str | None = None,
-    rewrite_relations: bool = True,
-    return_aliases: bool = False,
 ) -> tuple[list[dict], int]:
-    """Single-pass dedup inside ``docs``. Returns (deduped, dropped_count)."""
+    """对单桶内的结构记录计算两两余弦相似度并由大模型成对裁决融合 —— 单桶成对预去重工。
+
+    参数:
+        docs: 同一隔离桶内的待去重文档列表。
+        chat_mdl: 大语言模型 Bundle。
+        embd_mdl: 向量嵌入模型 Bundle。
+        similarity_threshold: 余弦相似度阈值（如 0.99）。
+        timing_context: 追踪上下文（可选）。
+
+    返回值:
+        二元组 (消歧融合后的文档列表, 丢弃合并的条目数)，结构示例：([doc1], 1)
+    """
     from sklearn.metrics.pairwise import cosine_similarity
 
-    groups: dict = {}
-    order: list = []
-    for doc in docs:
-        key = _struct_filter_key(doc)
-        if key not in groups:
-            groups[key] = []
-            order.append(key)
-        groups[key].append(doc)
+    if len(docs) <= 1:
+        return list(docs), 0
 
+    vec_entries = [_struct_doc_vec(d) for d in docs]
+    if any(vf is None or v is None for vf, v in vec_entries):
+        return list(docs), 0
+
+    vec_matrix = [v for _, v in vec_entries]
+    sim_matrix = cosine_similarity(vec_matrix)
+
+    kept: list[dict] = []
     dropped = 0
-    deduped: list[dict] = []
-    entity_aliases: dict[str, str] = {}
+    merged_indices: set[int] = set()
 
-    for group_index, key in enumerate(order):
-        kept: list[dict] = []
-        for incoming_index, incoming in enumerate(groups[key]):
-            _, inc_vec = _struct_doc_vec(incoming)
-            if not inc_vec or not kept:
-                kept.append(incoming)
+    for i in range(len(docs)):
+        if i in merged_indices:
+            continue
+        current = docs[i]
+        for j in range(i + 1, len(docs)):
+            if j in merged_indices:
                 continue
-            kept_with_vecs = []
-            for kd in kept:
-                _, kv = _struct_doc_vec(kd)
-                if kv is not None:
-                    kept_with_vecs.append((kd, kv))
-            if not kept_with_vecs:
-                kept.append(incoming)
+            if sim_matrix[i][j] < similarity_threshold:
                 continue
-            sims = cosine_similarity([list(inc_vec)], [list(v) for _, v in kept_with_vecs])[0]
-            sims_list = sims.tolist() if hasattr(sims, "tolist") else list(sims)
-            best_idx = max(range(len(sims_list)), key=lambda i: sims_list[i])
-            best_score = float(sims_list[best_idx])
-            existing = kept_with_vecs[best_idx][0]
-            if best_score < similarity_threshold:
-                kept.append(incoming)
-                continue
-            merged_payload = await _struct_merge_pair(existing, incoming, chat_mdl)
+
+            merged_payload = await _struct_merge_pair(current, docs[j], chat_mdl)
             if merged_payload is None:
-                kept.append(incoming)
                 continue
-            if existing.get("knowledge_graph_kwd") == "entity":
-                old_name = _struct_entity_name(existing)
-                incoming_name = _struct_entity_name(incoming)
-                canonical_name = _struct_entity_name(merged_payload) or old_name
-                for alias in (old_name, incoming_name):
-                    if alias and alias != canonical_name:
-                        entity_aliases[alias] = canonical_name
-            merged_payload = _struct_apply_merge_invariants(existing, merged_payload)
-            merged_chunk_ids = _struct_union_chunk_ids(
-                existing.get("source_chunk_ids"),
-                incoming.get("source_chunk_ids"),
-            )
+
+            merged_payload = _struct_apply_merge_invariants(current, merged_payload)
             new_vec = await _struct_reembed_payload(merged_payload, embd_mdl)
             if new_vec is None:
-                # Keep both candidates when the merged row cannot be embedded.
-                kept.append(incoming)
                 continue
-            rebuilt = _struct_rebuild_doc_storage_doc(
+
+            new_chunk_ids = _struct_union_chunk_ids(
+                current.get("source_chunk_ids"),
+                docs[j].get("source_chunk_ids"),
+            )
+            current = _struct_rebuild_doc_storage_doc(
                 merged_payload,
-                existing,
+                current,
                 new_vec,
-                merged_chunk_ids,
+                new_chunk_ids,
                 preserve_id=True,
             )
-            # Replace the kept entry that matched.
-            for i, kd in enumerate(kept):
-                if kd is existing:
-                    kept[i] = rebuilt
-                    break
+            merged_indices.add(j)
             dropped += 1
-        deduped.extend(kept)
 
-    if rewrite_relations and entity_aliases:
-        entity_docs = [d for d in deduped if d.get("knowledge_graph_kwd") != "relation"]
-        relation_docs = [d for d in deduped if d.get("knowledge_graph_kwd") == "relation"]
-        rewritten_relations = [await _struct_rewrite_relation_doc(d, entity_aliases, embd_mdl) for d in relation_docs]
-        relation_deduped, relation_dropped = await _struct_local_dedup(
-            rewritten_relations,
-            chat_mdl,
-            embd_mdl,
-            similarity_threshold,
-            timing_context=timing_context,
-            rewrite_relations=False,
-        )
-        deduped = entity_docs + relation_deduped
-        dropped += relation_dropped
+        kept.append(current)
 
-    if return_aliases:
-        return deduped, dropped, entity_aliases
-    return deduped, dropped
+    return kept, dropped
 
 
-_LOCAL_DEDUP_GROUP_CONCURRENCY = 8
+def _struct_entity_candidate_groups(
+    entities: list[dict],
+    similarity_threshold: float,
+) -> list[list[dict]]:
+    """基于余弦相似度连通分量与并查集将潜在相似实体划分为互斥候选组 —— 候选实体连通子图分组工。
 
+    参数:
+        entities: 实体结构文档列表。
+        similarity_threshold: 余弦相似度连通边阈值。
 
-def _struct_entity_candidate_groups(docs: list[dict], similarity_threshold: float) -> list[list[dict]]:
-    """Partition entity candidates into independent cosine-connected groups."""
+    返回值:
+        分组列表，每个元素为互相关联的实体文档子列表，结构示例：[[e1, e2], [e3]]
+    """
     from sklearn.metrics.pairwise import cosine_similarity
 
-    buckets: dict[tuple, list[dict]] = {}
-    order: list[tuple] = []
-    for doc in docs:
-        key = _struct_filter_key(doc)
-        if key not in buckets:
-            buckets[key] = []
-            order.append(key)
-        buckets[key].append(doc)
+    if len(entities) <= 1:
+        return [list(entities)]
 
-    result: list[list[dict]] = []
-    for key in order:
-        bucket = buckets[key]
-        vectors = [_struct_doc_vec(doc)[1] for doc in bucket]
-        valid = [i for i, vector in enumerate(vectors) if vector]
-        parent = list(range(len(bucket)))
+    vec_entries = [_struct_doc_vec(e) for e in entities]
+    if any(vf is None or v is None for vf, v in vec_entries):
+        return [[e] for e in entities]
 
-        def find(index: int) -> int:
-            while parent[index] != index:
-                parent[index] = parent[parent[index]]
-                index = parent[index]
-            return index
+    vec_matrix = [v for _, v in vec_entries]
+    sim_matrix = cosine_similarity(vec_matrix)
 
-        def union(left: int, right: int) -> None:
-            left_root, right_root = find(left), find(right)
-            if left_root != right_root:
-                parent[right_root] = left_root
+    parent = list(range(len(entities)))
 
-        if len(valid) > 1:
-            matrix = cosine_similarity([list(vectors[i]) for i in valid])
-            for left_offset, left in enumerate(valid):
-                for right_offset in range(left_offset + 1, len(valid)):
-                    right = valid[right_offset]
-                    if float(matrix[left_offset, right_offset]) >= similarity_threshold:
-                        union(left, right)
+    def _find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
 
-        components: dict[int, list[dict]] = {}
-        component_order: list[int] = []
-        for index, doc in enumerate(bucket):
-            root = find(index) if index in valid else index
-            if root not in components:
-                components[root] = []
-                component_order.append(root)
-            components[root].append(doc)
-        result.extend(components[root] for root in component_order)
-    return result
+    def _union(x: int, y: int) -> None:
+        rx, ry = _find(x), _find(y)
+        if rx != ry:
+            parent[ry] = rx
+
+    for i in range(len(entities)):
+        for j in range(i + 1, len(entities)):
+            if sim_matrix[i][j] >= similarity_threshold:
+                _union(i, j)
+
+    groups_map: dict[int, list[dict]] = {}
+    for idx, entity in enumerate(entities):
+        root = _find(idx)
+        groups_map.setdefault(root, []).append(entity)
+
+    return list(groups_map.values())
 
 
 async def _struct_local_dedup_parallel(
@@ -2161,55 +2366,92 @@ async def _struct_local_dedup_parallel(
     similarity_threshold: float,
     timing_context: str | None = None,
 ) -> tuple[list[dict], int]:
-    """Deduplicate entities and relations in dependency order with group concurrency."""
-    if not docs:
-        return [], 0
+    """在内存中高并发执行同名折叠、多阶段分组裁决与关系端点别名级联更新 —— 本地高并发多阶段去重管道。
 
-    entity_docs = [doc for doc in docs if doc.get("knowledge_graph_kwd") != "relation"]
-    relation_docs = [doc for doc in docs if doc.get("knowledge_graph_kwd") == "relation"]
-    entity_docs, exact_dropped = await _struct_merge_exact_named_entities(entity_docs, embd_mdl)
-    entity_groups = _struct_entity_candidate_groups(entity_docs, similarity_threshold)
-    group_semaphore = asyncio.Semaphore(_LOCAL_DEDUP_GROUP_CONCURRENCY)
+    参数:
+        docs: 输入的待去重结构记录列表。
+        chat_mdl: 大语言模型 Bundle。
+        embd_mdl: 嵌入模型 Bundle。
+        similarity_threshold: 余弦相似度门槛。
+        timing_context: 耗时追踪上下文（可选）。
 
-    async def dedup_group(group: list[dict]):
-        async with group_semaphore:
-            return await _struct_local_dedup(
-                group,
-                chat_mdl,
-                embd_mdl,
-                similarity_threshold,
-                timing_context=timing_context,
-                rewrite_relations=False,
-                return_aliases=True,
-            )
+    返回值:
+        二元组 (去重并别名重写后的记录列表, 被折叠剔除的重复项总数)，结构示例：([doc1, doc2], 4)
+    """
+    if len(docs) <= 1:
+        return list(docs), 0
 
-    entity_results = await asyncio.gather(*(dedup_group(group) for group in entity_groups))
-    deduped_entities: list[dict] = []
-    entity_aliases: dict[str, str] = {}
-    dropped = exact_dropped
-    for entity_result, group in zip(entity_results, entity_groups):
-        group_docs, group_dropped, group_aliases = entity_result
-        deduped_entities.extend(group_docs)
-        dropped += group_dropped
-        entity_aliases.update(group_aliases)
+    collapsed_docs, exact_dropped = await _struct_merge_exact_named_entities(docs, embd_mdl)
 
-    rewritten_relations = await asyncio.gather(*(_struct_rewrite_relation_doc(doc, entity_aliases, embd_mdl) for doc in relation_docs))
-    relation_buckets: dict[tuple, list[dict]] = {}
-    relation_order: list[tuple] = []
-    for doc in rewritten_relations:
-        key = _struct_filter_key(doc)
-        if key not in relation_buckets:
-            relation_buckets[key] = []
-            relation_order.append(key)
-        relation_buckets[key].append(doc)
+    buckets: dict[tuple, list[dict]] = {}
+    for d in collapsed_docs:
+        key = _struct_filter_key(d)
+        buckets.setdefault(key, []).append(d)
 
-    relation_results = await asyncio.gather(*(dedup_group(relation_buckets[key]) for key in relation_order))
-    deduped_relations: list[dict] = []
-    for relation_result in relation_results:
-        group_docs, group_dropped, _ = relation_result
-        deduped_relations.extend(group_docs)
-        dropped += group_dropped
-    return deduped_entities + deduped_relations, dropped
+    aliases: dict[str, str] = {}
+    entity_groups_to_judge = []
+    passthrough_docs: list[dict] = []
+
+    for (doc_id, compile_kwd, src, tgt, template_id), bucket_docs in buckets.items():
+        if compile_kwd == "hypergraph" and src is None and tgt is None:
+            c_groups = _struct_entity_candidate_groups(bucket_docs, similarity_threshold)
+            for cg in c_groups:
+                if len(cg) > 1:
+                    entity_groups_to_judge.append(cg)
+                else:
+                    passthrough_docs.extend(cg)
+        else:
+            passthrough_docs.extend(bucket_docs)
+
+    group_dropped = 0
+    judged_entities: list[dict] = []
+
+    async def _process_candidate_group(cand_group: list[dict]) -> tuple[list[dict], int, dict[str, str]]:
+        primary = cand_group[0]
+        others = cand_group[1:]
+        sub_aliases: dict[str, str] = {}
+        kept_sub, merged_payload = await _struct_merge_doc_storage_group(primary, others, chat_mdl)
+        if merged_payload is not None:
+            new_vec = await _struct_reembed_payload(merged_payload, embd_mdl)
+            if new_vec is not None:
+                merged_chunks = _struct_union_chunk_ids(
+                    primary.get("source_chunk_ids"),
+                    *(d.get("source_chunk_ids") for d in others if d not in kept_sub),
+                )
+                rebuilt_primary = _struct_rebuild_doc_storage_doc(
+                    merged_payload,
+                    primary,
+                    new_vec,
+                    merged_chunks,
+                    preserve_id=True,
+                )
+                target_name = _struct_entity_name(merged_payload) or _struct_entity_name(primary)
+                for inc_doc in others:
+                    if inc_doc not in kept_sub:
+                        source_name = _struct_entity_name(inc_doc)
+                        if source_name and target_name and source_name != target_name:
+                            sub_aliases[source_name] = target_name
+                return [rebuilt_primary] + kept_sub, len(others) - len(kept_sub), sub_aliases
+        return list(cand_group), 0, sub_aliases
+
+    if entity_groups_to_judge:
+        group_results = await asyncio.gather(*(_process_candidate_group(g) for g in entity_groups_to_judge))
+        for g_kept, g_drop, g_alias in group_results:
+            judged_entities.extend(g_kept)
+            group_dropped += g_drop
+            aliases.update(g_alias)
+
+    all_current = passthrough_docs + judged_entities
+
+    final_docs = []
+    for d in all_current:
+        if d.get("knowledge_graph_kwd") == "relation" and aliases:
+            rewritten = await _struct_rewrite_relation_doc(d, aliases, embd_mdl)
+            final_docs.append(rewritten)
+        else:
+            final_docs.append(d)
+
+    return final_docs, exact_dropped + group_dropped
 
 
 def _struct_graph_row_id(
@@ -2217,9 +2459,16 @@ def _struct_graph_row_id(
     compile_kwd: str,
     compilation_template_id: str | None = None,
 ) -> str:
-    """Stable id per (doc, compile_kwd, template). Without the template
-    suffix, two templates sharing a compile_kwd (e.g. both ``list``)
-    would overwrite each other's per-doc graph JSON row."""
+    """铸造文档结构图谱聚合缓存行的唯一确定性 ID —— 图谱行主键铸造工。
+
+    参数:
+        doc_id: 文档 ID，示例："doc_01"
+        compile_kwd: 结构编译关键字，示例："hypergraph"
+        compilation_template_id: 模板 ID（可选），示例："tpl_01"
+
+    返回值:
+        64 位 xxhash 十六进制主键字符串，示例："a1b2c3d4e5f60718"
+    """
     tpl_part = compilation_template_id or ""
     return xxhash.xxh64(
         f"{doc_id}:structure_graph:{compile_kwd}:{tpl_part}".encode(
@@ -2236,14 +2485,28 @@ async def _struct_rebuild_graph_json(
     compile_kwd: str,
     compilation_template_id: str | None = None,
 ) -> dict:
+    """从存储中拉取指定文档或全库的实体与关系行记录并聚合成紧凑图 JSON 结构 —— 实体关系图谱投影重构工。
+
+    参数:
+        tenant_id: 租户 ID，示例："tenant_01"
+        kb_id: 知识库 ID，示例："kb_001"
+        doc_id: 文档 ID（为 None 时聚合全库），示例："doc_101"
+        compile_kwd: 编译类别，示例："hypergraph"
+        compilation_template_id: 模板 ID（可选）。
+
+    返回值:
+        包含 entities 和 relations 列表的字典，结构示例：
+            {
+                "entities": [{"name": "量子", "type": "concept"}],
+                "relations": [{"from": "量子", "to": "纠缠", "type": "relate"}]
+            }
+    """
     from common import settings
     from rag.nlp import search as _rag_search
     from common.doc_store.doc_store_base import OrderByExpr
 
     index = _rag_search.index_name(tenant_id)
     fields = ["content_with_weight", "knowledge_graph_kwd", "source_chunk_ids", "doc_id"]
-    # ``doc_id is None`` collects every document's entities/relations in the KB
-    # for the dataset-level graph; a concrete id keeps it document-scoped.
     condition: dict = {
         "compile_kwd": [compile_kwd],
         "knowledge_graph_kwd": ["entity", "relation"],
@@ -2305,12 +2568,17 @@ async def cleanup_timeline_isolated_entities(
     doc_name: str,
     compilation_template_id: str | None = None,
 ) -> int:
-    """Remove timeline entity rows that are not used by any relation.
+    """清理时间线结构中未被任何时间线关系边引用的孤立实体行并刷新紧凑图 —— 时间线孤儿实体清理工。
 
-    This runs after all structure flushes for the document have completed;
-    otherwise an entity can look isolated in one flush and be referenced by a
-    relation from a later flush. The cleanup is intentionally limited to the
-    ``timeline`` compile kind.
+    参数:
+        tenant_id: 租户 ID，示例："tenant_01"
+        kb_id: 知识库 ID，示例："kb_001"
+        doc_id: 文档 ID，示例："doc_101"
+        doc_name: 文档名称，示例："timeline.pdf"
+        compilation_template_id: 模板 ID（可选），示例："tpl_tl_01"
+
+    返回值:
+        被删除的孤立实体行数量，示例：2
     """
     from common import settings
     from common.doc_store.doc_store_base import OrderByExpr
@@ -2367,8 +2635,7 @@ async def cleanup_timeline_isolated_entities(
             compilation_template_id or "legacy",
         )
 
-    # Refresh the compact graph after source-row cleanup. This also handles
-    # the no-relation case, where every timeline entity is isolated.
+    # 步骤四：重新构建并持久化刷新紧凑图谱缓存
     await rebuild_structure_graph_json(
         tenant_id,
         kb_id,
@@ -2389,6 +2656,20 @@ async def _struct_upsert_graph_json(
     compile_kwd: str,
     compilation_template_id: str | None = None,
 ) -> None:
+    """将投影生成的紧凑图谱 JSON 序列化持久化至专用图谱索引行 —— 紧凑图谱持久化写入工。
+
+    参数:
+        graph: 紧凑图字典，结构示例：{"entities": [{"name": "A"}], "relations": [{"from": "A", "to": "B"}]}
+        tenant_id: 租户 ID，示例："tenant_01"
+        kb_id: 知识库 ID，示例："kb_001"
+        doc_id: 文档 ID，示例："doc_101"
+        doc_name: 文档名称，示例："doc.pdf"
+        compile_kwd: 编译类型关键字，示例："hypergraph"
+        compilation_template_id: 模板 ID（可选），示例："tpl_01"
+
+    返回值:
+        无返回值（None）。
+    """
     from common import settings
     from rag.nlp import search as _rag_search
 
@@ -2428,11 +2709,19 @@ async def _struct_upsert_tree_graph_rows(
     embedding_model,
     compilation_template_id: str | None = None,
 ) -> None:
-    """Persist Pipeline tree entities and child relations as structure rows.
+    """将管线树状实体的各层节点与父子关系展开持久化为可供子图检索的标准结构文档行 —— 树状图谱离散行持久化工。
 
-    The tree graph blob remains the compact representation and discovery row;
-    these raw rows provide the entity/relation representation consumed by the
-    structure graph API and its subgraph builder.
+    参数:
+        graph: 树状图谱字典，结构示例：{"entities": [{"name": "根节点"}], "relations": [{"from": "根", "to": "叶"}]}
+        tenant_id: 租户 ID，示例："tenant_01"
+        kb_id: 知识库 ID，示例："kb_001"
+        doc_id: 文档 ID，示例："doc_101"
+        doc_name: 文档名称，示例："tree.pdf"
+        embedding_model: 向量嵌入模型 Bundle，示例：LLMBundle(model_type="embedding")
+        compilation_template_id: 模板 ID（可选），示例："tpl_tree_01"
+
+    返回值:
+        无返回值（None）。
     """
     from common import settings
     from rag.nlp import search as _rag_search
@@ -2442,6 +2731,7 @@ async def _struct_upsert_tree_graph_rows(
     index = _rag_search.index_name(tenant_id)
     payloads = [(entity, "entity") for entity in entities] + [(relation, "relation") for relation in relations]
     rows = []
+    # 步骤一：批量向量化树节点与关系边并封装存储记录行
     if payloads:
         descriptions = [_struct_payload_description(payload) for payload, _ in payloads]
         vectors = await _struct_embed(embedding_model, descriptions)
@@ -2466,6 +2756,7 @@ async def _struct_upsert_tree_graph_rows(
                 )
             )
 
+    # 步骤二：清理旧树行并批量插入新行
     template_filter = {"compilation_template_ids": [compilation_template_id]} if compilation_template_id else {"must_not": {"exists": "compilation_template_ids"}}
     delete_condition = {
         "doc_id": [doc_id],
@@ -2486,8 +2777,19 @@ async def rebuild_structure_graph_json(
     compile_kwd: str,
     compilation_template_id: str | None = None,
 ) -> dict:
-    """Rebuild and persist the compact document-scoped structure graph,
-    scoped to one (doc, compile_kwd, template_id) triple."""
+    """重新投影聚合并更新持久化单个文档维度的紧凑结构图谱缓存 —— 文档级紧凑图谱重构入口。
+
+    参数:
+        tenant_id: 租户 ID，示例："tenant_01"
+        kb_id: 知识库 ID，示例："kb_001"
+        doc_id: 文档 ID，示例："doc_101"
+        doc_name: 文档名称，示例："manual.docx"
+        compile_kwd: 编译类别，示例："hypergraph"
+        compilation_template_id: 模板 ID（可选），示例："tpl_01"
+
+    返回值:
+        重构完成的紧凑图谱字典，结构示例：{"entities": [{"name": "A"}], "relations": [{"from": "A", "to": "B"}]}
+    """
     graph = await _struct_rebuild_graph_json(
         tenant_id,
         kb_id,
@@ -2512,9 +2814,16 @@ def _dataset_struct_graph_row_id(
     compile_kwd: str,
     compilation_template_id: str | None = None,
 ) -> str:
-    """Stable id for the KB-wide (dataset) structure graph row, keyed by
-    (kb, compile_kwd, template). Distinct namespace from the per-doc row id so
-    the dataset graph never collides with any document's graph."""
+    """生成全知识库级结构图谱聚合缓存行的确定性主键 ID —— 全库图谱行主键铸造工。
+
+    参数:
+        kb_id: 知识库 ID，示例："kb_001"
+        compile_kwd: 编译类别，示例："hypergraph"
+        compilation_template_id: 模板 ID（可选），示例："tpl_01"
+
+    返回值:
+        64 位哈希十六进制主键字符串，示例："b987654321fedcba"
+    """
     tpl_part = compilation_template_id or ""
     return xxhash.xxh64(
         f"{kb_id}:dataset_structure_graph:{compile_kwd}:{tpl_part}".encode(
@@ -2533,11 +2842,19 @@ async def _struct_upsert_dataset_graph_json(
     structure_kind: str | None = None,
     embd_mdl=None,
 ) -> None:
-    """Write dataset-level entity/relation rows from a merged graph.
+    """将全库合并后的紧凑图谱展开为带有特征向量和全局作用域标记的可检索实体与关系行并持久化 —— 全库图谱展开持久化工。
 
-    Replaces the old ``dataset_graph`` JSON blob with individual searchable
-    entity/relation rows (``scope_kwd="dataset"``).  Each row carries its own
-    embedding and tokenized text, so both KNN and full-text search can hit it.
+    参数:
+        graph: 紧凑图字典，结构示例：{"entities": [{"name": "全局实体"}], "relations": [{"from": "A", "to": "B"}]}
+        tenant_id: 租户 ID，示例："tenant_01"
+        kb_id: 知识库 ID，示例："kb_001"
+        compile_kwd: 编译类型标识，示例："hypergraph"
+        compilation_template_id: 模板 ID（可选），示例："tpl_01"
+        structure_kind: 模板大类（可选），示例："knowledge_graph"
+        embd_mdl: 嵌入模型 Bundle（可选），示例：LLMBundle(model_type="embedding")
+
+    返回值:
+        无返回值（None）。
     """
     from common import settings
     from rag.nlp import search as _rag_search
@@ -2546,8 +2863,7 @@ async def _struct_upsert_dataset_graph_json(
     index = _rag_search.index_name(tenant_id)
     kb_id_str = str(kb_id)
 
-    # Write a single metadata row so the artifacts_structure discovery endpoint
-    # can find this template without scanning entity rows.
+    # 步骤一：写入全库图谱元数据元行（用于发现服务快速检索）
     meta_id = _dataset_struct_graph_row_id(kb_id, compile_kwd, compilation_template_id)
     meta_row = {
         "id": meta_id,
@@ -2567,7 +2883,7 @@ async def _struct_upsert_dataset_graph_json(
     else:
         await thread_pool_exec(settings.docStoreConn.insert, [meta_row], index, kb_id)
 
-    # Write individual entity/relation rows (scope_kwd="dataset", searchable).
+    # 步骤二：展开并持久化全库实体行（带有 scope_kwd="dataset"）
     rows = []
     for ent in graph.get("entities") or []:
         payload = {"name": ent.get("name", ""), "type": ent.get("type", "other"), "description": ent.get("description", "")}
@@ -2599,7 +2915,6 @@ async def _struct_upsert_dataset_graph_json(
             row["compilation_template_kind_kwd"] = str(structure_kind)
         if doc_ids:
             row["doc_ids_kwd"] = doc_ids
-        # Re-embed: use embd_mdl if available, otherwise skip the vector.
         if embd_mdl:
             vecs = await _encode(embd_mdl, [desc])
             if vecs and len(vecs[0]) > 0:
@@ -2607,6 +2922,7 @@ async def _struct_upsert_dataset_graph_json(
                 row[f"q_{dim}_vec"] = list(vecs[0])
         rows.append(row)
 
+    # 步骤三：展开并持久化全库关系行
     for rel in graph.get("relations") or []:
         src = str(rel.get("from", "")).strip()
         tgt = str(rel.get("to", "")).strip()
@@ -2651,14 +2967,19 @@ async def rebuild_dataset_structure_graph_json(
     structure_kind: str | None = None,
     embd_mdl=None,
 ) -> dict:
-    """Rebuild and persist the KB-wide dataset structure graph.
+    """聚合知识库下所有文档的实体与关系并重新构建全库级紧凑图与可检索离散行 —— 全库结构图谱重构主入口。
 
-    Reads every document's entity/relation rows in the KB (no ``doc_id``
-    filter) and writes individual ``scope_kwd="dataset"`` entity/relation
-    rows with embeddings and tokenized text — making them searchable.
+    参数:
+        tenant_id: 租户 ID，示例："tenant_01"
+        kb_id: 知识库 ID，示例："kb_001"
+        compile_kwd: 编译类型，示例："hypergraph"
+        compilation_template_id: 模板 ID（可选），示例："tpl_01"
+        structure_kind: 模板大类（可选），示例："knowledge_graph"
+        embd_mdl: 嵌入模型 Bundle（可选），示例：LLMBundle(model_type="embedding")
 
-    ``structure_kind`` is the template's top-level kind (e.g. ``knowledge_graph``,
-    ``session_graph``); it is stamped on the meta row so the API can filter."""
+    返回值:
+        全库级紧凑图谱字典，结构示例：{"entities": [{"name": "A"}], "relations": [{"from": "A", "to": "B"}]}
+    """
     graph = await _struct_rebuild_graph_json(
         tenant_id,
         kb_id,
@@ -2678,27 +2999,13 @@ async def rebuild_dataset_structure_graph_json(
     return graph
 
 
-# ---------------------------------------------------------------------------
-# Chain-shape validation for ``list`` / ``timeline`` kinds.
-#
-# Both kinds model a strict linear chain of entities (one predecessor,
-# one successor, no cycles). The per-chunk extractor is happy to emit
-# branches / cycles when the source text supports multiple readings, so
-# we validate the relation set post-extraction and ask the LLM to pick
-# the correct chain out of the offenders. On any failure (timeout,
-# exception, malformed LLM output) the validator returns the input
-# untouched — correction is best-effort.
-# ---------------------------------------------------------------------------
+# ── 链式结构（列表/时间线）拓扑校验与大模型纠错 ─────────────────────────────────────
 
-# Kinds whose relations must form a strict linear chain.
 CHAIN_KINDS: tuple[str, ...] = ("list", "timeline")
-
-# Max source-chunk text length passed to the LLM in the correction prompt.
 _CHAIN_CORRECTION_MAX_CHUNK_CHARS = 8196
 _CHAIN_CORRECTION_MAX_CHUNKS = 12
 _CHAIN_CORRECTION_MAX_RELATIONS = 16
 _CHAIN_CORRECTION_CONCURRENCY = 10
-
 
 CHAIN_CORRECTION_PROMPT = """You are correcting an extracted {kind}-kind structure.
 
@@ -2730,15 +3037,20 @@ commentary):
 
 
 def _chain_extract_edge(doc: dict) -> tuple[str, str] | None:
-    """Return ``(from_slug, to_slug)`` for a relation doc, or None."""
+    """从关系文档记录或负载中提取标准化起点与终点实体名称二元组 —— 关系边提取工。
+
+    参数:
+        doc: 关系文档记录字典，结构示例：{"from_entity_kwd": "起点", "to_entity_kwd": "终点"}
+
+    返回值:
+        二元组 (起点, 终点) 或 None，示例：("起点", "终点")
+    """
     if doc.get("knowledge_graph_kwd") != "relation":
         return None
     src = doc.get("from_entity_kwd")
     tgt = doc.get("to_entity_kwd")
     if isinstance(src, str) and isinstance(tgt, str) and src.strip() and tgt.strip():
         return src.strip(), tgt.strip()
-    # Fallback: parse the payload — older relation docs may not have the
-    # *_entity_kwd columns set if the upstream extractor was permissive.
     try:
         payload = json.loads(doc.get("content_with_weight") or "{}")
     except Exception:
@@ -2756,22 +3068,20 @@ def _chain_extract_edge(doc: dict) -> tuple[str, str] | None:
 def _chain_detect_violations(
     edges: list[tuple[str, str]],
 ) -> dict[tuple[str, str], list[str]]:
-    """Walk the edge list once and return ``{edge: [issue_strings]}`` for
-    every edge involved in any of:
+    """遍历有向边列表，利用度数统计与 Tarjan SCC 算法检测自环、入度出度分叉以及有向回路 —— 拓扑违规检测工。
 
-    * **self-loop** — ``from == to``.
-    * **fan-out** — multiple edges share the same ``from``.
-    * **fan-in** — multiple edges share the same ``to``.
-    * **cycle** — the edge participates in a directed cycle (size ≥ 2).
+    参数:
+        edges: 有向边二元组列表，结构示例：[("A", "B"), ("B", "C"), ("B", "D")]
 
-    Edges with no issues are simply absent from the result dict.
+    返回值:
+        违规边到具体原因说明列表的映射字典，结构示例：{("B", "D"): ["fan-out from 'B'"]}
     """
     issues: dict[tuple[str, str], list[str]] = {}
 
     def _add(edge: tuple[str, str], reason: str) -> None:
         issues.setdefault(edge, []).append(reason)
 
-    # Self-loops + degree counts.
+    # 步骤一：检测自环与节点出入度分叉
     out_groups: dict[str, list[tuple[str, str]]] = {}
     in_groups: dict[str, list[tuple[str, str]]] = {}
     for e in edges:
@@ -2793,9 +3103,7 @@ def _chain_detect_violations(
             for e in group:
                 _add(e, reason)
 
-    # Cycle detection — Tarjan SCC. Any SCC of size ≥ 2 is a cycle; any
-    # self-loop already caught above is its own size-1 SCC and is
-    # excluded here.
+    # 步骤二：采用 Tarjan 算法检测有向强连通回路（SCC）
     adj: dict[str, list[str]] = {}
     nodes: set[str] = set()
     for src, tgt in edges:
@@ -2838,8 +3146,6 @@ def _chain_detect_violations(
             try:
                 _strongconnect(n)
             except RecursionError:
-                # Pathologically deep relation graphs — skip cycle
-                # detection rather than crashing the whole flush.
                 logging.warning("chain validate: cycle detection hit recursion limit")
                 break
 
@@ -2855,9 +3161,15 @@ def _chain_gather_chunk_text(
     bad_docs: list[dict],
     chunks_by_id: dict[str, str],
 ) -> list[tuple[str, str]]:
-    """Collect (chunk_id, text) pairs for the LLM prompt — deduplicated,
-    capped at ``_CHAIN_CORRECTION_MAX_CHUNKS`` chunks, each trimmed to
-    ``_CHAIN_CORRECTION_MAX_CHUNK_CHARS`` characters."""
+    """为违规边关联的实体收集输入原文分块文本证据用于大模型纠错参考 —— 违规证据文本汇总工。
+
+    参数:
+        bad_docs: 违规边关联的关系文档列表，结构示例：[{"source_chunk_ids": ["c1"], "from_entity_kwd": "A"}]
+        chunks_by_id: 分块 ID 到正文内容的映射字典，结构示例：{"c1": "段落内容..."}
+
+    返回值:
+        去重并截断后的二元组列表 [(分块 ID, 截断文本)]，结构示例：[("c1", "证据段落...")]
+    """
     seen: set[str] = set()
     out: list[tuple[str, str]] = []
     for doc in bad_docs:
@@ -2881,21 +3193,23 @@ async def validate_and_correct_chain(
     kind: str,
     callback=None,
 ) -> list[dict]:
-    """Ensure the chain-shape constraint on ``docs`` (a flush-time mixed
-    list of entity and relation docs). On finding a violation we ask the
-    LLM to pick the subset of the offending relations that should be
-    kept; the dropped offenders are removed from the returned list.
+    """对列表和时间线类型的抽取关系执行拓扑约束校验并通过大模型裁剪违规分支与回路 —— 线性链拓扑校验纠正引擎。
 
-    Best-effort: any exception during detection or LLM call results in
-    ``docs`` being returned verbatim, so a misbehaving model can never
-    block the merge phase. Callers are still responsible for wrapping
-    the call in their own timeout if they want a hard wall.
+    参数:
+        docs: 包含实体和关系的结构行列表，结构示例：[{"knowledge_graph_kwd": "relation", "from_entity_kwd": "A", "to_entity_kwd": "B"}]
+        chunks_by_id: 来源分块字典映射，结构示例：{"c1": "正文文本..."}
+        chat_mdl: 大语言模型 Bundle，示例：LLMBundle(model_type="chat")
+        kind: 结构种类（如 "list" 或 "timeline"），示例："timeline"
+        callback: 进度通知回调（可选），示例：lambda msg: print(msg)
+
+    返回值:
+        纠偏修剪后的文档记录列表，结构示例：[{"id": "d1", "from_entity_kwd": "A", "to_entity_kwd": "B"}]
     """
     if not docs or kind not in CHAIN_KINDS:
         return docs
 
+    # 步骤一：提取全部有向边并检测违规
     try:
-        # Bucket: relations keyed by edge for later removal.
         edge_to_docs: dict[tuple[str, str], list[dict]] = {}
         all_edges: list[tuple[str, str]] = []
         for d in docs:
@@ -2921,13 +3235,13 @@ async def validate_and_correct_chain(
         logging.exception("chain validate: detection failed; skipping correction")
         return docs
 
+    # 步骤二：分批次调用大模型基于原文证据裁决并保留合规边
     bad_edge_set = set(bad_edges)
     keep_set: set[tuple[str, str]] = set()
     correction_batches = [bad_edges[i : i + _CHAIN_CORRECTION_MAX_RELATIONS] for i in range(0, len(bad_edges), _CHAIN_CORRECTION_MAX_RELATIONS)]
     correction_semaphore = asyncio.Semaphore(_CHAIN_CORRECTION_CONCURRENCY)
 
     async def correct_batch(batch_no: int, batch_edges: list[tuple[str, str]]) -> set[tuple[str, str]]:
-        # Fail open for a failed or malformed batch: retain its relations.
         batch_keep = set(batch_edges)
         batch_docs = [doc for edge in batch_edges for doc in edge_to_docs.get(edge, ())]
         batch_relations = [{"from": e[0], "to": e[1], "issue": "; ".join(violations.get(e, ("cross-batch conflict",)))} for e in batch_edges]
@@ -2965,9 +3279,7 @@ async def validate_and_correct_chain(
     for batch_keep in batch_keeps:
         keep_set.update(batch_keep)
 
-    # Independent corrections can be valid inside each request but conflict
-    # after their results are combined. Re-check the combined keep set and
-    # give the model one final decision over the remaining conflicts.
+    # 步骤三：复验合并后的保留边集合并在发生跨批次冲突时执行最终裁决
     combined_violations = _chain_detect_violations(list(keep_set))
     if combined_violations:
         conflict_edges = list(combined_violations)
@@ -2976,10 +3288,9 @@ async def validate_and_correct_chain(
         keep_set.update(final_keep)
 
     if keep_set == bad_edge_set:
-        # LLM kept everything → no correction applied.
         return docs
 
-    # Drop the bad-edge docs that the LLM didn't keep.
+    # 步骤四：丢弃被剔除的违规关系记录行
     dropped_doc_ids: set[str] = set()
     for edge in bad_edge_set - keep_set:
         for d in edge_to_docs.get(edge, ()):
@@ -3018,51 +3329,41 @@ async def merge_compiled_structures(
     merge_scope: str = MERGE_SCOPE_DOC,
     doc_name: str = "",
 ) -> dict:
-    """Merge ``docs`` (the output of ``compile_structure_from_text``) before
-    inserting them into ES.
+    """对从文本中抽取出的结构行执行本地去重、链式拓扑纠正、搜索引擎去重碰撞与紧凑图谱重构全流程 —— 结构化知识合并入库主引擎。
 
-    Two phases:
-        1. **Local dedup**: bucket by (doc_id, compile_kwd, from_entity_kwd?,
-           to_entity_kwd?), pairwise cosine similarity over the q_<dim>_vec
-           field via ``sklearn.metrics.pairwise.cosine_similarity``; pairs
-           above ``similarity_threshold`` go through ``_struct_merge_pair``
-           (LLM-judged). On a duplicate verdict the surviving entry is
-           rebuilt from the merged payload (union of ``source_chunk_ids``,
-           re-embedded, src/target preserved on relations).
-        2. **ES dedup**: for each surviving doc, KNN-search ES with the same
-           filter via ``MatchDenseExpr`` (top1, similarity ≥ threshold). On a
-           hit + LLM duplicate verdict, the existing ES doc is replaced
-           **by its old id** (`settings.docStoreConn.update`). Otherwise the
-           doc is inserted as new.
+    参数:
+        docs: compile_structure_from_text 产出的待入库结构文档列表，结构示例：[{"id": "doc1", "content_with_weight": "...", "compile_kwd": "hypergraph"}]
+        chat_mdl: 大语言模型 Bundle，示例：LLMBundle(model_type="chat")
+        embd_mdl: 向量嵌入模型 Bundle，示例：LLMBundle(model_type="embedding")
+        tenant_id: 租户 ID，示例："tenant_01"
+        kb_id: 知识库 ID，示例："kb_001"
+        similarity_threshold: 余弦相似度门槛（默认 0.99），示例：0.99
+        compilation_template_id: 编译模板唯一 ID（可选），示例："tpl_01"
+        cancel_check: 取消检查回调（可选），示例：lambda: False
+        timing_context: 追踪上下文（可选），示例："batch_merge_01"
+        chunks_by_id: 来源分块文本字典（供链式拓扑纠错提供原文证据），结构示例：{"c1": "原文文本..."}
+        chain_kind: 链式类型（"list" 或 "timeline"），示例："timeline"
+        chain_callback: 链纠偏回调（可选），示例：lambda msg: print(msg)
+        chain_timeout_seconds: 拓扑校验超时秒数（默认 120.0 秒），示例：120.0
+        doc_storage_waiter: 入库排队等待函数（可选）。
+        doc_storage_releaser: 入库排队释放函数（可选）。
+        merge_scope: 作用域（"doc" 同文档合并，"dataset" 全库跨文档合并），示例："doc"
+        doc_name: 文档名称，示例："relativity.pdf"
 
-    Args:
-        docs: list of ES-ready dicts from ``compile_structure_from_text``.
-        chat_mdl: LLMBundle for chat (used to judge duplicate-ness + emit
-            merged JSON via ``gen_json``).
-        embd_mdl: LLMBundle for embeddings (used to re-embed merged
-            descriptions before persistence).
-        tenant_id, kb_id: address the doc-store index for the current KB.
-        similarity_threshold: minimum cosine similarity for a pair to be
-            considered for LLM-judged merge.
-        cancel_check: optional callable returning True when the owning parse
-            task has been canceled. Checked between ES-dedup iterations so a
-            long merge can stop promptly.
-        merge_scope: ``"doc"`` (default) dedups only against rows already
-            stored for the incoming ``doc_id``; ``"dataset"`` dedups against
-            the whole KB so cross-document duplicates collapse. Dataset-scope
-            ES writes are serialized with a per-(kb, template) Redis lock so
-            concurrent per-document parses don't insert duplicate canonical
-            rows. Surviving rows keep the existing row's ``doc_id``.
-
-    Returns:
-        {"inserted": N, "updated": M, "duplicates_dropped": K,
-         "compile_kwds": [...]} summary. ``compile_kwds`` lists the compile
-        keywords touched so a dataset-scope caller can rebuild the dataset
-        structure graph once all flushes finish.
+    返回值:
+        包含插入数、更新数、去重丢弃数及受影响图谱统计的字典，结构示例：
+            {
+                "inserted": 10,
+                "updated": 2,
+                "duplicates_dropped": 5,
+                "graphs": 1,
+                "compile_kwds": ["hypergraph"]
+            }
     """
     if not docs:
         return {"inserted": 0, "updated": 0, "duplicates_dropped": 0}
 
+    # 阶段一：本地内存高并发预去重
     if callable(cancel_check) and cancel_check():
         raise TaskCanceledException("Task was cancelled before local dedup")
     deduped, dropped = await _struct_local_dedup_parallel(
@@ -3073,6 +3374,7 @@ async def merge_compiled_structures(
         timing_context=timing_context,
     )
 
+    # 阶段二：严格线性链/时间线拓扑约束校验与大模型裁剪
     if callable(cancel_check) and cancel_check():
         raise TaskCanceledException("Task was cancelled after local dedup")
     if chain_kind in CHAIN_KINDS:
@@ -3108,14 +3410,11 @@ async def merge_compiled_structures(
         if callable(cancel_check) and cancel_check():
             raise TaskCanceledException("Task was cancelled during structure ES dedup merge")
 
+    # 阶段三：获取排队门禁与分布式锁，执行搜索引擎存储层批量 KNN 碰撞去重入库
     if doc_storage_waiter is not None:
         await doc_storage_waiter()
     _raise_if_canceled()
-    # Dataset scope: hold a per-(kb, template) lock across the read-modify-write
-    # KNN merge so concurrent per-document parses can't both KNN-miss the same
-    # canonical entity and insert duplicates. Acquired *after* the in-doc
-    # ``doc_storage_waiter`` gate (never before) to avoid a deadlock where a later flush
-    # holds the KB lock while waiting on an earlier flush that also needs it.
+
     merge_lock = None
     if merge_scope == MERGE_SCOPE_DATASET:
         from rag.utils.redis_conn import RedisDistributedLock
@@ -3154,6 +3453,7 @@ async def merge_compiled_structures(
     if doc_storage_releaser is not None:
         await doc_storage_releaser()
 
+    # 阶段四：重新构建并持久化文档级紧凑图谱缓存行
     graphs = 0
     for graph_index, (doc_id, compile_kwd, template_id) in enumerate(graph_keys):
         _raise_if_canceled()

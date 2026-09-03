@@ -12,7 +12,11 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
-#
+"""知识离线编译与结构化提取组件包。
+
+包含文档结构编译（structure）、维基知识库编译（wiki / wiki_incremental）、
+RAPTOR 递归聚类树（raptor）、思维导图提取（mind_map_extractor）以及数据集全库导航树（dataset_nav）。
+"""
 
 from .structure import compile_structure_from_text, merge_compiled_structures
 from .wiki import (

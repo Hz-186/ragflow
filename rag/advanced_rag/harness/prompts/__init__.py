@@ -1,1 +1,4 @@
-"""Prompt templates for Agentic RAG harness."""
+"""Agentic RAG harness 所需的提示词模板包。
+
+集中管理报告生成、问答合成、大纲研判等阶段传给大语言模型的专用系统提示词。
+"""

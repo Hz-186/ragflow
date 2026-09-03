@@ -14,8 +14,7 @@
 #  limitations under the License.
 #
 
-# Mode configuration is the public entry point: every mode-dependent decision in
-# the harness reads from here.
+# 模式配置是整个包的公共入口：harness 中所有依赖模式的策略决策都从这里读取。
 from .harness.config import NAIVE, THINKING_MODES, get_mode, resolve_mode
 
 

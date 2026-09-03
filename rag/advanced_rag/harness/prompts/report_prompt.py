@@ -1,5 +1,13 @@
-"""Report synthesis prompts."""
+"""最终报告合成与回答生成提示词模块。
 
+定义了在收集并检索完所有事实证据后，交给大模型生成最终严格对齐事实的答案时使用的系统提示词模版。
+"""
+
+# 最终回答系统提示词（FINAL_ANSWER_SYSTEM）：
+# 强制要求模型仅依据提供的证据回答、明确多跳问题中的最终实体目标、遵守引用格式并杜绝属性偷换（如把出生地当籍贯等）。
+# 传给模型的 prompt 字符串模板，包含待格式化占位符 `{cite_rules}`。
+# 示例结构：
+#   FINAL_ANSWER_SYSTEM.format(cite_rules="Use [d1] format...") -> str
 FINAL_ANSWER_SYSTEM = """You are a smart agent. Answer the user's question using ONLY the evidence provided below. Do not invent facts: if the evidence cannot support a claim, say so plainly instead of guessing.
 
 # Answer target
@@ -29,5 +37,8 @@ Answer in the SAME language as the question. Translate retrieved evidence into t
 If the evidence does not answer the question, reply with a clear statement that you don't have enough information based on the available sources (in the user's language).
 """
 
-
+# 部分答案前置声明提示语：当上下文证据不足或多轮检索超时降级时，在最终回答前拼接的提示前缀。
+# 类型：str
+# 示例：
+#   "Note: the following answer is based on partial information and may be incomplete."
 PARTIAL_ANSWER_PREAMBLE = "Note: the following answer is based on partial information and may be incomplete."
