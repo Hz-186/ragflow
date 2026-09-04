@@ -1,19 +1,3 @@
-#
-#  Copyright 2025 The InfiniFlow Authors. All Rights Reserved.
-#
-#  Licensed under the Apache License, Version 2.0 (the "License");
-#  you may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
-#
-
 """RAPTOR 摘要切片的「标记识别与跳过判定」小工具集 —— RAPTOR 身份证管理局。
 
 RAPTOR 生成的摘要切片写进索引时，会带一个身份标记字段 ``raptor_kwd: "raptor"``，
@@ -29,7 +13,6 @@ RAPTOR 生成的摘要切片写进索引时，会带一个身份标记字段 ``r
 
 本模块只做「判断和收集」，不碰索引、不碰模型，因此无副作用、可放心单测。
 """
-
 import json
 import logging
 from typing import Optional
@@ -99,9 +82,9 @@ def _has_raptor_marker(marker) -> bool:
     历史数据里它可能是单个字符串，也可能是列表，两种形态都要兼容。
 
     输入参数的样子：
-        marker = "raptor"            # 单字符串形态 → True
-        marker = ["raptor", "psi"]   # 列表形态：只要列表里出现 "raptor" 就算 → True
-        marker = "other"             # 别的标记 → False
+        marker = "raptor"               # 单字符串形态 → True
+        marker = ["raptor", "legacy"]   # 列表形态：只要列表里出现 "raptor" 就算 → True
+        marker = "other"                # 别的标记 → False
 
     返回值：
         True / False   # 是否为 RAPTOR 摘要切片
@@ -122,9 +105,10 @@ def _raptor_methods_from_fields(fields: dict, extra: dict | None = None) -> set[
         # extra 可显式传入（已经反序列化好的字典），不传就从 fields["extra"] 现解析
 
     返回值的样子：
-        {"raptor"}    # method 是单值或单元素列表
-        {"raptor", "psi"}   # method 是列表时的全部取值
-        set()         # method 为空字符串等空值
+        {"raptor"}             # method 是单值或单元素列表；
+                               # 注意单值为空串时走下面 or 兜底，同样得 {"raptor"}
+        {"raptor", "legacy"}   # method 是列表 ["raptor", "legacy"] 时，取全部非空取值
+        set()                  # method 是仅含空值的列表时，如 [""]
     """
     extra = extra if extra is not None else _as_extra_dict(fields.get("extra"))
     method = extra.get("raptor_method") or RAPTOR_TREE_BUILDER
@@ -143,12 +127,12 @@ def collect_raptor_methods(field_map: dict) -> set[str]:
     输入参数的样子（文档引擎按切片 id 取回的字段映射）：
         field_map = {
             "chunk_id_1": {"raptor_kwd": "raptor", "extra": {"raptor_method": "raptor"}},
-            "chunk_id_2": {"raptor_kwd": "raptor", "extra": {"raptor_method": "psi"}},
+            "chunk_id_2": {"raptor_kwd": "raptor", "extra": {"raptor_method": "legacy"}},
             "chunk_id_3": {"raptor_kwd": "other"},   # 非 RAPTOR 切片，忽略
         }
 
     返回值的样子：
-        {"raptor", "psi"}   # 出现过的建树者方法名集合；没有 RAPTOR 切片时为 set()
+        {"raptor", "legacy"}   # 出现过的建树者方法名集合；没有 RAPTOR 切片时为 set()
     """
     methods = set()
     for fields in field_map.values():
@@ -171,13 +155,13 @@ def collect_raptor_chunk_ids(field_map: dict, exclude_methods: set[str] | None =
     输入参数的样子：
         field_map = {
             "chunk_id_1": {"raptor_kwd": "raptor", "extra": {"raptor_method": "raptor"}},
-            "chunk_id_2": {"raptor_kwd": "raptor", "extra": {"raptor_method": "psi"}},
+            "chunk_id_2": {"raptor_kwd": "raptor", "extra": {"raptor_method": "legacy"}},
         }
         exclude_methods = {"raptor"}   # 排除 "raptor" 方法的产物；缺省不排除
 
     返回值的样子：
         {"chunk_id_1", "chunk_id_2"}   # 不排除时，全部 RAPTOR 切片 id
-        {"chunk_id_2"}                 # 排除 "raptor" 后只剩 "psi" 的产物
+        {"chunk_id_2"}                 # 排除 "raptor" 后只剩 "legacy" 的产物
     """
     chunk_ids = set()
     exclude_methods = exclude_methods or set()
@@ -204,7 +188,7 @@ def make_raptor_summary_chunk_id(content: str, doc_id: str) -> str:
         doc_id  = "doc_001"
 
     返回值的样子：
-        "3f2a9b7c1e4d5f60"   # 16 位十六进制字符串（xxh64 摘要）
+        "786a34b084150259"   # 16 位十六进制字符串（上面输入真实算出的结果）
     """
     return xxhash.xxh64((content + str(doc_id)).encode("utf-8")).hexdigest()
 

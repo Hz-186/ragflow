@@ -55,7 +55,7 @@ async def get_raptor_chunk_field_map(doc_id: str, tenant_id: str, kb_id: str) ->
     返回值的样子（切片 id → 标记字段）：
         {
             "chunk_id_1": {"raptor_kwd": "raptor", "extra": {"raptor_method": "raptor"}},
-            "chunk_id_2": {"raptor_kwd": "raptor", "extra": {"raptor_method": "psi"}},
+            "chunk_id_2": {"raptor_kwd": "raptor", "extra": {"raptor_method": "legacy"}},
         }
         {}   # 该文档没有任何 RAPTOR 切片（快路径查空且兜底也无结果时）
     """
@@ -111,9 +111,9 @@ async def delete_raptor_chunks(doc_id: str, tenant_id: str, kb_id: str, keep_met
             tenant_id,
             kb_id,
         )
-        # 两种行形态一起扫：逐条摘要行（raptor，PSI 建树者仍在产出）
-        # 和单行整树（raptor_tree），保证无论上次是哪条路径产出的，
-        # 重跑都从干净状态开始
+        # 两种行形态一起扫：逐条摘要行（raptor_kwd="raptor"，
+        # 默认建树器的产物）和单行整树（raptor_tree），保证无论
+        # 上次是哪条路径产出的，重跑都从干净状态开始
         await thread_pool_exec(
             settings.docStoreConn.delete,
             {"doc_id": doc_id, "raptor_kwd": ["raptor", "raptor_tree"]},

@@ -27,7 +27,9 @@ RAPTOR（Recursive Abstractive Processing for Tree-Organized Retrieval）
    增强检索的全部机制：不改变检索算法，只是往候选池里放进「站得更高」
    的候选。
 2. 单行整树（``raptor_kwd="raptor_tree"``，available_int=0 不可检索）——
-   is_tree=True 路径的产物，整棵树序列化成一行，供编译模板使用。
+   is_tree=True 路径的产物，整棵树序列化成一行。注意：该分支当前
+   没有任何生产调用方（编译模板走的树路径是 build_doc_tree，产物
+   不落这种行），属于保留能力。
 3. 图谱行（``compile_kwd="raptor_graph"``，available_int=0 不可检索）——
    由 _persist_raptor_graph_to_es 在摘要入库后生成：把摘要按层级投影成
    {entities, relations} 图结构存成一行，供前端「结构图」页签和
@@ -35,7 +37,8 @@ RAPTOR（Recursive Abstractive Processing for Tree-Organized Retrieval）
 
 此外本服务还负责两件事：断点续建（入库前先查该文档已有哪些建树方法
 的摘要，已有就跳过）、旧摘要清理（重跑前排好清理计划，新摘要插入
-成功后才真正删旧的）。
+步骤返回后再删旧的——注意当前实现不校验插入是否成功，见
+_schedule_raptor_cleanup 的说明）。
 """
 
 import copy
@@ -67,19 +70,20 @@ from rag.svr.task_executor_refactor.task_context import TaskContext
 
 
 def _sum_tree_text_tokens(tree) -> int:
-    """统计整棵 RAPTOR 树里所有 ``title`` 摘要文本的 token 总数 —— 摘要字数会计。
+    """统计整棵 RAPTOR 树里所有节点 ``title``（首行标题）的 token 总数 —— 摘要字数会计。
 
-    单行整树（raptor_tree）路径不再产出逐条摘要行，但上游编排的日志/
-    计费仍沿用老的 tk_count 口径（各层摘要文本的 token 总和），
-    本函数就是补上这个统计：遍历树上每个节点的 title 累加。
+    注意口径：只累加每个节点的 title（LLM 摘要输出的第一行标题），
+    不含 description 里的完整摘要正文，所以它和逐条摘要路径的
+    tk_count（累加完整摘要正文）并不严格等价，数值通常小得多。
     用栈做迭代遍历，树再深也不会撞递归深度限制。
 
     输入参数的样子（is_tree=True 时 Raptor.__call__ 返回的树字典）：
         tree = {
-            "title": "全文总览：风险控制与合规要点",
+            "title": "全文总览：风险控制与合规要点",      # 只统计这一项
+            "description": "本文档覆盖市场、信用、操作三类风险……",  # 不计入
             "children": [
-                {"title": "第一章 市场风险概述", "children": []},
-                {"title": "第二章 信用风险评估", "children": []},
+                {"title": "第一章 市场风险概述", "description": "……", "children": []},
+                {"title": "第二章 信用风险评估", "description": "……", "children": []},
             ],
         }
 
@@ -179,7 +183,7 @@ class RaptorService:
         res = []  # 本批生产出的摘要切片行，逐文档累加
         tk_count = 0  # 摘要文本 token 累计
         cleanup_raptor_chunks = []  # 旧摘要清理计划，逐条追加
-        max_errors = int(os.environ.get("RAPTOR_MAX_ERRORS", 3))  # LLM 摘要连续失败的容忍上限
+        max_errors = int(os.environ.get("RAPTOR_MAX_ERRORS", 3))  # LLM 摘要累计失败的容忍上限（只增不减，不是连续）
 
         # 先从 MySQL 把每个文档的名字/类型/解析器信息查出来（跳过判定要用）
         doc_info_by_id = self._collect_doc_info(doc_ids)
@@ -438,8 +442,8 @@ class RaptorService:
         chunks: List[Tuple[str, np.ndarray, str]] = []
         skipped_chunks = 0
 
-        # 取回字段里必须包含 "id"：chunk_list 在显式指定 fields 时
-        # 默认不带切片 id，而血缘追踪离了它就没法做
+        # chunk_list 本来就会给每条结果补上 "id" 键，这里把 "id"
+        # 也列进 fields 只是显式声明依赖：血缘追踪要用它
         fields = ["id", "content_with_weight", vctr_nm]
         for d in settings.retriever.chunk_list(doc_id, ctx.tenant_id, [str(ctx.kb_id)], fields=fields, sort_by_position=True):
             if vctr_nm not in d or d[vctr_nm] is None:
@@ -534,8 +538,10 @@ class RaptorService:
                 ],
                 1234   # 所有摘要正文的 token 总数（计入任务用量）
             )
-            is_tree=True 时返回 (整棵树 JSON 压成一行的单元素列表, 全树正文 token 数)，
-            该行 raptor_kwd="raptor_tree"、available_int=0（不可被检索）。
+            is_tree=True 时返回 (整棵树 JSON 压成一行的单元素列表,
+            全树各节点 title 的 token 数——只算首行标题不含正文，见
+            _sum_tree_text_tokens)，该行 raptor_kwd="raptor_tree"、
+            available_int=0（不可被检索）。
         """
         ctx = self._task_context
         from rag.advanced_rag.knowlege_compile.raptor import RecursiveAbstractiveProcessing4TreeOrganizedRetrieval as Raptor
@@ -563,9 +569,11 @@ class RaptorService:
         # 库级产线挂在伪文档 graph_raptor_x 下，没有真实文件名，用任务名代替
         effective_doc_name = ctx.name if doc_id == GRAPH_RAPTOR_FAKE_DOC_ID else doc_info_by_id.get(doc_id, {}).get("name") or ctx.name
 
-        # 默认路径：向建树器要一棵层级树。PSI 建树器（超边摘要）
-        # 无法形成严格的父子关系，is_tree=True 时会抛
-        # NotImplementedError，接住后转走逐条摘要的旧物化路径兜底
+        # 默认路径：向建树器要一棵层级树。下面这个 except
+        # NotImplementedError 是历史遗留的防御分支——早期 PSI
+        # 建树器不支持树模式会在这里抛异常（该建树器已移除，
+        # 当前建树器不会抛此异常，分支实际不可达），接住后
+        # 转走逐条摘要的旧物化路径兜底
         original_length = len(chunks)  # 记住叶子数：返回列表前 N 个是叶子，之后全是摘要
         try:
             processed_chunks, layers = await raptor(
@@ -673,21 +681,22 @@ class RaptorService:
 
         返回值的样子（建树器 _materialize_tree 的产物）：
             {   # 根摘要节点；多个顶层节点时会包一层 {"title": "(root)", "children": [...]}
-                "title": "",            # 建树时未生成标题，通常为空串
-                "description": "本文档覆盖市场、信用、操作三类风险……",  # 摘要正文
+                "title": "风险手册总览",  # LLM 摘要输出的首行标题
+                                         #（默认提示词要求第一行给标题）
+                "description": "本文档覆盖市场、信用、操作三类风险……",  # 完整摘要正文
                 "children": [
                     {   # 中间层摘要节点：继续挂 children
-                        "title": "", "description": "第一章讲了市场风险……",
+                        "title": "市场风险篇", "description": "第一章讲了市场风险……",
                         "children": [...]
                     },
                     {   # 叶子的直接摘要节点：不带 children，改挂血缘
-                        "title": "", "description": "……",
+                        "title": "利率与汇率", "description": "……",
                         "source_chunk_ids": ["chunk_0001", "chunk_0003"]
                     }
                 ]
             }
-            # 以下情况返回 None：切片为空 / 选中 PSI 建树器（构不成
-            # 严格的树）/ 建树失败
+            # 以下情况返回 None：切片为空 / 建树失败 / 触发了
+            # 那个历史遗留的 NotImplementedError 防御分支
         """
         if not chunks:
             return None
@@ -715,7 +724,8 @@ class RaptorService:
                 is_tree=True,
             )
         except NotImplementedError:
-            # PSI 建树器不支持树模式：返回 None，让编译模板
+            # 历史遗留的防御分支（早期 PSI 建树器不支持树模式，
+            # 现已移除，正常不会走到这里）：返回 None，让编译模板
             # 那条路能体面地跳过这个文档
             logging.warning(
                 "build_doc_tree: PSI builder doesn't support is_tree; skipping",
@@ -732,10 +742,11 @@ class RaptorService:
         effective_doc_name,
         vctr_nm,
     ) -> Tuple[List[Dict], int]:
-        """旧式逐条摘要物化，现在只留给 PSI 建树器兜底 —— 旧产线保留间。
+        """旧式逐条摘要物化，现在只是 NotImplementedError 防御分支的兜底 —— 旧产线保留间。
 
-        PSI 的超边摘要构不成严格的树，_generate_raptor 在 is_tree 路径
-        抛 NotImplementedError 后落到这里。产出形状与默认路径一致：
+        _generate_raptor 在 is_tree 路径触发那个历史遗留的
+        NotImplementedError 防御分支（早期 PSI 建树器不支持树模式，
+        该建树器已移除）后落到这里。产出形状与默认路径一致：
         每条摘要一行、raptor_kwd="raptor" 可被检索；唯一多出来的是
         若建树器给了血缘就落 source_chunk_ids 字段。
 
@@ -756,8 +767,8 @@ class RaptorService:
         """
         ctx = self._task_context
         original_length = len(raptor_input)  # 叶子数，后面的才是摘要
-        # 这里不带 is_tree 重跑（PSI 下默认 False 不会抛），
-        # 拿回扁平的「叶子+全部摘要」列表和每层下标范围
+        # 这里不带 is_tree 重跑（扁平列表路径不触发树模式防御分支），
+        # 拿回「叶子+全部摘要」的扁平列表和每层下标范围
         processed_chunks, layers = await raptor(
             raptor_input,
             raptor_config["random_seed"],
@@ -815,8 +826,10 @@ class RaptorService:
         """登记一条「该删哪些旧摘要」的清理计划 —— 清理计划记账员。
 
         只是把 (文档, 保留方法) 记进计划清单并去重；真正的删除
-        在新摘要成功入库之后由 task_handler 统一执行（先成功后清旧，
-        保证任何时刻索引里至少有一份可用摘要）。
+        在新摘要插入步骤返回之后由 task_handler 统一执行。
+        注意：当前实现并不校验插入是否成功（insert_result 只被
+        记录进审计上下文），插入失败时清理照样执行——所以
+        「先成功后清旧」的保证在代码里并不存在。
 
         输入参数的样子：
             doc_id = "doc_001"
@@ -836,9 +849,9 @@ class RaptorService:
     async def _get_raptor_chunk_methods(cls, doc_id: str, tenant_id: str, kb_id: str) -> Set[str]:
         """查索引里这个文档已经存在哪些 RAPTOR 产物 —— 断点续建探测器。
 
-        用途：重建前先摸清家底。如果文档已有「逐条摘要行」，
-        本次任务就可以直接跳过摘要生产，只补「图谱行」（见
-        task_handler._run_raptor 的分流判断）。
+        用途：重建前先摸清家底。如果文档已有本方法的摘要产物，
+        本次任务就直接跳过该文档的摘要生产（注意：跳过即零新增，
+        也不会补写图谱行——图谱行只在有新摘要入库时落盘）。
 
         输入参数的样子：
             doc_id = "doc_001", tenant_id = "tenant_001", kb_id = "kb_001"
@@ -856,9 +869,9 @@ class RaptorService:
 
         try:
             # 主查询：按 RAPTOR 身份证过滤。两种标记都要认：
-            # "raptor"（逐条摘要行，生产默认与 PSI 都产这种）和
-            # "raptor_tree"（整棵树压一行的新形态），
-            # 这样无论索引里存着哪种形态都能被探测到
+            # "raptor"（逐条摘要行，生产默认产物）和
+            # "raptor_tree"（整棵树压一行的形态，当前无生产调用方
+            # 但历史索引里可能存在），无论存着哪种形态都能被探测到
             primary = await search_fields(
                 ["raptor_kwd", "extra"],
                 {"doc_id": doc_id, "raptor_kwd": ["raptor", "raptor_tree"]},

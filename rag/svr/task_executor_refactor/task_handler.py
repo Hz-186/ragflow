@@ -366,7 +366,9 @@ class TaskHandler:
         效果：
             索引里新增一批可检索的摘要行 + 每个文档一行结构图谱行，
             旧的过期摘要被清理，任务进度报告 100%。
-            失败时通过 progress_cb(-1.0) 报错，不抛给上层。
+            两个前置检查（知识库不存在、配置写回失败）会走
+            progress_cb(-1.0) 报错并返回；运行期异常（建树中断、
+            插入失败等）会向上抛出，由更外层统一处理。
         """
         ctx = self._task_context
         task_tenant_id = ctx.tenant_id
@@ -389,7 +391,8 @@ class TaskHandler:
                     "raptor": {
                         "use_raptor": True,
                         # 默认摘要提示词：不许编造事实、不许改数字，
-                        # 输出两行——第一行标题，后面是摘要正文
+                        # 输出两部分——第一部分是一行标题，
+                        # 第二部分（可多行）是摘要正文
                         "prompt": "Summarize the paragraphs below without inventing facts or changing numbers.\nOutput exactly two parts in the same language as the source:\n1. First line: a concise title only.\n2. Following lines: a concise summary of the content.\nDo not output labels, Markdown headings, bullet points, or any other commentary.\n\nParagraphs:\n{cluster_content}",
                         "max_token": 512,
                         "clustering_threshold": 0.3,
@@ -433,7 +436,7 @@ class TaskHandler:
             ctx.recording_context.record("raptor_token_count", token_count)
 
             if chunks:
-                # 统计口径用的文档 id：库级产线没有真实文档时，
+                # 统计口径用的文档 id：doc_ids 与 doc_id 都为空时，
                 # 退回伪文档 graph_raptor_x
                 task_doc_id = (ctx.doc_ids or [ctx.doc_id] or [GRAPH_RAPTOR_FAKE_DOC_ID])[0]
                 chunk_service = ChunkService(ctx=ctx)
@@ -444,8 +447,10 @@ class TaskHandler:
                 else:
                     ctx.recording_context.record("insertion_result", "failed")
 
-                # 新摘要入库成功后才执行清理：按生产时登记的计划，
-                # 逐文档删掉过期的旧摘要（保留本轮新方法产的）
+                # 插入步骤返回后执行清理：按生产时登记的计划，
+                # 逐文档删掉过期的旧摘要（保留本轮新方法产的）。
+                # 注意：这里不校验上面的 insert_result，插入失败
+                # 时清理照样执行（见 raptor_service 同名说明）
                 cleaned_chunks = 0
                 for cleanup_doc_id, keep_method in raptor_cleanup_chunks:
                     ret = await self._delete_raptor_chunks(cleanup_doc_id, task_tenant_id, task_dataset_id, keep_method)
