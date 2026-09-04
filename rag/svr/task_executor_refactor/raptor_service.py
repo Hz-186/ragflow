@@ -114,7 +114,8 @@ class RaptorService:
     1. 断点检测：入库前查某文档/数据集已有哪些建树方法的摘要，有则跳过；
     2. 摘要生产：按文档逐个（scope="file"）或全库合并（scope="dataset"）
        跑 RAPTOR，产出摘要切片行；
-    3. 旧摘要清理计划：重跑时把要删的旧摘要排成计划，插入成功后执行；
+    3. 旧摘要清理计划：重跑时把要删的旧摘要排成计划，交给调用方在
+       插入步骤返回后执行（注意：调用方不校验插入是否成功）；
     4. 自动禁用规则：Excel/CSV、表格型 PDF 不做 RAPTOR。
     """
 
@@ -174,7 +175,7 @@ class RaptorService:
                 1850,   # 所有摘要文本的 token 总数（记账用）
                 [("doc_003", "raptor"), ("graph_raptor_x", None)],
                 # 旧摘要清理计划：(文档id, 要保留的建树方法名；None=全删)，
-                # 由调用方在新摘要插入成功后执行
+                # 由调用方在插入步骤返回后执行（不校验插入是否成功）
             )
         """
         raptor_config = kb_parser_config.get("raptor", {})
@@ -594,7 +595,10 @@ class RaptorService:
             )
 
         if processed_chunks is None:
-            return [], 0  # 建树失败（如摘要连续报错被放弃）：无产出
+            # 防御分支：建树器只在 is_tree=True 且有效切片不足 2 片时
+            # 返回 (None, None)；默认逐条摘要路径到不了这里——
+            # 摘要累计报错达上限时建树器直接抛 RuntimeError，不返回 None
+            return [], 0
         # 所有摘要行共享的公共字段模板（后面逐条深拷贝再填差异部分）
         doc = {
             "doc_id": doc_id,

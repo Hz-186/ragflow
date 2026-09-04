@@ -1,18 +1,3 @@
-#
-#  Copyright 2024 The InfiniFlow Authors. All Rights Reserved.
-#
-#  Licensed under the Apache License, Version 2.0 (the "License");
-#  you may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
-
 """
 Task Handler Module.
 
@@ -436,8 +421,10 @@ class TaskHandler:
             ctx.recording_context.record("raptor_token_count", token_count)
 
             if chunks:
-                # 统计口径用的文档 id：doc_ids 与 doc_id 都为空时，
-                # 退回伪文档 graph_raptor_x
+                # 统计口径用的文档 id：doc_ids 为空时用 doc_id 兜底。
+                # 注意 [ctx.doc_id] 是单元素列表恒为真值，所以最后那个
+                # 伪文档 graph_raptor_x 的回退实际不可达——两者皆空时
+                # 这里拿到的是空串（代码侧的潜在隐患）
                 task_doc_id = (ctx.doc_ids or [ctx.doc_id] or [GRAPH_RAPTOR_FAKE_DOC_ID])[0]
                 chunk_service = ChunkService(ctx=ctx)
                 # 摘要行批量写入索引——从这一刻起它们就能被检索命中
