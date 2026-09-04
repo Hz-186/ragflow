@@ -384,9 +384,24 @@ class RaptorService:
         return res, tk_count
 
     def _should_skip_raptor(self, doc_id: str, doc_info_by_id: Dict, raptor_config: Dict) -> bool:
-        """Check if RAPTOR should be skipped for a document."""
+        """判定某文档是否跳过 RAPTOR（自动禁用规则的现场执行）—— 禁用规则门卫。
+
+        只是把文档档案（文件类型/解析器/解析器配置）凑齐，转手交给
+        rag.utils.raptor_utils.should_skip_raptor 做判断；跳过时播报原因。
+
+        输入参数的样子：
+            doc_id = "doc_002"
+            doc_info_by_id = {"doc_002": {"name": "产品说明.xlsx", "type": ".xlsx",
+                                          "parser_id": "naive", "parser_config": {}}}
+            raptor_config = {"use_raptor": True, "auto_disable_for_structured_data": True}
+
+        返回值：
+            True   # 该文档跳过（这里是 .xlsx，结构化数据）
+            False  # 正常做 RAPTOR
+        """
         ctx = self._task_context
         doc_info = doc_info_by_id.get(doc_id, {})
+        # 文档档案缺项时退回任务上下文里的值兜底
         file_type = doc_info.get("type") or ctx.raw_task.get("type", "")
         parser_id = doc_info.get("parser_id") or ctx.parser_id
         parser_config = doc_info.get("parser_config") or ctx.parser_config
@@ -400,23 +415,36 @@ class RaptorService:
         return False
 
     def _load_doc_chunks(self, doc_id: str, vctr_nm: str) -> List[Tuple[str, np.ndarray, str]]:
-        """Load chunks for a single document.
+        """从索引取回单个文档的原始切片，备料给建树 —— 单文档切片搬运工。
 
-        Returns ``(content, vector, chunk_id)`` triples so downstream
-        RAPTOR can attach ``source_chunk_ids`` provenance onto every
-        summary it produces. ``chunk_id`` may be an empty string if the
-        retriever didn't surface one — defensive against legacy rows.
+        复用你已经熟悉的 Dealer.chunk_list（search.py 的切片目录器），
+        按文档内位置顺序取回正文+向量+切片 id。切片 id 必须带上：
+        后面每条摘要要记录「我是由哪些原始切片总结来的」
+        （source_chunk_ids 血缘），源头就从这里开始。
+
+        输入参数的样子：
+            doc_id = "doc_001"
+            vctr_nm = "q_1024_vec"   # 向量列名（带维度）
+
+        返回值的样子：
+            [
+                ("第一章 市场风险包括利率风险、汇率风险……", np.array([0.01, -0.03, ...]), "chunk_0001"),
+                ("第二章 信用风险的评估方法是……",           np.array([0.05, 0.12, ...]),  "chunk_0002"),
+                ...
+            ]
+            # 没有向量的切片被丢弃并计数播报；全空时返回 []
         """
         ctx = self._task_context
         chunks: List[Tuple[str, np.ndarray, str]] = []
         skipped_chunks = 0
 
-        # ``id`` is included so the source-chunk provenance survives
-        # through summarization; the retriever otherwise drops it when
-        # ``fields`` is provided.
+        # 取回字段里必须包含 "id"：chunk_list 在显式指定 fields 时
+        # 默认不带切片 id，而血缘追踪离了它就没法做
         fields = ["id", "content_with_weight", vctr_nm]
         for d in settings.retriever.chunk_list(doc_id, ctx.tenant_id, [str(ctx.kb_id)], fields=fields, sort_by_position=True):
             if vctr_nm not in d or d[vctr_nm] is None:
+                # 没有向量的切片没法参与聚类，跳过并计数
+                #（常见原因：切片入库时用的嵌入模型和现在不一致）
                 skipped_chunks += 1
                 logging.warning(f"RAPTOR: Chunk missing vector field '{vctr_nm}' in doc {doc_id}, skipping")
                 continue
@@ -431,9 +459,21 @@ class RaptorService:
         return chunks
 
     def _load_all_doc_chunks(self, doc_ids: List[str], vctr_nm: str, skipped_doc_ids: Set[str]) -> List[Tuple[str, np.ndarray, str]]:
-        """Load chunks for all documents — returns provenance-carrying
-        ``(content, vector, chunk_id)`` triples. See ``_load_doc_chunks``
-        for the per-doc variant."""
+        """库级产线的备料：把所有参建文档的原始切片合并装载 —— 全库切片搬运工。
+
+        逻辑与 _load_doc_chunks 完全相同，只是多文档循环合并，
+        并避开被自动禁用跳过的文档。
+
+        输入参数的样子：
+            doc_ids = ["doc_001", "doc_002", "doc_003"]
+            vctr_nm = "q_1024_vec"
+            skipped_doc_ids = {"doc_002"}   # doc_002 是 Excel，已被禁用规则跳过
+
+        返回值的样子：
+            [("第一章 ……", np.array([...]), "chunk_0001"),   # doc_001 的切片在前
+             ("产品概述 ……", np.array([...]), "chunk_0051"),  # doc_003 的切片接后
+             ...]
+        """
         ctx = self._task_context
         chunks: List[Tuple[str, np.ndarray, str]] = []
         skipped_chunks = 0
@@ -441,7 +481,7 @@ class RaptorService:
         fields = ["id", "content_with_weight", vctr_nm]
         for doc_id in doc_ids:
             if doc_id in skipped_doc_ids:
-                continue
+                continue  # 被自动禁用跳过的文档不参与合树
             for d in settings.retriever.chunk_list(doc_id, ctx.tenant_id, [str(ctx.kb_id)], fields=fields, sort_by_position=True):
                 if vctr_nm not in d or d[vctr_nm] is None:
                     skipped_chunks += 1
@@ -465,21 +505,46 @@ class RaptorService:
         doc_info_by_id: Dict,
         is_tree: bool = False,
     ) -> Tuple[List[Dict], int]:
-        """Run RAPTOR and generate summary chunks.
+        """真正开工：调建树器生成摘要，再物化成待入库的行 —— 摘要生产车间。
 
-        ``chunks`` is the provenance-carrying triple shape produced by
-        ``_load_doc_chunks`` / ``_load_all_doc_chunks``:
-        ``(content, vector, chunk_id)``. Each leaf is wrapped into the
-        ``(text, vec, [chunk_id])`` shape RAPTOR expects so every
-        summary it produces carries the order-preserving deduped union
-        of the leaf ids underneath it.
+        chunks 是 _load_doc_chunks / _load_all_doc_chunks 产出的带血缘三元组，
+        本函数先把每片叶子包成建树器认的 (正文, 向量, [原始切片id]) 形状，
+        让之后每条摘要都能携带「我由哪些原始切片总结而来」的血缘并集。
+
+        输入参数的样子：
+            chunks = [("第一章 ……", np.array([...]), "chunk_0001"), ...]
+            doc_id = "doc_001"   # 库级产线时是伪文档 "graph_raptor_x"
+            raptor_config = {"prompt": "Summarize …", "max_token": 512,
+                             "clustering_threshold": 0.3, "clustering_ratio": 0.5,
+                             "max_cluster": 64, "random_seed": 0}
+            is_tree = False      # 生产默认：摘要逐条成行；True = 整棵树存一行
+
+        返回值的样子（is_tree=False 生产默认）：
+            (
+                [   # 每条摘要一行，与普通切片同构、可被检索命中
+                    {"id": "8f3a…", "doc_id": "doc_001", "kb_id": ["kb_001"],
+                     "docnm_kwd": "风险手册.pdf", "raptor_kwd": "raptor",
+                     "extra": {"raptor_method": "raptor"},
+                     "q_1024_vec": [0.02, -0.05, ...],
+                     "content_with_weight": "本文档覆盖市场、信用、操作三类风险……",
+                     "content_ltks": "本 文档 覆盖 市场 信用 操作 三类 风险",
+                     "content_sm_ltks": "本 文 档 覆 盖 …",
+                     "raptor_layer_int": 1, ...},
+                    ...
+                ],
+                1234   # 所有摘要正文的 token 总数（计入任务用量）
+            )
+            is_tree=True 时返回 (整棵树 JSON 压成一行的单元素列表, 全树正文 token 数)，
+            该行 raptor_kwd="raptor_tree"、available_int=0（不可被检索）。
         """
         ctx = self._task_context
         from rag.advanced_rag.knowlege_compile.raptor import RecursiveAbstractiveProcessing4TreeOrganizedRetrieval as Raptor
 
         assert chunks, "_generate_raptor must not be called with empty chunks"
+        # 向量列名按实际维度现场拼出来：1024 维向量 → "q_1024_vec"
         vctr_nm = "q_%d_vec" % len(chunks[0][1])
 
+        # 组装你已经读完的那棵建树器（聚类+摘要递归），参数全部来自知识库配置
         raptor = Raptor(
             raptor_config.get("max_cluster", 64),
             chat_mdl,
@@ -491,21 +556,17 @@ class RaptorService:
             clustering_ratio=float(raptor_config.get("clustering_ratio", 0.5)),
         )
 
-        # Seed each leaf with its own id as the start of its
-        # ``source_chunk_ids`` provenance trail. The id may be empty
-        # for malformed retriever rows; ``Raptor.__call__`` filters
-        # those out of the union on the inbound normalize step.
+        # 给每片叶子播下自己的切片 id 作为血缘起点；检索行不规范时
+        # id 可能为空串，建树器入队归一化时会把空 id 滤掉
         raptor_input = [(content, vctr, [chunk_id] if chunk_id else []) for content, vctr, chunk_id in chunks]
 
+        # 库级产线挂在伪文档 graph_raptor_x 下，没有真实文件名，用任务名代替
         effective_doc_name = ctx.name if doc_id == GRAPH_RAPTOR_FAKE_DOC_ID else doc_info_by_id.get(doc_id, {}).get("name") or ctx.name
 
-        # Default path: ask RAPTOR for a single hierarchical tree dict
-        # and persist it as ONE non-searchable ES row. PSI's
-        # hyperedge-driven summarization can't form a strict
-        # parent-of relation, so __call__(is_tree=True) raises
-        # NotImplementedError there — catch and fall through to the
-        # legacy per-summary materialization below for that case.
-        original_length = len(chunks)
+        # 默认路径：向建树器要一棵层级树。PSI 建树器（超边摘要）
+        # 无法形成严格的父子关系，is_tree=True 时会抛
+        # NotImplementedError，接住后转走逐条摘要的旧物化路径兜底
+        original_length = len(chunks)  # 记住叶子数：返回列表前 N 个是叶子，之后全是摘要
         try:
             processed_chunks, layers = await raptor(
                 raptor_input,
@@ -525,12 +586,15 @@ class RaptorService:
             )
 
         if processed_chunks is None:
-            return [], 0
+            return [], 0  # 建树失败（如摘要连续报错被放弃）：无产出
+        # 所有摘要行共享的公共字段模板（后面逐条深拷贝再填差异部分）
         doc = {
             "doc_id": doc_id,
             "kb_id": [str(ctx.kb_id)],
             "docnm_kwd": effective_doc_name,
             "title_tks": rag_tokenizer.tokenize(effective_doc_name),
+            # raptor_kwd="raptor" 是「这是摘要切片」的身份证：
+            # 既让检索可以识别它，也是后续清理/重建时的查询过滤条件
             "raptor_kwd": "raptor",
             "extra": {"raptor_method": "raptor"},
             "create_time": str(datetime.now()).replace("T", " ")[:19],
@@ -540,7 +604,10 @@ class RaptorService:
             doc[PAGERANK_FLD] = int(ctx.pagerank)
 
         if not is_tree:
-            # Build index→layer mapping
+            # layers 形如 [(0, 30), (30, 42), (42, 45)]：每层在
+            # processed_chunks 里的下标区间。第 0 层就是原始叶子，
+            # 不用登记；其余下标 → 层号（第 1 层=叶子的直接摘要，
+            # 第 2 层=摘要的摘要……），供下面写进 raptor_layer_int
             chunk_layer = {}
             for layer_idx, (layer_start, layer_end) in enumerate(layers):
                 if layer_idx == 0:
@@ -550,13 +617,21 @@ class RaptorService:
 
             res = []
             tk_count = 0
+            # 只取追加在叶子之后的摘要部分，逐条做成一行。
+            # 注意两个下划线：摘要元组后两项（血缘切片 id 列表、
+            # 子节点信息）在这条默认路径里被丢弃——默认路径的摘要行
+            # 不落 source_chunk_ids 字段，只有下面 legacy 路径会写入
             for idx, (content, vctr, _, _) in enumerate(processed_chunks[original_length:], start=original_length):
                 d = copy.deepcopy(doc)
+                # 摘要行 id = 内容哈希，同一文档重复生成同样摘要会撞同一
+                # id，天然幂等（重建时旧行先被清理，不会残留两份）
                 d["id"] = make_raptor_summary_chunk_id(content, doc_id)
                 d["create_time"] = str(datetime.now()).replace("T", " ")[:19]
                 d["create_timestamp_flt"] = datetime.now().timestamp()
-                d[vctr_nm] = vctr.tolist()
+                d[vctr_nm] = vctr.tolist()  # 摘要自己的向量（建树时算好的）
                 d["content_with_weight"] = content
+                # 与普通切片一样做两级分词：粗粒度参与全文打分，
+                # 细粒度参与兜底——摘要就此进入与普通切片同一个检索池
                 d["content_ltks"] = rag_tokenizer.tokenize(content)
                 d["content_sm_ltks"] = rag_tokenizer.fine_grained_tokenize(d["content_ltks"])
                 d["raptor_layer_int"] = chunk_layer.get(idx, 1)
@@ -564,6 +639,8 @@ class RaptorService:
                 tk_count += num_tokens_from_string(content)
             return res, tk_count
 
+        # is_tree=True 路径：整棵树压成 JSON 存一行（不可被检索，
+        # available_int=0），供编译模板按树结构使用
         row_id = xxhash.xxh64(
             f"raptor_tree:{doc_id}:raptor".encode("utf-8", "surrogatepass"),
         ).hexdigest()
@@ -584,12 +661,33 @@ class RaptorService:
         embd_mdl,
         max_errors: int,
     ) -> Optional[Dict]:
-        """Build a RAPTOR tree dict for one document — no ES IO.
+        """只建一棵树字典返回，不碰索引 —— 供「树形编译模板」用的裸建树接口。
 
-        Used by the ``tree``-kind compilation template, which wraps the
-        returned tree into a per-template structure-graph row. Returns
-        None when the input has no chunks, the PSI builder is selected
-        (which can't form a strict tree), or RAPTOR itself fails.
+        与 _generate_raptor(is_tree=True) 的区别：那里会把树压成一行
+        写入索引；这里只把树字典交回给调用方（tree 类编译模板），
+        由模板自己决定怎么包装入库。
+
+        输入参数的样子：
+            chunks = [("第一章 ……", np.array([...]), "chunk_0001"), ...]
+            raptor_config / chat_mdl / embd_mdl / max_errors 同 _generate_raptor
+
+        返回值的样子（建树器 _materialize_tree 的产物）：
+            {   # 根摘要节点；多个顶层节点时会包一层 {"title": "(root)", "children": [...]}
+                "title": "",            # 建树时未生成标题，通常为空串
+                "description": "本文档覆盖市场、信用、操作三类风险……",  # 摘要正文
+                "children": [
+                    {   # 中间层摘要节点：继续挂 children
+                        "title": "", "description": "第一章讲了市场风险……",
+                        "children": [...]
+                    },
+                    {   # 叶子的直接摘要节点：不带 children，改挂血缘
+                        "title": "", "description": "……",
+                        "source_chunk_ids": ["chunk_0001", "chunk_0003"]
+                    }
+                ]
+            }
+            # 以下情况返回 None：切片为空 / 选中 PSI 建树器（构不成
+            # 严格的树）/ 建树失败
         """
         if not chunks:
             return None
@@ -606,6 +704,7 @@ class RaptorService:
             clustering_ratio=float(raptor_config.get("clustering_ratio", 0.5)),
         )
 
+        # 同样先给叶子播下自己的切片 id 作为血缘起点
         raptor_input = [(content, vctr, [chunk_id] if chunk_id else []) for content, vctr, chunk_id in chunks]
         try:
             tree, _ = await raptor(
@@ -616,8 +715,8 @@ class RaptorService:
                 is_tree=True,
             )
         except NotImplementedError:
-            # PSI builder — not supported in tree mode; surface as None
-            # so the compilation-template path can skip the doc cleanly.
+            # PSI 建树器不支持树模式：返回 None，让编译模板
+            # 那条路能体面地跳过这个文档
             logging.warning(
                 "build_doc_tree: PSI builder doesn't support is_tree; skipping",
             )
@@ -633,16 +732,32 @@ class RaptorService:
         effective_doc_name,
         vctr_nm,
     ) -> Tuple[List[Dict], int]:
-        """Legacy per-summary materialization, kept only for PSI builds.
+        """旧式逐条摘要物化，现在只留给 PSI 建树器兜底 —— 旧产线保留间。
 
-        PSI's hyperedge summaries don't map to a strict tree, so the
-        ``is_tree=True`` default in ``_generate_raptor`` raises and
-        falls through here. Same shape this function produced before
-        the tree migration — one ES row per appended summary, marked
-        ``raptor_kwd="raptor"``.
+        PSI 的超边摘要构不成严格的树，_generate_raptor 在 is_tree 路径
+        抛 NotImplementedError 后落到这里。产出形状与默认路径一致：
+        每条摘要一行、raptor_kwd="raptor" 可被检索；唯一多出来的是
+        若建树器给了血缘就落 source_chunk_ids 字段。
+
+        输入参数的样子：
+            raptor = 已组装好的建树器实例
+            raptor_input = [("第一章 ……", np.array([...]), ["chunk_0001"]), ...]
+            raptor_config / doc_id / effective_doc_name / vctr_nm 同 _generate_raptor
+
+        返回值的样子：
+            (
+                [{"id": "8f3a…", "raptor_kwd": "raptor",
+                  "content_with_weight": "……", "q_1024_vec": [...],
+                  "raptor_layer_int": 1,
+                  "source_chunk_ids": ["chunk_0001", "chunk_0002"],  # 有才写
+                  ...}, ...],
+                987    # 摘要正文 token 总数
+            )
         """
         ctx = self._task_context
-        original_length = len(raptor_input)
+        original_length = len(raptor_input)  # 叶子数，后面的才是摘要
+        # 这里不带 is_tree 重跑（PSI 下默认 False 不会抛），
+        # 拿回扁平的「叶子+全部摘要」列表和每层下标范围
         processed_chunks, layers = await raptor(
             raptor_input,
             raptor_config["random_seed"],
@@ -650,6 +765,7 @@ class RaptorService:
             ctx.id,
         )
 
+        # 摘要行公共字段模板，与默认路径同款（少了两个时间字段，逐条再补）
         doc = {
             "doc_id": doc_id,
             "kb_id": [str(ctx.kb_id)],
@@ -661,6 +777,7 @@ class RaptorService:
         if ctx.pagerank:
             doc[PAGERANK_FLD] = int(ctx.pagerank)
 
+        # 下标 → 层号登记：跳过第 0 层（原始叶子），其余按区间打标
         chunk_layer = {}
         for layer_idx, (layer_start, layer_end) in enumerate(layers):
             if layer_idx == 0:
@@ -671,6 +788,7 @@ class RaptorService:
         res = []
         tk_count = 0
         for idx, item in enumerate(processed_chunks[original_length:], start=original_length):
+            # 摘要元组长度不保齐：有三元组就取血缘，没有就置空
             if len(item) >= 3:
                 content, vctr, source_chunk_ids = item[0], item[1], item[2] or []
             else:
