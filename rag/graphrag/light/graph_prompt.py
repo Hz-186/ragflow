@@ -1,7 +1,31 @@
-# Licensed under the MIT License
+# 本文件从 LightRAG 开源项目移植而来（github.com/HKUDS/LightRAG 的 prompt.py）。
 """
-Reference:
- - [LightRAG](https://github.com/HKUDS/LightRAG/blob/main/lightrag/prompt.py)
+light 抽取法的提示词仓库 —— 发给 LLM 的「合同文本」全部住在这里。
+
+重要：本文件里所有三引号字符串都是【数据】（原样发给大模型的提示词模板），
+不是注释！一个字符都不能改，否则抽取行为直接变样。下面的 # 注释只解释
+每段提示词的用途和占位符含义。
+
+占位符约定（调用方用 str.format 填空）：
+    {language}           → 要求 LLM 用什么语言输出（如 Chinese）
+    {entity_types}       → 允许的实体类型名单（逗号拼接）
+    {tuple_delimiter}    → 记录内部的字段分隔符，固定 "<|>"
+    {record_delimiter}   → 记录与记录之间的分隔符，固定 "##"
+    {completion_delimiter} → 「我写完了」的终止标记，固定 "<|COMPLETE|>"
+    {examples}           → few-shot 示例（从 entity_extraction_examples 取）
+    {input_text}         → 本次要抽取的原文
+
+各键用途速查：
+    entity_extraction             —— 主抽取提示词（写入侧核心，一次问出实体+关系）
+    entity_extraction_examples    —— 三个 few-shot 示例（给 LLM 看样板）
+    entity_continue_extraction    —— 「追问补漏」提示词：上一轮抽完后再问一轮漏没漏
+    entity_if_loop_extraction     —— 「还要不要再追一轮」的 YES/NO 询问
+    summarize_entity_descriptions —— 描述归纳提示词（light 路径未使用，
+                                     生产用的是 general/graph_prompt.py 的同名模板）
+    fail_response / rag_response / naive_rag_response /
+    keywords_extraction / keywords_extraction_examples
+                                  —— LightRAG 查询侧的遗留模板，
+                                     本仓库没有任何代码引用它们（留档备查）
 """
 
 from typing import Any
@@ -9,6 +33,7 @@ from typing import Any
 PROMPTS: dict[str, Any] = {}
 
 PROMPTS["DEFAULT_LANGUAGE"] = "English"
+# 三种分隔符：字段内 / 记录间 / 全文终止（与解析代码里的常量一一对应）
 PROMPTS["DEFAULT_TUPLE_DELIMITER"] = "<|>"
 PROMPTS["DEFAULT_RECORD_DELIMITER"] = "##"
 PROMPTS["DEFAULT_COMPLETION_DELIMITER"] = "<|COMPLETE|>"
@@ -17,6 +42,14 @@ PROMPTS["DEFAULT_ENTITY_TYPES"] = ["organization", "person", "geo", "event", "ca
 
 PROMPTS["DEFAULT_USER_PROMPT"] = "n/a"
 
+# ── 主抽取提示词：light 写入侧的「合同」本体 ──────────────────────────────
+# 要求 LLM 做三件事：
+#   1. 抽实体，每条格式 ("entity"<|>名字<|>类型<|>描述) —— 描述只许来自原文，禁止脑补
+#   2. 抽关系，每条格式 ("relationship"<|>源<|>目标<|>描述<|>关键词<|>强度分)
+#   3. 抽全文级高层关键词，格式 ("content_keywords"<|>关键词)
+# 所有记录用 ## 分隔，结尾输出 <|COMPLETE|>。
+# 解析端对应：utils.split_string_by_multi_markers 按 ## 和 <|COMPLETE|> 切，
+# 再按 <|> 切字段，交给 handle_single_entity/relationship_extraction。
 PROMPTS["entity_extraction"] = """---Goal---
 Given a text document that is potentially relevant to this activity and a list of entity types, identify all entities of those types from the text and all relationships among the identified entities.
 Use {language} as output language.
@@ -58,6 +91,9 @@ Text:
 ######################
 Output:"""
 
+# ── few-shot 示例：三个「原文 → 标准答案」样板，填进主提示词的 {examples} ──
+# 示例 1：小说叙事文本；示例 2：财经新闻；示例 3：体育短讯。
+# 三个示例都展示了标准输出格式：实体行、关系行、内容关键词行、终止符。
 PROMPTS["entity_extraction_examples"] = [
     """Example 1:
 
@@ -137,6 +173,9 @@ Output:
 #############################""",
 ]
 
+# ── 描述归纳提示词（light 路径未使用）────────────────────────────────────
+# 把一个实体的多条描述合成一段连贯摘要。light 抽取器实际用的是
+# general/graph_prompt.py 里的 SUMMARIZE_DESCRIPTIONS_PROMPT，此键留档。
 PROMPTS["summarize_entity_descriptions"] = """You are a helpful assistant responsible for generating a comprehensive summary of the data provided below.
 Given one or two entities, and a list of descriptions, all related to the same entity or group of entities.
 Please concatenate all of these into a single, comprehensive description. Make sure to include information collected from all the descriptions.
@@ -152,6 +191,8 @@ Description List: {description_list}
 Output:
 """
 
+# ── 「追问补漏」提示词：第一轮抽完后追问「还漏了什么」，只许补新的 ────────
+# 对应 graph_extractor 里 gleaning 循环的 self._continue_prompt。
 PROMPTS["entity_continue_extraction"] = """
 MANY entities and relationships were missed in the last extraction. Please find only the missing entities and relationships from previous text.
 
@@ -184,6 +225,8 @@ Format the content-level key words as ("content_keywords"{tuple_delimiter}<high_
 Add new entities and relations below using the same format, and do not include entities and relations that have been previously extracted. :\n
 """.strip()
 
+# ── 「还要不要再追一轮」询问：LLM 只许答 YES / NO ──────────────────────
+# 答 YES → 继续追问补漏；否则结束 gleaning 循环。
 PROMPTS["entity_if_loop_extraction"] = """
 ---Goal---'
 
@@ -194,8 +237,12 @@ It appears some entities may have still been missed.
 Answer ONLY by `YES` OR `NO` if there are still entities that need to be added.
 """.strip()
 
+# ── 以下五个键是 LightRAG 查询侧的遗留模板，本仓库无代码引用，留档备查 ──
+
+# 检索失败时的兜底回答文本
 PROMPTS["fail_response"] = "Sorry, I'm not able to provide an answer to that question.[no-context]"
 
+# 基于「知识图谱 + 文档块」生成回答的模板（含引用格式约定 [KG]/[DC]）
 PROMPTS["rag_response"] = """---Role---
 
 You are a helpful assistant responding to user query about Knowledge Graph and Document Chunks provided in JSON format below.
@@ -236,6 +283,8 @@ Generate a concise response based on Knowledge Base and follow Response Rules, c
 
 Response:"""
 
+# 从用户问题里抽高层/低层关键词的模板（本仓库实际用的是
+# query_analyze_prompt.py 里的同名键，那套才是活代码）
 PROMPTS["keywords_extraction"] = """---Role---
 You are an expert keyword extractor, specializing in analyzing user queries for a Retrieval-Augmented Generation (RAG) system. Your purpose is to identify both high-level and low-level keywords in the user's query that will be used for effective document retrieval.
 
@@ -259,6 +308,7 @@ User Query: {query}
 ---Output---
 """
 
+# keywords_extraction 的三个 few-shot 示例（同样未被引用）
 PROMPTS["keywords_extraction_examples"] = [
     """Example 1:
 
@@ -295,6 +345,7 @@ Output:
 """,
 ]
 
+# 仅基于「文档块」生成回答的模板（未引用）
 PROMPTS["naive_rag_response"] = """---Role---
 
 You are a helpful assistant responding to user query about Document Chunks provided provided in JSON format below.
