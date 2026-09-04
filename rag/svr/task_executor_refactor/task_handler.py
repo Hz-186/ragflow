@@ -356,30 +356,47 @@ class TaskHandler:
         vector_size: int,
         mark_done: bool = True,
     ) -> None:
-        """Run RAPTOR summary generation."""
+        """RAPTOR 任务的现场总指挥：备配置 → 产摘要 → 入库 → 清旧 → 落图谱 —— 任务调度官。
+
+        输入参数的样子：
+            embedding_model = LLMBundle 实例（嵌入模型，摘要行要带向量）
+            vector_size = 1024      # 向量维度（决定写入 q_1024_vec 列）
+            mark_done = True        # 收尾时是否把任务进度拨到 100%
+
+        效果：
+            索引里新增一批可检索的摘要行 + 每个文档一行结构图谱行，
+            旧的过期摘要被清理，任务进度报告 100%。
+            失败时通过 progress_cb(-1.0) 报错，不抛给上层。
+        """
         ctx = self._task_context
         task_tenant_id = ctx.tenant_id
         task_dataset_id = ctx.kb_id
+        # 摘要用的对话模型：优先知识库指定的，其次任务上下文带的
         kb_task_llm_id = ctx.kb_parser_config.get("llm_id") or ctx.llm_id
 
+        # 先从 MySQL 确认知识库还活着（可能任务排队期间被删了）
         ok, kb = KnowledgebaseService.get_by_id(task_dataset_id)
         if not ok:
             ctx.progress_cb(prog=-1.0, msg="Cannot found valid dataset for RAPTOR task")
             return
 
+        # 知识库没开过 RAPTOR 配置时，注入一套默认值并回写 MySQL，
+        # 让后续读取方看到的配置是自洽的
         kb_parser_config = kb.parser_config
         if not kb_parser_config.get("raptor", {}).get("use_raptor", False):
             kb_parser_config.update(
                 {
                     "raptor": {
                         "use_raptor": True,
+                        # 默认摘要提示词：不许编造事实、不许改数字，
+                        # 输出两行——第一行标题，后面是摘要正文
                         "prompt": "Summarize the paragraphs below without inventing facts or changing numbers.\nOutput exactly two parts in the same language as the source:\n1. First line: a concise title only.\n2. Following lines: a concise summary of the content.\nDo not output labels, Markdown headings, bullet points, or any other commentary.\n\nParagraphs:\n{cluster_content}",
                         "max_token": 512,
                         "clustering_threshold": 0.3,
                         "clustering_ratio": 0.5,
                         "max_cluster": 64,
                         "random_seed": 0,
-                        "scope": "file",
+                        "scope": "file",  # 默认每个文档各建一棵树
                     },
                 }
             )
@@ -392,13 +409,17 @@ class TaskHandler:
                 ctx.progress_cb(prog=-1.0, msg="Internal error: Invalid RAPTOR configuration")
                 return
 
-        # Bind LLM for raptor
+        # 绑定摘要用的对话模型（LLMBundle 是模型的统一信封，
+        # with 语句保证用完释放连接）
         chat_model_config = resolve_model_config(task_tenant_id, LLMType.CHAT, kb_task_llm_id)
         with LLMBundle(task_tenant_id, chat_model_config, lang=ctx.language) as chat_model:
-            # Run RAPTOR
             raptor_service = RaptorService(ctx=ctx)
 
+            # kg_limiter：与 GraphRAG 共用的并发闸门，
+            # 防止多个大摘要任务同时打爆 LLM 配额
             async with ctx.kg_limiter:
+                # 真正的生产环节（见 raptor_service.run_raptor_for_kb）：
+                # 返回新摘要行列表、摘要 token 总数、待清理的旧摘要计划
                 chunks, token_count, raptor_cleanup_chunks = await raptor_service.run_raptor_for_kb(
                     kb_parser_config=kb_parser_config,
                     chat_mdl=chat_model,
@@ -407,20 +428,24 @@ class TaskHandler:
                     doc_ids=ctx.doc_ids or [ctx.doc_id],
                 )
 
+            # 产出记账（供任务审计/统计上下文使用）
             ctx.recording_context.record("raptor_chunks", chunks)
             ctx.recording_context.record("raptor_token_count", token_count)
 
-            # Insert RAPTOR chunks
             if chunks:
+                # 统计口径用的文档 id：库级产线没有真实文档时，
+                # 退回伪文档 graph_raptor_x
                 task_doc_id = (ctx.doc_ids or [ctx.doc_id] or [GRAPH_RAPTOR_FAKE_DOC_ID])[0]
                 chunk_service = ChunkService(ctx=ctx)
+                # 摘要行批量写入索引——从这一刻起它们就能被检索命中
                 insert_result = await chunk_service.insert_chunks(ctx.id, task_tenant_id, task_dataset_id, chunks)
                 if insert_result:
                     ctx.recording_context.record("insertion_result", "success")
                 else:
                     ctx.recording_context.record("insertion_result", "failed")
 
-                # Cleanup stale RAPTOR chunks
+                # 新摘要入库成功后才执行清理：按生产时登记的计划，
+                # 逐文档删掉过期的旧摘要（保留本轮新方法产的）
                 cleaned_chunks = 0
                 for cleanup_doc_id, keep_method in raptor_cleanup_chunks:
                     ret = await self._delete_raptor_chunks(cleanup_doc_id, task_tenant_id, task_dataset_id, keep_method)
@@ -429,15 +454,12 @@ class TaskHandler:
                 if cleaned_chunks:
                     ctx.progress_cb(msg=f"Cleaned up {cleaned_chunks} stale RAPTOR chunks.")
 
-                # Build the per-doc RAPTOR tree graph from the just-
-                # inserted summaries. Each chunk in ``chunks`` carries
-                # the doc_id it was written under (real doc id for
-                # scope="file"; GRAPH_RAPTOR_FAKE_DOC_ID for the
-                # dataset-scope path). We materialize one graph row per
-                # distinct doc_id so the dataset structure-graph
-                # endpoint can surface a RAPTOR tab per document.
-                # Failure here is best-effort — the summaries are
-                # already persisted; the tab just won't render.
+                # 从刚入库的摘要投影结构图谱行。每行摘要自带它挂在
+                # 哪个文档下（文件级=真实文档 id，库级=伪文档
+                # graph_raptor_x），按去重后的文档逐个落一行图谱，
+                # 数据集「结构图」页签就能每文档渲染一个 RAPTOR 页。
+                # 这一步尽力而为：失败只记日志——摘要已经落库了，
+                # 最多是图谱页签渲染不出来
                 raptor_doc_ids = {str(c.get("doc_id")) for c in chunks if c.get("doc_id")}
                 for raptor_doc_id in raptor_doc_ids:
                     try:
@@ -449,12 +471,13 @@ class TaskHandler:
                             raptor_doc_id,
                         )
 
-                # Update document stats
+                # 回写文档统计：切片数 += 行数、累计 token 数
                 if ctx.write_interceptor:
                     ctx.write_interceptor.intercept("DocumentService.increment_chunk_num")
                 else:
                     DocumentService.increment_chunk_num(task_doc_id, task_dataset_id, token_count, len(chunks), 0)
 
+            # 收尾：标记任务完成，进度拨到 100%
             if mark_done:
                 ctx.recording_context.record("task_status", "completed")
                 ctx.progress_cb(prog=1.0, msg="RAPTOR done")

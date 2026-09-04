@@ -812,25 +812,53 @@ class RaptorService:
 
     @classmethod
     def _schedule_raptor_cleanup(cls, doc_id: str, keep_method: Optional[str], cleanup_list: List):
-        """Queue stale RAPTOR summaries for deletion."""
+        """登记一条「该删哪些旧摘要」的清理计划 —— 清理计划记账员。
+
+        只是把 (文档, 保留方法) 记进计划清单并去重；真正的删除
+        在新摘要成功入库之后由 task_handler 统一执行（先成功后清旧，
+        保证任何时刻索引里至少有一份可用摘要）。
+
+        输入参数的样子：
+            doc_id = "doc_001"
+            keep_method = "raptor"        # 本轮新产出的方法，旧的要删掉；
+                                          # None = 两种标记全清扫
+            cleanup_list = [("doc_003", "raptor")]
+
+        效果：
+            cleanup_list 变为 [("doc_003", "raptor"), ("doc_001", "raptor")]
+            （若 ("doc_001", "raptor") 已存在则不重复登记）
+        """
         cleanup_plan = (doc_id, keep_method)
         if cleanup_plan not in cleanup_list:
             cleanup_list.append(cleanup_plan)
 
     @classmethod
     async def _get_raptor_chunk_methods(cls, doc_id: str, tenant_id: str, kb_id: str) -> Set[str]:
-        """Get RAPTOR chunk methods for a document."""
+        """查索引里这个文档已经存在哪些 RAPTOR 产物 —— 断点续建探测器。
+
+        用途：重建前先摸清家底。如果文档已有「逐条摘要行」，
+        本次任务就可以直接跳过摘要生产，只补「图谱行」（见
+        task_handler._run_raptor 的分流判断）。
+
+        输入参数的样子：
+            doc_id = "doc_001", tenant_id = "tenant_001", kb_id = "kb_001"
+
+        返回值的样子：
+            {"raptor"}        # 已有逐条摘要行（extra.raptor_method 的并集）
+            set()             # 什么都没有，需要从头建
+        """
         from common.doc_store.doc_store_base import OrderByExpr
 
         async def search_fields(fields: list, condition: dict, order_by=None):
+            # 对 docStoreConn.search 的薄封装：只取指定字段，上限一万行
             res = await thread_pool_exec(settings.docStoreConn.search, fields, [], condition, [], order_by or OrderByExpr(), 0, 10000, search.index_name(tenant_id), [kb_id])
             return settings.docStoreConn.get_fields(res, fields)
 
         try:
-            # Accept both ``raptor`` (legacy per-summary rows, PSI
-            # builder still produces these) and ``raptor_tree`` (new
-            # single-row tree blob) so existing-method detection stays
-            # accurate across the migration.
+            # 主查询：按 RAPTOR 身份证过滤。两种标记都要认：
+            # "raptor"（逐条摘要行，生产默认与 PSI 都产这种）和
+            # "raptor_tree"（整棵树压一行的新形态），
+            # 这样无论索引里存着哪种形态都能被探测到
             primary = await search_fields(
                 ["raptor_kwd", "extra"],
                 {"doc_id": doc_id, "raptor_kwd": ["raptor", "raptor_tree"]},
@@ -838,6 +866,8 @@ class RaptorService:
             if collect_raptor_chunk_ids(primary):
                 return collect_raptor_methods(primary)
 
+            # 兜底查询：身份证过滤查不到时，把该文档的全部行
+            # 按创建时间倒序捞回来再认一遍（防脏数据漏检）
             return collect_raptor_methods(
                 await search_fields(
                     ["raptor_kwd", "extra"],
@@ -851,51 +881,60 @@ class RaptorService:
 
     @staticmethod
     def _build_raptor_graph(rows: List[Dict]) -> Dict:
-        """Project loaded RAPTOR summary rows onto the canvas graph shape.
+        """把摘要行投影成前端能画的结构图（实体+关系）—— 图谱投影器。
 
-        Each row contributes one entity::
+        输入参数的样子（_persist_raptor_graph_to_es 刚从索引捞回的摘要行）：
+            [
+                {"content_with_weight": "本文档覆盖市场、信用、操作三类风险……",
+                 "raptor_layer_int": 2,
+                 "source_chunk_ids": []},          # 默认产线此字段缺失 → 空列表
+                {"content_with_weight": "第一章讲了市场风险……",
+                 "raptor_layer_int": 1,
+                 "source_chunk_ids": []},
+                ...
+            ]
 
+        返回值的样子：
             {
-              "id":          xxh128(content)           # 32-char hex
-              "name":        first 16 whitespace tokens
-              "description": content_with_weight
-              "source_chunk_ids": row.source_chunk_ids
+                "entities": [
+                    {   # 每条摘要 = 一个节点
+                        "id": "a1b2…（xxh128(正文) 32 位十六进制）",
+                        "name": "本文档覆盖市场 信用 操作三类风险",  # 前 16 个空白分词
+                        "description": "本文档覆盖市场、信用、操作三类风险……",  # 完整正文
+                        "source_chunk_ids": []
+                    }, ...
+                ],
+                "relations": [
+                    {"from": "第2层节点id", "to": "第1层节点id"},   # 层间扇出
+                    ...
+                ]
             }
-
-        Relations: full bipartite layer-by-layer fan-out — every node at
-        layer K gets an edge to every node at layer K-1 (because we only
-        loaded ``content_with_weight`` + ``raptor_layer_int`` we don't
-        have the specific parent linkage). Self-edges and dangling
-        targets are dropped (the latter only matters if the layer-int
-        values are non-contiguous).
         """
-        # Build entities. Dedup by id so two identical-content summaries
-        # collapse to one node — the canvas can't render multiple nodes
-        # at the same id anyway, and identical content is a defensible
-        # collapse.
+        # 逐行造节点。两张登记表：by_id 按内容哈希去重
+        #（内容相同的两条摘要合成一个节点——画布也画不出同 id
+        # 多节点），by_layer 按层号归拢节点，供后面连边用
         by_id: Dict[str, Dict] = {}
         by_layer: Dict[int, List[str]] = {}
 
         for row in rows:
             content = row.get("content_with_weight")
             if not isinstance(content, str) or not content.strip():
-                continue
+                continue  # 正文缺失或空白的行成不了节点
             try:
                 layer = int(row.get("raptor_layer_int") or 0)
             except (TypeError, ValueError):
                 layer = 0
             if layer <= 0:
-                # Layer 0 would be the original leaf chunks; RAPTOR
-                # summaries start at layer 1. Anything claiming layer 0
-                # here is malformed; skip.
+                # 第 0 层是原始叶子切片，RAPTOR 摘要从第 1 层起；
+                # 这里自称第 0 层的行是畸形数据，跳过
                 continue
 
-            name = " ".join(content.split()[:16])
+            name = " ".join(content.split()[:16])  # 节点名 = 正文前 16 个空白分词
             nid = xxhash.xxh128(
                 content.encode("utf-8", "surrogatepass"),
             ).hexdigest()  # 32-char hex
             if nid in by_id:
-                continue
+                continue  # 同内容摘要已登记过，去重
             source_chunk_ids = row.get("source_chunk_ids") or []
             if not isinstance(source_chunk_ids, list):
                 source_chunk_ids = []
@@ -907,13 +946,16 @@ class RaptorService:
             }
             by_layer.setdefault(layer, []).append(nid)
 
-        # Layered fan-out from parent (higher layer) → child (lower layer).
+        # 连边：高层（父）→ 低一层（子）的完全二部扇出。
+        # 注意这是「粗连」：装载时只取了正文和层号，没有取到
+        # 真实的父子血缘，所以第 K 层每个节点连向第 K-1 层所有
+        # 节点。自环边去掉；层号不连续时悬空目标自然落空
         relations: List[Dict] = []
         layers_sorted = sorted(by_layer.keys())
         for layer in layers_sorted:
             child_layer = layer - 1
             if child_layer not in by_layer:
-                continue
+                continue  # 下一层不存在（层号不连续），这层没法往下连
             for parent in by_layer[layer]:
                 for child in by_layer[child_layer]:
                     if parent == child:
@@ -923,23 +965,26 @@ class RaptorService:
         return {"entities": list(by_id.values()), "relations": relations}
 
     async def _persist_raptor_graph_to_es(self, doc_id: str) -> None:
-        """Load the just-inserted RAPTOR summaries for ``doc_id`` and
-        persist a single graph row that the dataset structure-graph
-        endpoint can surface as a tree.
+        """把刚入库的摘要投影成一张结构图，压成一行写回索引 —— 图谱行落盘员。
 
-        Loads only ``content_with_weight`` + ``raptor_layer_int`` +
-        ``source_chunk_ids`` (per
-        the smallest-payload contract) and writes one row with::
+        这一行不参与检索（available_int=0），专供两处消费：
+        数据集「结构图」页签（chunk_api 的 structure-graph 端点）和
+        harness 的导航工具（navigation.py 按 compile_kwd 查它）。
 
-            compile_kwd:                  "raptor_graph"
-            compilation_template_kind_kwd:"raptor"
-            doc_id:                       <doc_id>
+        输入参数的样子：
+            doc_id = "doc_001"   # 文档级；库级产线传伪文档 id
 
-        The row id is deterministic per ``(kb_id, doc_id)`` so re-runs
-        delete-and-replace cleanly through the same primary key.
-        ``knowledge_graph_kwd`` is intentionally NOT set — that field
-        belongs to the KG feature; this row is identified via
-        ``compile_kwd`` so the two paths stay semantically distinct.
+        效果：索引里多出一行——
+            {
+                "id": "xxh64(f\"raptor_graph:{kb_id}:{doc_id}\")",  # 同键重跑=覆盖
+                "kb_id": "kb_001", "doc_id": "doc_001",
+                "compile_kwd": "raptor_graph",
+                "compilation_template_kind_kwd": "raptor",
+                "content_with_weight": "{\"entities\": [...], \"relations\": [...]}",
+                "available_int": 0          # 不可被检索命中
+            }
+            任何一步失败都只记日志不抛错（图谱是锦上添花，
+            不能拖垮主产线）。
         """
         from common.doc_store.doc_store_base import OrderByExpr
 
@@ -947,8 +992,11 @@ class RaptorService:
         tenant_id = ctx.tenant_id
         kb_id_str = str(ctx.kb_id)
         index_nm = search.index_name(tenant_id)
+        # 只捞投影必需的最小字段集
         select_fields = ["content_with_weight", "raptor_layer_int", "source_chunk_ids"]
         try:
+            # 条件：身份证 raptor_kwd="raptor" + 本文档
+            #（注意不含 "raptor_tree"：树 blob 没有逐条层号，投影不了）
             res = await thread_pool_exec(
                 settings.docStoreConn.search,
                 select_fields,
@@ -963,6 +1011,7 @@ class RaptorService:
             )
             field_map = settings.docStoreConn.get_fields(res, select_fields)
         except Exception:
+            # 装载失败：图谱行本次不写，主产线照常
             logging.exception(
                 "raptor_graph: load failed for kb=%s doc=%s",
                 kb_id_str,
@@ -979,6 +1028,7 @@ class RaptorService:
             )
             return
 
+        # 投影成 {entities, relations} 图谱
         graph = self._build_raptor_graph(rows)
         if not graph["entities"]:
             logging.info(
@@ -988,6 +1038,8 @@ class RaptorService:
             )
             return
 
+        # 行 id 由 (kb, doc) 确定性算出：重跑时先删旧行再插新行，
+        # 即使删除失败也能靠同 id 覆盖，不会长出第二张图
         row_id = xxhash.xxh64(
             f"raptor_graph:{kb_id_str}:{doc_id}".encode("utf-8", "surrogatepass"),
         ).hexdigest()
@@ -1000,6 +1052,8 @@ class RaptorService:
             "content_with_weight": json.dumps(graph, ensure_ascii=False),
             "available_int": 0,
         }
+        # 故意不设 knowledge_graph_kwd：那是 GraphRAG 知识图谱的
+        # 身份证，本行靠 compile_kwd 识别，两条功能线语义分开
         try:
             await thread_pool_exec(
                 settings.docStoreConn.delete,
@@ -1008,6 +1062,7 @@ class RaptorService:
                 ctx.kb_id,
             )
         except Exception:
+            # 删旧失败不致命：行 id 相同，插入即覆盖
             logging.debug(
                 "raptor_graph: prior delete failed for kb=%s doc=%s; relying on id-upsert",
                 kb_id_str,
