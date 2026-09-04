@@ -94,7 +94,6 @@ class GraphExtractor(Extractor):
     ):
         super().__init__(llm_invoker, language, entity_types)
         """初始化：装好提示词模板、各种占位符键名和追问参数。"""
-        # TODO: streamline construction
         self._llm = llm_invoker
         self._join_descriptions = join_descriptions
         # 各占位符键名：没传就用默认键名（这些键名对应提示词模板里的 {xxx} 空位）

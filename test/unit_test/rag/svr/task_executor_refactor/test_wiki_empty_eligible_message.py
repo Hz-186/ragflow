@@ -125,9 +125,6 @@ def _load_wiki_generator(monkeypatch):
         _wiki_load_map_extracts_for_state=lambda *_args, **_kwargs: [],
         _wiki_scan_current_chunk_state=lambda *_args, **_kwargs: [],
         wiki_map_from_chunks=lambda *_args, **_kwargs: [],
-        wiki_plan_from_reduction=lambda *_args, **_kwargs: [],
-        wiki_reduce_from_extracts=lambda *_args, **_kwargs: [],
-        wiki_refine_from_plan=lambda *_args, **_kwargs: [],
     )
     _stub_module("rag.nlp", search=ModuleType("rag.nlp.search"))
     _stub_module("rag.utils")

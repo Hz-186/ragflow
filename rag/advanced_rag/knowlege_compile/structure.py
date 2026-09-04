@@ -1,18 +1,3 @@
-#
-#  Copyright 2026 The InfiniFlow Authors. All Rights Reserved.
-#
-#  Licensed under the Apache License, Version 2.0 (the "License");
-#  you may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
-#
 """结构化知识编译引擎模块 —— 负责从非结构化文本中提取列表（list）、集合（set）与超图（hypergraph）等结构，并执行两阶段去重（本地相似度去重与搜索引擎存储碰撞）与图谱重构。"""
 
 import datetime
@@ -42,18 +27,21 @@ from ._common import (
     knowledge_compile_gen_conf as _knowledge_compile_gen_conf,
 )
 
-
+# 系统原生支持的标准结构类型白名单
 _STRUCT_TYPES = ("list", "set", "hypergraph")
+# 结构名称的兼容性别名词典
 _STRUCT_TYPE_ALIASES = {
     "graph": "hypergraph",
     "knowledge_graph": "hypergraph",
 }
 
-_ES_DEDUP_KNN_CONCURRENCY = 8
-_ES_DEDUP_LLM_CONCURRENCY = 16
+# 在入库前，系统会拿新抽取的实体去数据库里查：「这个实体库里是不是已经有了？相似度高不高？如果高，是不是同一个人/事物？」
+_ES_DEDUP_KNN_CONCURRENCY = 8  # 存储层（Elasticsearch / Infinity）KNN 向量检索的最大并发数。
+_ES_DEDUP_LLM_CONCURRENCY = 16  # 大模型去重裁决的最大并发请求数。
 _ES_DEDUP_LLM_BATCH_SIZE = 16
 _ES_DEDUP_EMBED_BATCH_SIZE = 64
 _ES_DEDUP_INSERT_BATCH_SIZE = 256
+
 _STRUCT_INVALID_SENTINELS = {"-1"}
 
 # 合并作用域常量：doc（单文档范围去重）、dataset（全知识库跨文档合并）
@@ -261,12 +249,10 @@ def _struct_localize(value, language: str = "en") -> str:
     返回值:
         匹配后的单字符串，示例："你好"
     """
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value
-    if isinstance(value, list):
-        return "\n".join(f"{i + 1}. {item}" for i, item in enumerate(value))
+    if value is None: return ""
+    if isinstance(value, str): return value
+    if isinstance(value, list): return "\n".join(f"{i + 1}. {item}" for i, item in enumerate(value))
+
     if isinstance(value, dict):
         v = value.get(language)
         if v is None and language != "en":
@@ -292,9 +278,9 @@ def _struct_get(cfg: dict, *keys, default=None):
 
     if not isinstance(cfg, dict):
         return default
+
     for k in keys:
-        if k in cfg:
-            return cfg[k]
+        if k in cfg: return cfg[k]
         kl = k.lower()
         for ck in cfg.keys():
             if isinstance(ck, str) and ck.lower() == kl:
@@ -346,8 +332,7 @@ def _struct_supported_type(parser_config: dict, autotype: str) -> bool:
 
 
 def _struct_render_fields(fields: list, language: str) -> Tuple[str, str]:
-    """将字段定义列表渲染为提示词文本说明与 JSON 骨架字符串 —— 传统字段骨架渲染工。
-
+    """ 将字段定义列表渲染为提示词文本说明与 JSON 骨架字符串 —— 传统字段骨架渲染工。
     参数:
         fields: 字段配置字典列表，结构示例：[{"name": "title", "type": "str", "description": "文章标题"}]
         language: 语种，示例："zh"
@@ -433,7 +418,6 @@ def _struct_hypergraph_prompts(parser_config: dict, language: str = "en", rechun
         parser_config: 解析规则配置字典。
         language: 语种，示例："zh"
         rechunk: 是否启用语义分块同步重切分，示例：False
-
     返回值:
         二元组 (实体抽取系统提示词, 关系抽取系统提示词)，示例：("...", "...")
     """
@@ -476,6 +460,7 @@ def _struct_hypergraph_prompts(parser_config: dict, language: str = "en", rechun
     if ent_desc:
         node_parts.append(f"## Entity Description:\n{ent_desc}")
     node_parts.append(f"## Entity Fields:\n{ent_fields_text}")
+
     if rechunk:
         node_parts.append(
             "## Semantic Chunking Rules:\n"
@@ -523,6 +508,53 @@ def _struct_hypergraph_prompts(parser_config: dict, language: str = "en", rechun
     edge_prompt = "\n\n".join(edge_parts)
 
     return node_prompt, edge_prompt
+
+
+# # Role and Task:
+# 提取这篇科技论文中的核心科学发现与研究机构
+#
+# ## Global Rules:
+# 严格依据原文，禁止外部知识臆测。
+#
+# ## Entity Extraction Rules:
+# 不要提取宽泛的概念，只提取具象的算法或实体
+#
+# ## Entity Fields:
+# - type: person
+#   description: 科学家/学者
+# - type: algorithm
+#   description: 具体算法模型
+#
+# ## Response Format:
+# Reply with a single JSON object of the form: {
+#   "items": [{ "type": "<one of: person|algorithm|other>", "name": "<exact extracted item text>", "description": "<evidence>", "source_chunk_ids": ["<source chunk id>", ...] }, ...]
+# }.
+# Auto-type: "hypergraph".
+# Return JSON only, no commentary.
+
+
+
+# # Role and Task:
+# 提取这篇科技论文中的核心科学发现与研究机构
+#
+# ## Relation Extraction Rules:
+# 提取从属关系或提出关系
+#
+# ## Relation Fields:
+# - type: propose
+#   description: 提出/发明
+# - type: employ
+#   description: 任职于
+#
+# ## Known Entities:
+# {known_nodes}
+#
+# ## Response Format:
+# Reply with a single JSON object of the form:
+# {"items": [{ "type": "<one of: propose|employ>", "source": "<known entity name>", "target": "<known entity name>", "description": "..." }, ...]}.
+# Only create relations between entities listed in 'Known Entities'. Return JSON only, no commentary.
+
+# {known_nodes} 是预留给后续代码动态替换的。第一阶段把实体抽出来后，会把抽出的实体名字填进 {known_nodes}，命令大模型只允许在这些已知实体之间连线
 
 
 def _struct_entity_id_field(parser_config: dict) -> str:
@@ -623,6 +655,15 @@ async def _struct_extract_hypergraph(
 
     参数:
         text: 拼接后的批次分块文本。
+
+            [CHUNK_ID: c1]
+            爱因斯坦在1905年发表了狭义相对论
+            [END_CHUNK]
+
+            [CHUNK_ID: c2]
+            光电效应论文为他赢得了1921年诺贝尔物理学奖
+            [END_CHUNK]
+
         parser_config: 编译配置字典。
         chat_mdl: 大模型 Bundle。
         language: 语种。
@@ -632,7 +673,8 @@ async def _struct_extract_hypergraph(
         四元组 (抽取出的实体列表, 抽取出的关系列表, 来源切片到正式分块映射表, 正式分块列表)。
     """
     node_prompt, edge_prompt_template = _struct_hypergraph_prompts(parser_config, language, rechunk=rechunk)
-
+    # 你的任务是从文本中提取实体，每个实体要有 name、type、description 字段，输出 JSON 格式。
+    # 你的任务是在已知实体之间提取关系，每个关系要有 type、source、target、description 字段，输出 JSON 格式。注意：模版里有一个 {known_nodes} 占位符，等着被替换成真实的实体名单。
     user_prompt = (
         "## Source Text:\n"
         "Each source chunk is enclosed by [CHUNK_ID: ...] and [END_CHUNK]. "
@@ -642,7 +684,37 @@ async def _struct_extract_hypergraph(
     )
     # 步骤一：执行第一阶段大模型抽取（提取实体节点）
     node_res = await gen_json(node_prompt, user_prompt, chat_mdl, gen_conf=_knowledge_compile_gen_conf(chat_mdl, {"temperature": 0.1}))
-    nodes = _struct_unwrap_items(node_res)
+    # {
+    #     "items": [
+    #         {
+    #             "name": "爱因斯坦",
+    #             "type": "person",
+    #             "description": "理论物理学家，提出相对论",
+    #             "source_chunk_ids": ["c1", "c2"]
+    #         },
+    #         {
+    #             "name": "狭义相对论",
+    #             "type": "theory",
+    #             "description": "1905年由爱因斯坦发表的物理学理论",
+    #             "source_chunk_ids": ["c1"]
+    #         },
+    #         {
+    #             "name": "诺贝尔物理学奖",
+    #             "type": "award",
+    #             "description": "物理学界顶级奖项",
+    #             "source_chunk_ids": ["c2"]
+    #         }
+    #     ]
+    # }
+    nodes = _struct_unwrap_items(node_res)  # 从 items 中提取实体节点
+
+    # 所以一个 node 就是{
+    #     #             "name": "爱因斯坦",
+    #     #             "type": "person",
+    #     #             "description": "理论物理学家，提出相对论",
+    #     #             "source_chunk_ids": ["c1", "c2"]
+    #     #         },
+
     chunk_id_map: dict[str, str] = {}
     rechunked_chunks: list[dict] = []
     relation_text = text
@@ -696,7 +768,7 @@ async def _struct_extract_hypergraph(
                 node["source_chunk_ids"] = [temp_to_uuid.get(str(item).strip(), str(item).strip()) for item in raw_ids if temp_to_uuid.get(str(item).strip())]
 
     # 步骤三：收集第一阶段已抽取的有效节点名称，注入到第二阶段提示词中
-    id_field = _struct_entity_id_field(parser_config)
+    id_field = _struct_entity_id_field(parser_config)  # name 字段
     known_keys = []
     for n in nodes:
         v = n.get(id_field)
@@ -707,8 +779,7 @@ async def _struct_extract_hypergraph(
             known_keys.append(v_str)
     known_str = "- " + "\n- ".join(known_keys) if known_keys else "(none)"
 
-    if not edge_prompt_template:
-        return nodes, [], chunk_id_map, rechunked_chunks
+    if not edge_prompt_template: return nodes, [], chunk_id_map, rechunked_chunks
 
     # 步骤四：执行第二阶段大模型抽取（提取受控关系边）
     edge_prompt = edge_prompt_template.replace("{known_nodes}", known_str)
@@ -723,6 +794,24 @@ async def _struct_extract_hypergraph(
         )
     )
     edge_res = await gen_json(edge_prompt, edge_user_prompt, chat_mdl, gen_conf=_knowledge_compile_gen_conf(chat_mdl, {"temperature": 0.1}))
+    # {
+    #     "items": [
+    #         {
+    #             "type": "propose",
+    #             "source": "爱因斯坦",
+    #             "target": "狭义相对论",
+    #             "description": "爱因斯坦在1905年提出了狭义相对论",
+    #             "source_chunk_ids": ["c1"]
+    #         },
+    #         {
+    #             "type": "win",
+    #             "source": "爱因斯坦",
+    #             "target": "诺贝尔物理学奖",
+    #             "description": "爱因斯坦因光电效应获得诺贝尔物理学奖",
+    #             "source_chunk_ids": ["c2"]
+    #         }
+    #     ]
+    # }
     edges = _struct_unwrap_items(edge_res)
 
     if rechunk:
@@ -735,10 +824,87 @@ async def _struct_extract_hypergraph(
 
     return nodes, edges, chunk_id_map, rechunked_chunks
 
+# 如果 rechunk 开启
+# 原始输入变一下
+# 假设原始文本有4个更细碎的小分块：
 
+            # [CHUNK_ID: t1]
+            # 爱因斯坦是理论物理学家
+            # [END_CHUNK]
+            #
+            # [CHUNK_ID: t2]
+            # 他在1905年发表了狭义相对论
+            # [END_CHUNK]
+            #
+            # [CHUNK_ID: t3]
+            # 光电效应论文发表于1905年
+            # [END_CHUNK]
+            #
+            # [CHUNK_ID: t4]
+            # 1921年他获得诺贝尔物理学奖
+            # [END_CHUNK]
+
+# 大模型第一阶段返回时多了 chunks 字段
+    # {
+    #   "chunks": [
+    #     {"id": "c1", "source_chunk_ids": ["t1", "t2"]},
+    #     {"id": "c2", "source_chunk_ids": ["t3"]}
+    #   ],
+    #   "items": [
+    #     {"name": "爱因斯坦", "type": "person", "description": "...", "source_chunk_ids": ["c1"]},
+    #     {"name": "狭义相对论", "type": "theory", "description": "...", "source_chunk_ids": ["c1"]},
+    #     {"name": "诺贝尔物理学奖", "type": "award", "description": "...", "source_chunk_ids": ["c2"]}
+    #   ]
+    # }
+
+# 代码执行重切分
+# 第1步： 解析所有原始分块到 source_texts：
+# source_texts = {
+#     "t1": "爱因斯坦是理论物理学家",
+#     "t2": "他在1905年发表了狭义相对论",
+#     "t3": "光电效应论文发表于1905年",
+#     "t4": "1921年他获得诺贝尔物理学奖"
+# }
+# 第2步： 遍历模型返回的 chunks 分组。对每个分组，先展开 source_chunk_ids（支持 "t1-t3" 这种范围写法 → ["t1","t2","t3"]），然后检查是否已被其他组认领。
+#
+# valid_groups 会变成：
+# [("c1", ["t1", "t2"]), ("c2", ["t3"])]
+
+# 注意 t4 没有被任何分组认领，会把它补成一个独立组。
+#
+# 第3步： 为每个新分组生成 UUID，构建 chunk_id_map 和 rechunked_chunks：
+#
+    # chunk_id_map = {
+    #     "t1": "a1b2c3d4...",  # uuid4().hex
+    #     "t2": "a1b2c3d4...",  # 和 t1 同一个 UUID，因为同属 c1 组
+    #     "t3": "e5f6g7h8...",
+    #     "t4": "i9j0k1l2..."
+    # }
+# 第4步： 更新实体的 source_chunk_ids 从临时ID（c1, c2）换成新 UUID：
+#
+# 爱因斯坦 → ["a1b2c3d4..."]
+# 狭义相对论 → ["a1b2c3d4..."]
+# 诺贝尔物理学奖 → ["e5f6g7h8..."]
+
+# 第5步： 用新分块重新组装 relation_text：
+#
+# [CHUNK_ID: a1b2c3d4...]
+# 爱因斯坦是理论物理学家
+#
+# 他在1905年发表了狭义相对论
+# [END_CHUNK]
+#
+# [CHUNK_ID: e5f6g7h8...]
+# 光电效应论文发表于1905年
+# [END_CHUNK]
+
+# 人话说这一整段： 重切分就是"让大模型帮我把小分块按语义重新合并成更大的块"——原本4个碎块，模型觉得 t1+t2 都是关于爱因斯坦和相对论的可以合并，
+#  t3关于光电效应单独成块，t4（1921年诺贝尔奖）没人认领就自己成一块。合并后第二阶段的关系抽取就是在这些更大的语境块上进行，信息更完整。
+
+
+# 过滤分块ID：从一个实体/关系的 source_chunk_ids 里，只保留属于当前批次的有效ID；如果一个都没命中，就返回整个批次ID列表作为兜底
 def _struct_payload_chunk_ids(payload: dict, batch_ids: list) -> list:
-    """过滤并仅保留属于当前批次有效范围内的溯源分块 ID —— 批次溯源切片过滤工。
-
+    """
     参数:
         payload: 实体或关系负载字典。
         batch_ids: 当前批次包含的分块 ID 列表。
@@ -765,12 +931,13 @@ _struct_embed = _encode
 
 def _struct_payload_description(payload: dict) -> str:
     """将负载字典中的所有非空文本与列表字段扁平拼接为用于向量化的综合描述 —— 描述文本拼接工。
-
-    参数:
-        payload: 实体或关系字典负载，结构示例：{"name": "爱因斯坦", "type": "物理学家"}
-
-    返回值:
-        以空格分隔的综合描述纯文本，示例："爱因斯坦 物理学家"
+        payload = {
+            "name": "爱因斯坦",
+            "type": "person",
+            "description": "理论物理学家，提出相对论",
+            "source_chunk_ids": ["c1", "c2"]
+        }
+        # 爱因斯坦 → "爱因斯坦 person 理论物理学家，提出相对论 c1 c2"
     """
     parts: list[str] = []
     for k, v in payload.items():
@@ -938,11 +1105,19 @@ def _struct_relation_member_fields(parser_config: dict) -> Tuple:
     """从配置中推导关系的起点与终点字段名称 —— 关系端点字段解析工。
 
     参数:
-        parser_config: 编译解析配置字典。
+        parser_config: 编译解析配置字典，结构示例：
+            {
+                "relation": {
+                    "fields": [{"type": "propose", "description": "提出"}]
+                }
+            }
 
     返回值:
         二元组 (起点字段名, 终点字段名) 或 (None, None)，示例：("source", "target")
     """
+    # 步骤一：优先检查显式声明的关系端点别名映射
+    # 输入 parser_config["identifiers"]["relation_members"] 结构示例：
+    #     {"source": "head_entity", "target": "tail_entity"}
     identifiers = _struct_get(parser_config, "identifiers", default={}) or {}
     members = _struct_get(identifiers, "relation_members")
     if isinstance(members, dict):
@@ -951,9 +1126,13 @@ def _struct_relation_member_fields(parser_config: dict) -> Tuple:
         if src or tgt:
             return src, tgt
 
+    # 步骤二：若使用了新版 relation 模板配置，系统默认使用 "source" 与 "target" 作为起点和终点键名
     if _struct_get(parser_config, "relation"):
         return "source", "target"
 
+    # 步骤三：兼容检查旧版 output.relations 结构中的字段定义列表
+    # 输入 relations_cfg 结构示例：
+    #     {"fields": [{"name": "source", "type": "str"}, {"name": "target", "type": "str"}]}
     relations_cfg = (
         _struct_get(
             _struct_get(parser_config, "output", default={}) or {},
@@ -986,23 +1165,33 @@ def _struct_to_doc_storage_doc(
     """将抽取的单条实体或关系转换为可在搜索引擎持久化存储的检索行字典 —— 存储行封装转换工。
 
     参数:
-        payload: 实体或关系字典负载，结构示例：{"name": "牛顿", "type": "person"}
+        payload: 实体或关系字典负载，结构示例：
+            {"name": "爱因斯坦", "type": "person", "description": "相对论提出者"}
         compile_kwd: 编译类型标识，示例："hypergraph"
         doc_id: 所属文档 ID，示例："doc_101"
         doc_name: 所属文档文件名，示例："physics.pdf"
-        chunk_ids: 来源分块 ID 列表，示例：["c1"]
-        vec: 嵌入特征向量列表或 numpy 数组。
+        chunk_ids: 来源分块 ID 列表，结构示例：["c1", "c2"]
+        vec: 嵌入特征向量列表或 numpy 数组，结构示例：[0.012, -0.045, ...]
         kind: 项目类型（"entity" 或 "relation"），示例："entity"
-        src_field: 关系起点字段名（可选），示例："from"
-        target_field: 关系终点字段名（可选），示例："to"
-        compilation_template_id: 编译模板 ID（可选），示例："tpl_kg"
-        compilation_template_kind: 模板大类（可选），示例："hypergraph"
+        src_field: 关系起点字段名（可选），示例："source"
+        target_field: 关系终点字段名（可选），示例："target"
+        compilation_template_id: 编译模板 ID（可选），示例："tpl_kg_01"
+        compilation_template_kind: 模板大类（可选），示例："knowledge_graph"
         scope: 作用域（"doc" 或 "dataset"），示例："doc"
-        doc_ids: 针对全库合并记录的来源文档列表（可选），示例：["doc_101", "doc_102"]
+        doc_ids: 针对全库合并记录的来源文档列表（可选），结构示例：["doc_101", "doc_102"]
 
     返回值:
-        包含分词字段、向量字段与全局元数据的 Elasticsearch 存储文档字典。
+        包含分词字段、向量字段与全局元数据的 Elasticsearch 存储文档字典，结构示例：
+            {
+                "id": "xxh64_hash",
+                "content_with_weight": "{\"name\": \"爱因斯坦\", ...}",
+                "compile_kwd": "hypergraph",
+                "knowledge_graph_kwd": "entity",
+                "name_kwd": "爱因斯坦",
+                "q_1024_vec": [0.012, -0.045, ...]
+            }
     """
+    # 序列化正文负载并统一向量为 Python 原生 float 列表
     content_with_weight = json.dumps(payload, ensure_ascii=False)
     if hasattr(vec, "tolist"):
         vec_list = vec.tolist()
@@ -1011,17 +1200,35 @@ def _struct_to_doc_storage_doc(
     doc_id_str = str(doc_id)
     template_id_str = str(compilation_template_id).strip() if compilation_template_id else ""
 
-    # 步骤一：对实体/关系描述执行多粒度分词
+    # 步骤一：提取描述文本并执行多粒度中英文分词（生成粗粒度与细粒度词条列表，用于全文检索与 BM25 打分）
+    # 输入 description 结构示例："爱因斯坦 著名物理学家"
+    # 输出 content_ltks 细粒度分词示例："爱因斯坦 著名 物理 学家"
+    # 输出 content_sm_ltks 粗粒度分词示例："爱因斯坦 物理学家"
     description = _struct_payload_description(payload)
     content_ltks, content_sm_ltks = _tokenize_for_search(description)
 
-    # 步骤二：铸造确定性 ID（融合模板标识与作用域防止哈希冲突）
+    # 步骤二：铸造唯一确定性主键 ID（基于文本内容哈希、文档ID、模板ID及作用域生成稳定哈希）
+    # 输出 row_id 结构示例："a1b2c3d4e5f60718"（64 位十六进制哈希字符串）
     row_seed_extras = [template_id_str] if template_id_str else []
     if scope == "dataset":
         row_seed_extras.append("dataset")
     row_id = _stable_row_id(content_with_weight, doc_id_str, *row_seed_extras)
 
-    # 步骤三：拼装基础存储列
+    # 步骤三：组装基础文档结构（包含检索正文、向量特征、分词列与切片溯源列表）
+    # 输出 doc 基础字典结构示例：
+    #     {
+    #         "id": "a1b2c3d4e5f60718",
+    #         "content_with_weight": "{\"name\": \"爱因斯坦\", \"type\": \"person\"}",
+    #         "compile_kwd": "hypergraph",
+    #         "knowledge_graph_kwd": "entity",
+    #         "scope_kwd": "doc",
+    #         "doc_id": "doc_101",
+    #         "docnm_kwd": "physics.pdf",
+    #         "source_chunk_ids": ["c1", "c2"],
+    #         "content_ltks": "爱因斯坦 物理学",
+    #         "content_sm_ltks": "爱因斯坦 物理学家",
+    #         "q_1024_vec": [0.012, -0.045, ...]
+    #     }
     doc = {
         "content_with_weight": content_with_weight,
         "compile_kwd": compile_kwd,
@@ -1038,7 +1245,8 @@ def _struct_to_doc_storage_doc(
     if scope == "dataset" and doc_ids:
         doc["doc_ids_kwd"] = list(doc_ids)
 
-    # 步骤四：提取提及计数与小写实体名称列便于快速精确过滤
+    # 步骤四：提取频次统计与小写实体名（用于图谱画布节点大小渲染与精准同名检索）
+    # 数据示例：mention_count_int = 3, name_kwd = "albert einstein"
     try:
         mention_count = int(payload.get("mention_count") or 1)
     except (TypeError, ValueError):
@@ -1054,7 +1262,10 @@ def _struct_to_doc_storage_doc(
     if compilation_template_kind:
         doc["compilation_template_kind_kwd"] = str(compilation_template_kind)
 
-    # 步骤五：为关系行填充起点与终点索引列
+    # 步骤五：若是关系边（relation），提取起点与终点实体名存入独立索引列（支持按起点/终点高速出边入边图遍历）
+    # 关系行专属字段数据示例：
+    #     doc["from_entity_kwd"] = "爱因斯坦"
+    #     doc["to_entity_kwd"] = "广义相对论"
     if kind == "relation":
         if src_field:
             src_val = payload.get(src_field)
@@ -1067,7 +1278,7 @@ def _struct_to_doc_storage_doc(
 
     return doc
 
-
+# 单批次抽取
 async def _struct_process_batch(
     packed: list[dict],
     batch_idx: int,
@@ -1084,10 +1295,16 @@ async def _struct_process_batch(
     compilation_template_id: str | None = None,
     compilation_template_kind: str | None = None,
 ) -> _RechunkedDocs:
-    """对单个分块批次执行超图抽取、向量嵌入与存储行转换调度 —— 单批次抽取管道执行工。
+    """接收当前批次的若干原始文本分块，驱动大模型进行实体与关系的两阶段抽取，
+    为抽取出的所有实体/关系计算 Embedding 向量特征，最后封装成可以直接存入 Elasticsearch / Infinity 引擎的结构化检索文档行。
 
     参数:
-        packed: 打包好的输入分块列表，结构示例：[{"chunk_id": "c1", "text": "..."}]
+        packed: 打包好的输入分块列表，结构示例：
+            [
+                {"chunk_id": "c1", "text": "爱因斯坦在1905年发表了狭义相对论。"},
+                {"chunk_id": "c2", "text": "光电效应理论为他赢得了1921年诺贝尔物理学奖。"}
+            ]
+
         batch_idx: 当前批次索引，示例：0
         total: 总批次数，示例：10
         autotype: 推导出的结构类型，示例："hypergraph"
@@ -1111,6 +1328,18 @@ async def _struct_process_batch(
     batch_ids: list = [e["chunk_id"] for e in packed if e.get("chunk_id")]
     batch_segments: list[str] = [f"[CHUNK_ID: {e['chunk_id']}]\n{e['text']}\n[END_CHUNK]" for e in packed if e.get("chunk_id") and isinstance(e.get("text"), str)]
     combined_text = "\n\n".join(batch_segments)
+
+# batch_ids = ["c1", "c2"]
+# combined_text = """
+#                    [CHUNK_ID: c1]
+#                    爱因斯坦在1905年发表了狭义相对论
+#                    [END_CHUNK]
+#
+#                   [CHUNK_ID: c2]
+#                   光电效应论文为他赢得了1921年诺贝尔奖
+#                   [END_CHUNK]
+#                """
+
     src_field, target_field = _struct_relation_member_fields(parser_config)
     rechunk = bool(parser_config.get("rechunk"))
 
@@ -1128,6 +1357,18 @@ async def _struct_process_batch(
             logging.exception(f"compile_structure_from_text: extraction failed for batch {batch_idx}: {e}")
             return _RechunkedDocs()
 
+        # items = [
+        #     {"name": "爱因斯坦", "type": "person", "description": "理论物理学家，提出相对论",
+        #      "source_chunk_ids": ["c1", "c2"]},
+        #     {"name": "狭义相对论", "type": "theory", "description": "1905年由爱因斯坦发表", "source_chunk_ids": ["c1"]},
+        #     {"name": "诺贝尔物理学奖", "type": "award", "description": "物理学界顶级奖项", "source_chunk_ids": ["c2"]}
+        # ]
+        # relations = [
+        #     {"type": "propose", "source": "爱因斯坦", "target": "狭义相对论",
+        #      "description": "爱因斯坦在1905年提出了狭义相对论", "source_chunk_ids": ["c1"]},
+        #     {"type": "win", "source": "爱因斯坦", "target": "诺贝尔物理学奖",
+        #      "description": "爱因斯坦因光电效应获得诺贝尔奖", "source_chunk_ids": ["c2"]}
+        # ]
         payloads = items + relations
         kinds = ["entity"] * len(items) + ["relation"] * len(relations)
         payload_chunk_ids = list(dict.fromkeys(chunk_id_map.values())) if chunk_id_map else batch_ids
@@ -1135,6 +1376,7 @@ async def _struct_process_batch(
             if callback:
                 callback((batch_idx + 1) / total, f"{batch_idx + 1}/{total} batches: 0 items")
             return _RechunkedDocs(rechunked_chunks=formal_chunks)
+        # 没有抽取项，直接返回空文档
 
         # 步骤二：批量为所有抽取项计算特征嵌入向量
         embed_inputs = [_struct_payload_description(p) for p in payloads]
@@ -1166,6 +1408,38 @@ async def _struct_process_batch(
             for payload, vec, kind in zip(payloads, embeddings, kinds)
         ]
 
+        # {
+        #     "id": "a1b2c3d4e5f6...",  # 稳定哈希主键
+        #     "content_with_weight": '{"name":"爱因斯坦","type":"person","description":"理论物理学家，提出相对论","source_chunk_ids":["c1","c2"]}',
+        #     "compile_kwd": "hypergraph",
+        #     "knowledge_graph_kwd": "entity",
+        #     "scope_kwd": "doc",
+        #     "doc_id": "doc_101",
+        #     "docnm_kwd": "physics.pdf",
+        #     "source_chunk_ids": ["c1", "c2"],
+        #     "content_ltks": "爱因斯坦 person 理论 物理 学家 提出 相对论 c1 c2",
+        #     "content_sm_ltks": "爱因斯坦 理论物理学家 提出相对论",
+        #     "q_1024_vec": [0.012, -0.045, 0.078, ...],
+        #     "mention_count_int": 1,
+        #     "name_kwd": "爱因斯坦"
+        # }
+        #
+        # {
+        #     "id": "f6e5d4c3b2a1...",
+        #     "content_with_weight": '{"type":"propose","source":"爱因斯坦","target":"狭义相对论","description":"爱因斯坦提出了狭义相对论","source_chunk_ids":["c1"]}',
+        #     "compile_kwd": "hypergraph",
+        #     "knowledge_graph_kwd": "relation",
+        #     "scope_kwd": "doc",
+        #     "doc_id": "doc_101",
+        #     "docnm_kwd": "physics.pdf",
+        #     "source_chunk_ids": ["c1"],
+        #     "content_ltks": "propose 爱因斯坦 狭义相对论...",
+        #     "content_sm_ltks": "propose 爱因斯坦 狭义相对论",
+        #     "q_1024_vec": [0.091, 0.044, ...],
+        #     "from_entity_kwd": "爱因斯坦",
+        #     "to_entity_kwd": "狭义相对论"
+        # }
+
         if callback:
             callback((batch_idx + 1) / total, f"{batch_idx + 1}/{total} batches: {len(payloads)} items")
 
@@ -1194,12 +1468,18 @@ async def compile_structure_from_text(
 
     参数:
         chunks: 输入分块字典列表，结构示例：[{"id": "chunk_01", "text": "爱因斯坦提出相对论..."}]
-        parser_config: 编译规则配置字典或 JSON 字符串，结构示例：{"kind": "hypergraph", "language": "zh", "entity_types": ["person", "concept"]}
+        parser_config: 编译规则配置字典或 JSON 字符串，结构示例：{
+                                                                "kind": "hypergraph",
+                                                                "language": "zh",
+                                                                "entity_types": ["person", "concept"],
+                                                            }
+
         chat_mdl: 大语言模型 Bundle 实例，示例：LLMBundle(model_type="chat")
         embd_mdl: 向量嵌入模型 Bundle 实例，示例：LLMBundle(model_type="embedding")
         doc_id: 来源文档唯一标识，示例："doc_101"
         doc_name: 文档名称（可选），示例："relativity.pdf"
         language: 语种，示例："zh"
+
         callback: 进度通知回调函数（可选），示例：lambda progress, msg: print(progress, msg)
         max_workers: 最大并发批次工作线程数，示例：10
         compilation_template_id: 关联的模板唯一 ID（可选），示例："tpl_kg_01"
@@ -1218,40 +1498,108 @@ async def compile_structure_from_text(
                 }
             ]
     """
-    # 步骤一：反序列化并校验编译配置
+
+    # 步骤一：反序列化并校验编译配置（入参合法性检查与格式归一化）
+    # 1. 格式兼容与反序列化：调用方（如数据库 Peewee 字段、前端 API 传参）传入的配置既可能是
+    #    JSON 字符串（如 '{"kind": "knowledge_graph"}'），也可能是已解析好的 dict。
+    #    若为字符串，需用 json.loads 解析；若 JSON 损坏则记录异常并安全返回空列表，防止解析 worker 意外崩溃。
     if isinstance(parser_config, str):
         try:
             parser_config = json.loads(parser_config)
         except Exception as e:
             logging.exception(f"compile_structure_from_text: invalid parser_config JSON: {e}")
             return []
+    # 2. 类型防御检查：确保最终拿到的配置必为字典。若传入非法类型（如 None、数字），
+    #    后续代码进行 key 读取时会崩溃，因此提前拦截报错并返回空列表。
     if not isinstance(parser_config, dict):
         logging.error("compile_structure_from_text: parser_config must be a dict or JSON string")
         return []
 
+    # 3. 结构大类推导：从配置中提取 compile_type 或 kind，利用别名词典将其归一化
+    #    （例如将 "graph"、"knowledge_graph" 统一映射为系统标准名称 "hypergraph"）。
     autotype = _struct_infer_type(parser_config)
+    # 4. 支持性白名单校验：确认推导出的类型必须在系统支持的列表 ("list", "set", "hypergraph") 内。
+    #    若配置了不支持的未知大类，记录日志并终止当前批次的抽取流水线。
     if not _struct_supported_type(parser_config, autotype):
         logging.error(f"compile_structure_from_text: unsupported type '{autotype}'")
         return []
 
     # 步骤二：预估提示词 Token 开销并划分并发分块批次
+
+    # 1. 语义重切分开关：读取是否在抽取图谱的同时，让大模型根据实体语义将零碎碎片重组成大块
+    #    数据示例：rechunk = True 或 False
     rechunk = bool(parser_config.get("rechunk"))
+
+    # 2. 组装两阶段提示词模板：生成实体节点抽取提示词（node_prompt）与关系边抽取提示词（edge_prompt）
+    #    数据示例：
+    #    node_prompt: "Extract entities: [{'name': '爱因斯坦', 'type': 'person', 'source_chunk_ids': ['c1']}]"
+    #    edge_prompt: "Extract relations from {known_nodes}: [{'from': '爱因斯坦', 'to': '相对论', 'type': 'propose'}]"
     node_prompt, edge_prompt = _struct_hypergraph_prompts(parser_config, language, rechunk=rechunk)
+
+    # 3. 计算系统提示词占用的最大 Token 预算（预留空间，防止正文加上提示词后撑爆大模型上下文窗口）
+    #    数据示例：prompt_overhead = 850（两套提示词中 Token 开销较大者的整数计数）
     prompt_overhead = max(num_tokens_from_string(node_prompt), num_tokens_from_string(edge_prompt))
 
+    # 4. 确定编译模板的类型标识：优先取配置中的 kind，未填时回退为推导出的 autotype
+    #    数据示例：template_kind = "knowledge_graph" 或 "hypergraph"
     template_kind = parser_config.get("kind") if isinstance(parser_config, dict) else None
     if not isinstance(template_kind, str) or not template_kind.strip():
         template_kind = autotype
 
+    # 5. 贪心配额切片打包：根据模型上下文窗口减去提示词预留开销后的预算，把多个分散切片拼成批次
+    #    输入 chunks 结构示例：
+    #        [
+    #            {"id": "c1", "content_with_weight": "爱因斯坦在1905年发表狭义相对论..."},
+    #            {"id": "c2", "content_with_weight": "光电效应为他赢得了诺贝尔奖..."}
+    #        ]
+    #    输出 packed_batches 结构示例（每项为一个待并发调用的批次）：
+    #        [
+    #            [
+    #                {"chunk_id": "c1", "text": "爱因斯坦在1905年发表狭义相对论..."},
+    #                {"chunk_id": "c2", "text": "光电效应为他赢得了诺贝尔奖..."}
+    #            ]
+    #        ]
     packed_batches, _info = _build_chunk_batches(
         chunks,
         chat_mdl,
         prompt_overhead_tokens=prompt_overhead,
     )
+    # 6. 空值保护：如果输入为空或没有打包出任何有效批次，直接返回空列表
     if not packed_batches:
         return []
 
-    # 步骤三：定义单批次抽取与结果聚合闭包
+    # 步骤三：定义单批次抽取任务与多批次结果聚合闭包
+    # 1. 单批次处理闭包：将单个打包切片批次传入底层抽取函数，执行「大模型提取 -> 计算向量 -> 封装ES结构行」
+    #    输入 batch 结构示例：
+    #        [
+    #            {"chunk_id": "c1", "text": "爱因斯坦于1905年发表了狭义相对论..."},
+    #            {"chunk_id": "c2", "text": "光电效应为他赢得了诺贝尔物理学奖..."}
+    #        ]
+    #    产出返回值示例（包含实体行、关系行及可选重切分切片的 _RechunkedDocs 对象）：
+    #        [
+    #            {
+    #                "id": "xxh64_hash1",
+    #                "content_with_weight": '{
+    #                   "name": "爱因斯坦",
+    #                   "type": "person",
+    #                   "description": "著名物理学家",
+    #                 }',
+    #                "compile_kwd": "hypergraph",
+    #                "knowledge_graph_kwd": "entity",
+    #                "source_chunk_ids": ["c1", "c2"],
+    #                "q_1024_vec": [0.012, -0.045, ...]
+    #            },
+    #            {
+    #                "id": "xxh64_hash2",
+    #                "content_with_weight": '{"from": "爱因斯坦", "to": "狭义相对论", "type": "propose"}',
+    #                "compile_kwd": "hypergraph",
+    #                "knowledge_graph_kwd": "relation",
+    #                "from_entity_kwd": "爱因斯坦",
+    #                "to_entity_kwd": "狭义相对论",
+    #                "source_chunk_ids": ["c1"],
+    #                "q_1024_vec": [0.081, 0.023, ...]
+    #            }
+    #        ]
     async def _process_one(batch: list[dict], bi: int, total: int) -> list[dict]:
         return await _struct_process_batch(
             packed=batch,
@@ -1270,6 +1618,18 @@ async def compile_structure_from_text(
             compilation_template_kind=template_kind,
         )
 
+    # 2. 多批次结果扁平化汇总函数：将所有并发批次产出的局部提取行展平成一个一维大列表，
+    #    并同步合并所有语义重切分产生的正式切片（formal_chunks）。
+    #    输入 per_batch 结构示例（列表套列表）：
+    #        [
+    #            [{"id": "doc1", "compile_kwd": "hypergraph"}],  # 批次 0 提取结果
+    #            [{"id": "doc2", "compile_kwd": "hypergraph"}]   # 批次 1 提取结果
+    #        ]
+    #    输出返回值示例（合并后的单一 _RechunkedDocs 扁平列表）：
+    #        [
+    #            {"id": "doc1", "compile_kwd": "hypergraph"},
+    #            {"id": "doc2", "compile_kwd": "hypergraph"}
+    #        ]
     def _flatten(per_batch: list) -> _RechunkedDocs:
         out: list[dict] = []
         formal_chunks: list[dict] = []
@@ -1281,6 +1641,12 @@ async def compile_structure_from_text(
         return _RechunkedDocs(out, formal_chunks)
 
     # 步骤四：通过通用分块并发执行器启动并行抽取
+    # 按照 max_workers（如 10）并发调度执行 _process_one，并在全部批次完成后通过 _flatten 聚合成最终结果列表。
+    # 最终返回值结构示例：
+    #    [
+    #        {"id": "entity_1", "knowledge_graph_kwd": "entity", "content_with_weight": "..."},
+    #        {"id": "relation_1", "knowledge_graph_kwd": "relation", "content_with_weight": "..."}
+    #    ]
     return await _run_chunked_pipeline(
         packed_batches,
         process_batch=_process_one,

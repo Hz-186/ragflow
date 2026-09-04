@@ -21,7 +21,6 @@ def _load_wiki_module(monkeypatch):
 
     common = sys.modules["rag.advanced_rag.knowlege_compile._common"]
     monkeypatch.setattr(common, "build_chunk_batches", lambda *args, **kwargs: ([], {}), raising=False)
-    monkeypatch.setattr(common, "bulk_dedup_items", lambda items, *args, **kwargs: items, raising=False)
     monkeypatch.setattr(common, "ensure_llm_bundle", lambda model: model, raising=False)
     monkeypatch.setattr(common, "knowledge_compile_gen_conf", lambda *args, **kwargs: {}, raising=False)
     monkeypatch.setattr(common, "run_chunked_pipeline", lambda *args, **kwargs: {}, raising=False)

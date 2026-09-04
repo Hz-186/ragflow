@@ -149,7 +149,6 @@ if hasattr(sys.modules["rag.advanced_rag.knowlege_compile"], "__package__"):
 # _common.py symbols used by wiki_incremental at import time
 _common_mod = sys.modules["rag.advanced_rag.knowlege_compile._common"]
 _common_mod.build_chunk_batches = lambda *a, **k: ([], {})
-_common_mod.bulk_dedup_items = lambda items, *a, **k: items
 _common_mod.ensure_llm_bundle = lambda model: model
 _common_mod.knowledge_compile_gen_conf = lambda *a, **k: {}
 _common_mod.run_chunked_pipeline = MagicMock(return_value={})

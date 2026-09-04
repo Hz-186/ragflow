@@ -47,18 +47,18 @@ from .types import Entity, Relation
 # 某个键缺失 = 该语言的语法里没有对应结构
 _LANG_DEP_RULES: Dict[str, Dict[str, object]] = {
     "en": {"pass_subj": "nsubjpass", "subj": "nsubj", "agent": ("agent", "pobj"), "dobj": "dobj", "prep_obj": ("prep", "pobj")},
-    "de": {"subj": "sb", "agent": ("sbp", "nk"), "prep_obj": ("mo", "nk"), "root_verb_child": "oc"},  # German ROOT is aux, real verb is "oc"
+    "de": {"subj": "sb", "agent": ("sbp", "nk"), "prep_obj": ("mo", "nk"), "root_verb_child": "oc"},  # 德语的 ROOT 是助动词，真正的动词挂在 "oc" 子节点上
     "fr": {"pass_subj": "nsubj:pass", "subj": "nsubj", "agent": "obl:agent", "dobj": "obj", "prep_obj": ("case", "obl")},
     "es": {"subj": "nsubj", "agent": "obj", "prep_obj": ("case", "obl")},
     "pt": {"pass_subj": "nsubj:pass", "subj": "nsubj", "agent": "obl:agent", "dobj": "obj", "prep_obj": ("case", "obl")},
     "zh": {
         "subj": "nsubj",
-        "agent": ("nmod:prep", None, "由"),  # case "由" marks agent
+        "agent": ("nmod:prep", None, "由"),  # 中文靠「由」字标记施动者
         "prep_obj": ("case", "nmod"),
     },
     "ja": {
         "subj": "nsubj",
-        "agent": ("obl", None, "によって"),  # "によって" marks agent
+        "agent": ("obl", None, "によって"),  # 日文靠「によって」标记施动者
         "prep_obj": ("case", "obl"),
     },
 }
@@ -407,8 +407,8 @@ class DepRelationExtractor:
                         continue
                     for c in token.children:
                         if c.dep_ == "oc":
-                            # German: args attach to aux (ROOT), not main verb (oc)
-                            # Pass both: root aux for args, oc for verb lemma
+                            # 德语：论元挂在助动词（ROOT）上、不挂在真正动词（oc）上，
+                            # 所以两个都传：aux_root=助动词找论元、root=真动词取词形
                             relations.extend(self._extract_from_root(text, c, entity_map, aux_root=token))
                     continue
 
@@ -574,20 +574,20 @@ class DepRelationExtractor:
 
         title_lemma = None    # 头衔词的词形（如 "ceo"）
         prep_obj = None       # 头衔指向的机构实体
-        deps_to_check = ["attr", "pred"]  # attr=en, pred=de
+        deps_to_check = ["attr", "pred"]  # attr 是英文的表语标签，pred 是德语的
         # 在系动词的子节点里找表语（attr/pred），再从表语下挖介词宾语
         for c in root.children:
             if c.dep_ not in deps_to_check:
                 continue
             for cc in c.children:
-                prep_deps = {"prep", "mo", "case"}  # en=prep, de=mo, fr/case
+                prep_deps = {"prep", "mo", "case"}  # 各语言的介词标签：英文 prep、德语 mo、法文 case
                 if cc.dep_ not in prep_deps:
                     continue
                 for gc in cc.children:
                     pobj_deps = {"pobj", "nk", "obl"}
                     # 注意：or True 让这个条件恒成立——任何子节点都接受为宾语，
                     # pobj_deps 的判断实际上被短路了（保留上游原样写法）
-                    if gc.dep_ in pobj_deps or True:  # accept any child as object
+                    if gc.dep_ in pobj_deps or True:  # 任何子节点都接受为宾语
                         prep_obj = self._entity_from_subtree(gc, entity_map)
                         if prep_obj:
                             title_lemma = c.lemma_.lower()
@@ -652,7 +652,7 @@ class DepRelationExtractor:
             return None
         if len(entries) == 1:
             return entries[0]
-        # Prefer exact text match
+        # 优先挑文本与 fallback_text 完全相等的那个
         for e in entries:
             if e.text.lower() == fallback_text.lower():
                 return e

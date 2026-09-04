@@ -121,11 +121,22 @@ class Dealer:
             total        = 123                        # 命中的切片总数
             ids          = ["chunk_id_1", "chunk_id_2", ...]  # 切片 id 列表，按引擎打分排序
             query_vector = [0.012, -0.03, ...]        # 用户问题的向量；没走向量检索时为 []
-            field        = {"chunk_id_1": {"content_ltks": "第一 章", "_score": 12.3, "doc_id": "...", ...}, ...}
-                                                      # 每个切片取回的字段（含引擎原始 _score）
-            highlight    = {"chunk_id_1": "这是<em>高亮</em>片段", ...}  # 高亮结果；没有可高亮的内容时为 {}
+            field        = {
+                                "chunk_id_1": {
+                                    "content_ltks": "第一 章",
+                                    "_score": 12.3,
+                                    "doc_id": "...",
+                                    ...,
+                                },
+                                ...,
+                            } # 每个切片取回的字段（含引擎原始 _score）
+
+            highlight    = {
+                                "chunk_id_1": "这是<em>高亮</em>片段",
+                                ...
+                            }  # 高亮结果；没有可高亮的内容时为 {}
             aggregation  = [("book.pdf", 5), ("manual.docx", 2), ...]  # 按文档名聚合的命中数
-            keywords     = ["机器学习", "梯度", ...]  # 从问题扩展出的关键词（含细粒度子词）
+            keywords     = ["机器学习", "梯度", ...]    # 从问题扩展出的关键词（含细粒度子词）
             group_docs   = None                       # 按文档分组的结果（预留，当前未使用）
         """
 
@@ -142,14 +153,14 @@ class Dealer:
         """把问题文本编码成向量，包装成「向量查询表达式」—— 向量查询构建器。
 
         输入参数的样子：
-            txt = "naive_merge 是什么？"       # 用户问题原文
+            txt = "naive_merge 是什么？"              # 用户问题原文
             emb_mdl = <BAAI/bge-large-zh 的模型对象>  # 嵌入模型，必须提供 encode_queries 方法
-            top_k = 1024          # KNN 召回多少条候选（ES 侧作为 knn 查询的 k 传入）
-            num_candidates = 2048 # HNSW 索引搜索时候选池大小，越大越准但越慢（ES 专用）
-            similarity = 0.1      # 余弦相似度下限，低于它的候选直接由引擎丢弃
+            top_k = 10                               # KNN 召回多少条候选（ES 侧作为 knn 查询的 k 传入）
+            num_candidates = 20                      # HNSW 索引搜索时候选池大小，越大越准但越慢（ES 专用）
+            similarity = 0.1                         # 余弦相似度下限，低于它的候选直接由引擎丢弃
 
         返回值的样子：
-            MatchDenseExpr(
+            MatchDenseExpr (
                 vector_column_name="q_1024_vec",     # 索引里的向量列名 = q_{维度}_vec
                 embedding_data=[0.012, -0.03, ...],  # 问题本身的向量（一维）
                 embedding_data_type="float",
@@ -164,9 +175,16 @@ class Dealer:
         if len(shape) > 1:
             # 一个问题的向量必须是一维的；出现二维说明模型返回了多个向量，属于模型实现错误
             raise Exception(f"Dealer.get_vector returned array's shape {shape} doesn't match expectation(exact one dimension).")
-        embedding_data = [get_float(v) for v in qv]  # numpy 浮点统一转成 Python float，避免引擎序列化出问题
+        embedding_data = [get_float(v) for v in qv]          # numpy 浮点统一转成 Python float，避免引擎序列化出问题
         vector_column_name = f"q_{len(embedding_data)}_vec"  # 向量列名带维度：1024 维模型 → q_1024_vec
-        return MatchDenseExpr(vector_column_name, embedding_data, "float", "cosine", top_k, {"similarity": similarity, "num_candidates": num_candidates})
+        return MatchDenseExpr(
+            vector_column_name,
+            embedding_data,
+            "float",
+            "cosine",
+            top_k,
+            {"similarity": similarity, "num_candidates": num_candidates},
+        )
 
     async def _existing_doc_ids(self, doc_ids: list[str]) -> set[str]:
         """在一批文档 id 里，筛出「在 MySQL 里还真实存在」的那些 —— 文档存在性核验器。
@@ -180,8 +198,7 @@ class Dealer:
         查询前先过一遍短命缓存（_DOC_EXISTS_TTL 秒有效期），
         缓存没命中的才真正去 MySQL 查一次，并把结果写回缓存。
         """
-        if not doc_ids:
-            return set()
+        if not doc_ids: return set()
 
         unique_doc_ids = list(dict.fromkeys(doc_ids))  # 去重且保持原顺序
         now = time.time()
@@ -192,8 +209,7 @@ class Dealer:
             hit = {d for d in unique_doc_ids if d in cached and cached[d][1]}
             miss = [d for d in unique_doc_ids if d not in cached]
 
-        if not miss:
-            return hit  # 全部命中缓存，不用碰数据库
+        if not miss: return hit  # 全部命中缓存，不用碰数据库
 
         # 存在性查询刻意在「主线程」里直接执行，走共享的 peewee 连接池。
         # 如果丢给 thread_pool_exec，每次调用都会新起一个线程；peewee 的池化连接
@@ -214,6 +230,7 @@ class Dealer:
 
         return hit.union(found)
 
+
     async def _prune_deleted_chunks(self, sres: SearchResult) -> SearchResult:
         """把「所属文档已被删掉」的残留切片从检索结果里剔除 —— 过期切片清道夫。
 
@@ -225,6 +242,7 @@ class Dealer:
         在这里把这类孤儿切片过滤掉，聊天/检索就不会把已删文档的内容翻出来。
         它只是兜底，不能替代正常的删除清理流程。
         """
+
         # 收集本次结果里所有切片挂着的 doc_id（跳过空值）
         chunk_doc_ids = [chunk.get("doc_id") for chunk in sres.field.values() if chunk and chunk.get("doc_id")]
         if not chunk_doc_ids:
@@ -267,6 +285,7 @@ class Dealer:
             group_docs=sres.group_docs,
         )
 
+
     def get_filters(self, req):
         """把请求字典里的「过滤要求」翻译成文档引擎认识的条件字典 —— 过滤条件翻译器。
 
@@ -295,7 +314,7 @@ class Dealer:
         for key, field in {"kb_ids": "kb_id", "doc_ids": "doc_id"}.items():
             if key in req and req[key] is not None:
                 condition[field] = req[key]
-        # TODO(yzc): `available_int` 字段允许为空，但 Infinity 不支持可空列。
+
         for key in ["id", "knowledge_graph_kwd", "available_int", "entity_kwd", "from_entity_kwd", "to_entity_kwd", "removed_kwd"]:
             if key in req and req[key] is not None:
                 condition[key] = req[key]
@@ -303,13 +322,15 @@ class Dealer:
             condition["must_not"] = req["must_not"]
         return condition
 
+
     async def search(self, req, idx_names: str | list[str], kb_ids: list[str], emb_mdl=None, highlight: bool | list | None = None, rank_feature: dict | None = None, min_match: bool = True):
         """把一次「检索请求」发给文档引擎，拿回候选切片 —— 引擎查询总入口。
 
         输入参数的样子：
             req = {
                 "question": "naive_merge 是什么？",  # 用户问题；为空则退化成纯列表查询
-                "kb_ids": ["kb_1"], "doc_ids": None,
+                "kb_ids": ["kb_1"],
+                "doc_ids": None,
                 "page": 1, "size": 64,               # 结果分页（第几页、每页几条）
                 "knn_top_k": 1024,                   # 向量召回候选数
                 "knn_num_candidates": 2048,          # HNSW 候选池（ES 专用）
@@ -319,6 +340,7 @@ class Dealer:
                 "fields": [...],                     # 可选：指定取回哪些字段，缺省用下面内置全量清单
                 "sort": ...,                         # 可选：无问题纯列表时按切片顺序排
             }
+
             idx_names = ["ragflow_租户id"]   # 要查的索引（一个或多个租户）
             kb_ids    = ["kb_1"]             # 知识库过滤值
             emb_mdl   = <嵌入模型对象>        # 给 None 就只做全文检索，不走向量
@@ -331,15 +353,14 @@ class Dealer:
         内部路径分三种：没有问题 → 纯列表；有问题无向量模型 → 纯全文；
         有问题有向量模型 → 全文 + KNN 向量 + 融合（不同引擎融合方式不同）。
         """
-        if highlight is None:
-            highlight = False
+        if highlight is None: highlight = False
 
         filters = self.get_filters(req)  # 请求里的过滤键 → 引擎条件字典
-        orderBy = OrderByExpr()  # 排序子句容器，纯列表查询时才填
+        orderBy = OrderByExpr()          # 排序子句容器，纯列表查询时才填
 
-        pg = int(req.get("page", 1)) - 1  # 页码从 1 开始，这里换成从 0 开始的页下标
-        # 结果分页（page/size）与 KNN 候选池大小（knn_top_k）是两回事：
-        # 候选池决定引擎先捞多少条参与排序，分页只决定最后切哪一段返回
+        pg = int(req.get("page", 1)) - 1    # 页码从 1 开始，这里换成从 0 开始的页下标
+                                            # 结果分页（page/size）与 KNN 候选池大小（knn_top_k）是两回事：
+                                            # 候选池决定引擎先捞多少条参与排序，分页只决定最后切哪一段返回
         ps = int(req.get("size", 30))
         offset, limit = pg * ps, ps
 

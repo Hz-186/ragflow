@@ -1,8 +1,45 @@
-# Copyright (c) 2024 Microsoft Corporation.
-# Licensed under the MIT License
+# 本文件的提示词模板移植自微软 GraphRAG 开源项目（github.com/microsoft/graphrag）。
+
 """
-Reference:
- - [GraphRAG](https://github.com/microsoft/graphrag/blob/main/graphrag/prompts/index/community_report.py)
+社区报告提示词模板 —— 让 LLM 给一个「社区」（实体圈子）写结构化综述报告。
+
+本文件只有一个字符串常量 COMMUNITY_REPORT_PROMPT，它是数据不是代码，
+一个字符都不要改（包括里面的英文原文——那是给 LLM 看的指令）。
+
+谁来用它：
+    general/community_reports_extractor.py 的 CommunityReportsExtractor.__call__
+    里，每处理一个社区就执行：
+        perform_variable_replacements(COMMUNITY_REPORT_PROMPT, variables={
+            "entity_df":   实体清单 CSV 文本,
+            "relation_df": 关系清单 CSV 文本,
+        })
+    然后把填好的提示词当 system 消息、user 只发 "Output:" 去问 LLM。
+
+两个占位符（唯一会被替换的空位）：
+    {entity_df}    → 社区成员清单，形如：
+                         id,entity,description
+                         0,张三,北京大学教授
+                         1,李四,张三的学生
+    {relation_df}  → 圈内关系清单，形如：
+                         id,source,target,description
+                         0,张三,李四,师生关系
+
+双花括号 {{ }} 的来历：
+    模板里的 JSON 示例用了 {{ }} 转义写法（防止被当作占位符误替换）；
+    LLM 照抄示例也会吐出 {{ }}，所以解析端（community_reports_extractor）
+    在 json.loads 之前会把 {{ 和 }} 还原成单花括号。
+
+要求 LLM 产出的五个字段（缺一即判失败，社区报告作废）：
+    title              社区标题（尽量带上代表性实体名）
+    summary            执行摘要：社区结构、实体间关联、重要信息
+    rating             0~10 的影响力评分（浮点数）
+    rating_explanation 一句话解释这个评分
+    findings           5~10 条「关键洞察」，每条 = 小标题 + 多段论证；
+                       论证必须按 Grounding Rules 引用数据编号
+                       （[Data: Entities (5), Relationships (37, 38)] 这种格式）
+
+中间那一大段 Verdant Oasis Plaza / Unity March 的例子是 few-shot 示例：
+实体是虚构的，专门演示「报告应该长什么样、引用应该怎么标」。
 """
 
 COMMUNITY_REPORT_PROMPT = """

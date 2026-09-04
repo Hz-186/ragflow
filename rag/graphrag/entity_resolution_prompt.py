@@ -1,18 +1,23 @@
-#
-#  Copyright 2024 The InfiniFlow Authors. All Rights Reserved.
-#
-#  Licensed under the Apache License, Version 2.0 (the "License");
-#  you may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
-#
+"""实体消解（entity resolution）阶段的提示词模板 —— 问 LLM「这俩是不是同一个」的合同文本。
+
+重要：下面的三引号字符串是【数据】（原样发给大模型的提示词模板），
+不是注释！一个字符都不能改，否则消解行为直接变样。
+
+用途：实体消解阶段把「疑似同一实体」的实体名两两配对，一批（最多 100 对）
+打包成一道「判断题」交给 LLM 逐对回答 Yes/No（见 entity_resolution.py 的
+_resolve_candidate）。本模板就是那张考卷的固定格式。
+
+占位符约定（调用方用填空函数 perform_variable_replacements 填空）：
+    {record_delimiter}            → 每条答案之间的分隔符，固定 "##"
+    {entity_index_delimiter}      → 包住题号的定界符，固定 "<|>"（如 <|>3<|> = 第 3 题）
+    {resolution_result_delimiter} → 包住判定结果的定界符，固定 "&&"（如 &&yes&&）
+    {input_text}                  → 本次要判定的题目清单（由 _resolve_candidate 拼好）
+
+模板里内嵌了两个示例（商品类、地名类），展示标准答案格式：
+    (For question <|>1<|>, &&yes&&, ...){##}
+解析端对应：_process_results 按 ## 切条 → 正则抠出 <|>题号<|> 和 &&yes/no&&
+→ 只留下答 yes 的对子（那才是真要合并的同义实体）。
+"""
 
 ENTITY_RESOLUTION_PROMPT = """
 -Goal-
@@ -62,7 +67,7 @@ Use domain knowledge of toponym to help understand the text and answer the above
 Output:
 (For question {entity_index_delimiter}1{entity_index_delimiter}, {resolution_result_delimiter}yes{resolution_result_delimiter}, toponym A and toponym B are same toponym.){record_delimiter}
 (For question {entity_index_delimiter}2{entity_index_delimiter}, {resolution_result_delimiter}no{resolution_result_delimiter}, toponym A and toponym B are different toponym.){record_delimiter}
-(For question {entity_index_delimiter}3{entity_index_delimiter}, {resolution_result_delimiter}yes{resolution_result_delimiter}, toponym A and toponym B are the same toponym.){record_delimiter}
+(For question {entity_index_delimiter}3{entity_index_delimiter}, {resolution_result_delimiter}yes{resolution_result_delimiter}, toponym A and toponym B are same toponym.){record_delimiter}
 (For question {entity_index_delimiter}4{entity_index_delimiter}, {resolution_result_delimiter}no{resolution_result_delimiter}, toponym A and toponym B are different toponym.){record_delimiter}
 #############################
 

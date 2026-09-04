@@ -1,18 +1,3 @@
-#
-#  Copyright 2024 The InfiniFlow Authors. All Rights Reserved.
-#
-#  Licensed under the Apache License, Version 2.0 (the "License");
-#  you may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
-#
 import asyncio
 import logging
 import re
@@ -111,8 +96,8 @@ class RecursiveAbstractiveProcessing4TreeOrganizedRetrieval:
         """
         # 第一步：查询全局缓存
         cached = await thread_pool_exec(get_llm_cache, self._llm_model.llm_name, system, history, gen_conf)
-        if cached:
-            return cached
+        # 缓存命中直接返回
+        if cached: return cached
 
         last_exc = None
         # 第二步：最多 3 次重试执行模型调用
@@ -145,8 +130,8 @@ class RecursiveAbstractiveProcessing4TreeOrganizedRetrieval:
         """
         # 第一步：检查向量缓存
         response = await thread_pool_exec(get_embed_cache, self._embd_model.llm_name, txt)
-        if response is not None:
-            return response
+        # 缓存命中直接返回
+        if response is not None:  return response
         # 第二步：调用模型编码并回写缓存
         embds, _ = await thread_pool_exec(self._embd_model.encode, [txt])
         if len(embds) < 1 or len(embds[0]) < 1:
@@ -157,25 +142,23 @@ class RecursiveAbstractiveProcessing4TreeOrganizedRetrieval:
 
     def _get_clusters_ahc(self, embeddings: np.ndarray, task_id: str = "") -> np.ndarray:
         """基于相邻切片余弦相似度的一维分水岭切分算法 —— 一维相邻分水岭聚类工。
-
         参数:
             embeddings: 二维切片向量矩阵，示例：np.ndarray(shape=(10, 768))
             task_id: 异步任务 ID，示例："task_1001"
 
         返回值:
-            各切片对应的整数聚类标签数组，结构示例：
-                np.array([0, 0, 1, 1, 2], dtype=int)
+            各切片对应的整数聚类标签数组，结构示例： np.array([0, 0, 1, 1, 2], dtype=int)
         """
+
         n = len(embeddings)
-        if n <= 1:
-            return np.zeros(n, dtype=int)
+        if n <= 1: return np.zeros(n, dtype=int)
 
         self._check_task_canceled(task_id, "_get_clusters_ahc")
 
         # 步骤一：L2 模长归一化
-        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-        norms = np.where(norms == 0, 1.0, norms)
-        normalized = embeddings / norms
+        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)  # 每行的长度
+        norms = np.where(norms == 0, 1.0, norms)  # 长度是0的兜底为1，防止除0
+        normalized = embeddings / norms  # 每行除以自己的长度
 
         # 步骤二：计算相邻切片之间的余弦相似度 (共 n-1 对)
         adj_sims = np.sum(normalized[:-1] * normalized[1:], axis=1)
@@ -221,8 +204,9 @@ class RecursiveAbstractiveProcessing4TreeOrganizedRetrieval:
         )
         return labels
 
+    # 这个方法没有用
     def clustering(self, embeddings, random_state: int, task_id: str = "") -> tuple[int, list[int]]:
-        """对单个 RAPTOR 层的切片向量执行一维分水岭聚类并返回连续规范化标签 —— 分层切片聚类调度工。
+        """对单个 RAPTOR 层的切片向量执行一维分水岭聚类并返回连续规范化标签
 
         参数:
             embeddings: 切片向量列表或矩阵，结构示例：[[0.1, 0.2, ...], ...]
@@ -239,6 +223,7 @@ class RecursiveAbstractiveProcessing4TreeOrganizedRetrieval:
         # 步骤一：转为 ndarray 执行一维分水岭聚类
         asarray = np.asarray(embeddings, dtype=np.float64)
         labels = self._get_clusters_ahc(asarray, task_id=task_id)
+        # labels = np.array([0, 0, 0, 1, 1, 2])   # 6 片，分到 0/1/2 三组
 
         # 步骤二：规整提取标量整数标签
         normalized_labels: list[int] = []
@@ -250,20 +235,20 @@ class RecursiveAbstractiveProcessing4TreeOrganizedRetrieval:
 
         if len(normalized_labels) <= 0:
             return 0, []
-        unique_labels = np.unique(normalized_labels)
-        if len(unique_labels) <= 1:
+        unique_labels = np.unique(normalized_labels)  # 把标签去重并升序排序
+        if len(unique_labels) <= 1:  # 只有一种标签 = 全在一组
             return 1, [0 for _ in normalized_labels]
         # 步骤三：映射为 0..k-1 的连续索引
         label_map = {int(old): idx for idx, old in enumerate(unique_labels)}
         return len(unique_labels), [label_map[label] for label in normalized_labels]
+
 
     @timeout(60 * 20)
     async def _summarize_texts(self, texts: list[str], callback=None, task_id: str = ""):
         """对同一个聚类簇内的文本片段生成概括标题、摘要正文及向量表示 —— 聚类文本多模态摘要工。
 
         参数:
-            texts: 待聚合摘要的正文文本列表，结构示例：
-                ["文本片段 1...", "文本片段 2..."]
+            texts: 待聚合摘要的正文文本列表，结构示例： ["文本片段 1...", "文本片段 2..."]    原文
             callback: 进度通知回调函数（可选）。
             task_id: 异步任务 ID，示例："task_1001"
 
@@ -306,8 +291,8 @@ class RecursiveAbstractiveProcessing4TreeOrganizedRetrieval:
 
                 self._check_task_canceled(task_id, "before embedding")
 
-                embds = await self._embedding_encode(cnt)
-                title = cnt.splitlines()[0].strip() if cnt else ""
+                embds = await self._embedding_encode(cnt)  # 摘要文本 → 向量（带缓存）
+                title = cnt.splitlines()[0].strip() if cnt else ""  # 取第一行当标题
                 return title, cnt, embds
         except TaskCanceledException:
             raise
@@ -315,11 +300,11 @@ class RecursiveAbstractiveProcessing4TreeOrganizedRetrieval:
             self._error_count += 1
             warn_msg = f"[RAPTOR] Skip cluster ({len(texts)} chunks) due to error: {exc}"
             logging.warning(warn_msg)
-            if callback:
-                callback(msg=warn_msg)
+            if callback: callback(msg=warn_msg)
             if self._error_count >= self._max_errors:
                 raise RuntimeError(f"RAPTOR aborted after {self._error_count} errors. Last error: {exc}") from exc
             return None
+
 
     async def __call__(
         self,
@@ -344,8 +329,7 @@ class RecursiveAbstractiveProcessing4TreeOrganizedRetrieval:
             若 is_tree=True，返回嵌套树字典与空列表，结构示例：
                 ([("正文...", vec, ["c1"], "标题")], [(0, 10), (10, 12)])
         """
-        if len(chunks) <= 1:
-            return (None, None) if is_tree else ([], [])
+        if len(chunks) <= 1: return (None, None) if is_tree else ([], [])
 
         def _normalize(item):
             """标准化输入切片为统一四元组格式 (text, vec, source_chunk_ids, title)。"""
@@ -354,18 +338,19 @@ class RecursiveAbstractiveProcessing4TreeOrganizedRetrieval:
             else:
                 text, vec = item[0], item[1]
                 src = []
+
             if not text or vec is None or len(vec) <= 0:
                 return None
+
             if isinstance(src, (list, tuple)):
                 src = [s for s in src if s]
             else:
                 src = [src] if src else []
             return (text, vec, list(src), "")
 
-        # 步骤一：输入数据清洗规范化
+        # 步骤一：输入数据清洗规范化 (text, vec, source_chunk_ids, title)
         normalized = [t for t in (_normalize(c) for c in chunks) if t is not None]
-        if len(normalized) <= 1:
-            return (None, None) if is_tree else (normalized, [(0, len(normalized))])
+        if len(normalized) <= 1: return (None, None) if is_tree else (normalized, [(0, len(normalized))])
         chunks = normalized
 
         parent_child_map: dict[int, list[int]] = {}
@@ -389,6 +374,7 @@ class RecursiveAbstractiveProcessing4TreeOrganizedRetrieval:
                         if src and src not in seen:
                             seen.add(src)
                             merged_ids.append(src)
+
                 summary_ti, summary_text, summary_vec = result
                 chunks.append((summary_text, summary_vec, merged_ids, summary_ti))
                 parent_child_map[len(chunks) - 1] = list(ck_idx)
@@ -413,8 +399,7 @@ class RecursiveAbstractiveProcessing4TreeOrganizedRetrieval:
                     produced,
                 )
                 layers.append((end, len(chunks)))
-                if callback:
-                    callback(msg="Cluster one layer: {} -> {} (small-N collapse)".format(end - start, produced))
+                if callback: callback(msg="Cluster one layer: {} -> {} (small-N collapse)".format(end - start, produced))
                 break
 
             # 步骤三：执行分水岭聚类划分
@@ -423,6 +408,8 @@ class RecursiveAbstractiveProcessing4TreeOrganizedRetrieval:
                 random_state=random_state,
                 task_id=task_id,
             )
+            # n_clusters, lbls = (5, [0, 0, 1, 1, 2, 2, 3, 3, 3, 4, 4, 4])
+            #                      前2片一组  中间2片一组…          最后3片一组
 
             # 防止聚类退化死循环保底：若聚类数未发生收缩，强制归为单类
             if n_clusters >= len(embeddings):
@@ -438,7 +425,7 @@ class RecursiveAbstractiveProcessing4TreeOrganizedRetrieval:
             tasks = []
             for c in range(n_clusters):
                 ck_idx = [i + start for i in range(len(lbls)) if lbls[i] == c]
-                assert len(ck_idx) > 0
+
                 self._check_task_canceled(task_id, "before cluster processing")
                 tasks.append(asyncio.create_task(summarize(ck_idx)))
             try:
@@ -449,6 +436,11 @@ class RecursiveAbstractiveProcessing4TreeOrganizedRetrieval:
                     t.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
                 raise
+            # 组0 → 下标[0, 1]      → summarize([0, 1])
+            # 组1 → 下标[2, 3]      → summarize([2, 3])
+            # 组2 → 下标[4, 5]      → summarize([4, 5])
+            # 组3 → 下标[6, 7, 8]   → summarize([6, 7, 8])
+            # 组4 → 下标[9, 10, 11] → summarize([9, 10, 11])
 
             produced = len(chunks) - end
             assert produced <= n_clusters, "{} vs. {}".format(produced, n_clusters)
@@ -472,11 +464,16 @@ class RecursiveAbstractiveProcessing4TreeOrganizedRetrieval:
         if is_tree:
             return self._materialize_tree(chunks, layers, parent_child_map, n_originals), []
         return chunks, layers
+    #
+    # 时刻              chunks 里装着什么                      列表长度    layers（每层下标范围）
+    # ─────────────────────────────────────────────────────────────────────────────────────────
+    # 刚开始            12 片叶子（下标 0~11）                     12          [(0, 12)]
+    # 第 1 轮聚类后     12 片叶子 + 5 条摘要（下标 12~16）          17          [(0, 12), (12, 17)]
+    # 第 2 轮折叠后     12 片叶子 + 5 条摘要 + 1 条根摘要（下标 17）  18         [(0, 12), (12, 17), (17, 18)]
 
     @staticmethod
     def _materialize_tree(chunks, layers, parent_child_map, n_originals):
         """自顶向下遍历父子节点映射关系构建前台可渲染的嵌套树字典 —— 聚类树层级物化工。
-
         参数:
             chunks: 全部切片元组列表，结构示例：[(text, vec, ids, title)]
             layers: 各层切片起始索引范围元组列表，结构示例：[(0, 10), (10, 12)]
@@ -493,8 +490,8 @@ class RecursiveAbstractiveProcessing4TreeOrganizedRetrieval:
                     ]
                 }
         """
-        if not layers or len(chunks) == 0:
-            return None
+        if not layers or len(chunks) == 0: return None
+
         top_start, top_end = layers[-1]
         if top_end <= top_start:
             return None
@@ -526,3 +523,12 @@ class RecursiveAbstractiveProcessing4TreeOrganizedRetrieval:
         if len(top_nodes) == 1:
             return top_nodes[0]
         return {"title": "(root)", "children": top_nodes}
+
+    # parent_child_map = {
+    #     12: [0, 1],  # 下标12的摘要 ← 由叶子0、1 浓缩而成
+    #     13: [2, 3],
+    #     14: [4, 5],
+    #     15: [6, 7, 8],
+    #     16: [9, 10, 11],
+    #     17: [12, 13, 14, 15, 16],  # 下标17的根摘要 ← 由5条摘要浓缩而成
+    # }

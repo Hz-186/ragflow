@@ -1,10 +1,43 @@
-# Copyright (c) 2024 Microsoft Corporation.
-# Licensed under the MIT License
-"""
-Reference:
- - [GraphRAG](https://github.com/microsoft/graphrag/blob/main/graphrag/prompts/index/extract_graph.py)
+# 本文件的提示词模板移植自微软 GraphRAG 开源项目
+# （github.com/microsoft/graphrag 的 extract_graph.py）。
+"""general 抽取法的提示词仓库 —— 微软 GraphRAG 原版风格，发给 LLM 的「合同文本」。
+
+重要：本文件里所有三引号字符串都是【数据】（原样发给大模型的提示词模板），
+不是注释！一个字符都不能改，否则抽取行为直接变样。下面的 # 注释只解释
+每段提示词的用途和占位符含义。
+
+与 light/graph_prompt.py 的关系（两套并存，由知识库配置 method 选用）：
+    * 本文件的 GRAPH_EXTRACTION_PROMPT —— general 抽取器（general/graph_extractor.py）用
+    * light 的 PROMPTS["entity_extraction"] —— light 抽取器用（本仓库默认方法）
+    两套模板大同小异：light 版多了「描述只许来自原文、禁止脑补」的强约束
+    和输出语言要求，general 版更简洁。
+
+各模板用途速查：
+    GRAPH_EXTRACTION_PROMPT      —— 主抽取提示词：一次问出实体 + 关系（含 3 个内嵌示例）
+    CONTINUE_PROMPT              —— 「追问补漏」一句话：上一轮抽完后再逼一轮
+    LOOP_PROMPT                  —— 「还要不要再追一轮」的 Y/N 询问
+    SUMMARIZE_DESCRIPTIONS_PROMPT —— 描述归纳模板：同一实体/关系的描述条数
+                                     太多（>12）时，请 LLM 合并成一段连贯摘要。
+                                     三个抽取子类共用（基类 _handle_entity_relation_summary）
+
+占位符约定（调用方用 str.format 填空）：
+    {entity_types}        → 允许的实体类型名单（逗号拼接）
+    {tuple_delimiter}     → 记录内部字段分隔符，固定 "<|>"
+    {record_delimiter}    → 记录间分隔符，固定 "##"
+    {completion_delimiter} → 「我写完了」终止标记，固定 "<|COMPLETE|>"
+    {input_text}          → 本次要抽取的原文
+    {language}            → 摘要的输出语言（仅 SUMMARIZE 模板用）
 """
 
+# ── 主抽取提示词：general 写入侧的「合同」本体 ─────────────────────────────
+# 要求 LLM 做两件事（比 light 版少一项：不抽全文级关键词）：
+#   1. 抽实体，每条格式 ("entity"<|>名字<|>类型<|>描述)
+#   2. 抽关系，每条格式 ("relationship"<|>源<|>目标<|>描述<|>强度分)
+#      注意：general 版的关系记录没有关键词字段，强度分直接跟在描述后面，
+#      字段数比 light 版少一个（5 个字段对 6 个字段）
+# 所有记录用 ## 分隔，结尾输出 <|COMPLETE|>。
+# 模板里内嵌了 3 个「原文 → 标准答案」示例（小说叙事/科幻任务/首次接触），
+# 直接写死在字符串里，不像 light 版那样从外部填充 {examples}。
 GRAPH_EXTRACTION_PROMPT = """
 -Goal-
 Given a text document that is potentially relevant to this activity and a list of entity types, identify all entities of those types from the text and all relationships among the identified entities.
@@ -105,9 +138,20 @@ Text: {input_text}
 ######################
 Output:"""
 
+# ── 「追问补漏」提示词：第一轮抽完后追加这一句，逼 LLM 把漏掉的实体补上 ──
+# 对应 general/graph_extractor.py 里 gleaning 循环的 CONTINUE_PROMPT。
 CONTINUE_PROMPT = "MANY entities were missed in the last extraction.  Add them below using the same format:\n"
+
+# ── 「还要不要再追一轮」询问：只许答单字母 Y 或 N ────────────────────────
+# general 抽取器还会用 logit_bias 把 Y/N 两个 token 的概率同时推高
+# （_loop_args），逼模型干脆利落地只吐一个字母。
 LOOP_PROMPT = "It appears some entities may have still been missed. Answer Y if there are still entities that need to be added, or N if there are none. Please answer with a single letter Y or N.\n"
 
+# ── 描述归纳模板：多条描述 → 一段连贯摘要 ─────────────────────────────────
+# 谁在用：基类 extractor.py 的 _handle_entity_relation_summary ——
+# 同一实体/关系的描述超过 12 条时才触发（三个抽取子类共用这一份模板）。
+# 占位符：{entity_name} = 实体名或 "源 -> 目标"，{description_list} = 描述列表，
+# {language} = 输出语言。
 SUMMARIZE_DESCRIPTIONS_PROMPT = """
 You are a helpful assistant responsible for generating a comprehensive summary of the data provided below.
 Given one or two entities, and a list of descriptions, all related to the same entity or group of entities.

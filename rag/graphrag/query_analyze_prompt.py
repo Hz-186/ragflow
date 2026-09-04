@@ -1,12 +1,36 @@
-# Licensed under the MIT License
-"""
-Reference:
- - [LightRag](https://github.com/HKUDS/LightRAG)
- - [MiniRAG](https://github.com/HKUDS/MiniRAG)
+# 本文件的提示词模板移植自 LightRAG / MiniRAG 开源项目
+# （github.com/HKUDS/LightRAG、github.com/HKUDS/MiniRAG）。
+"""查询分析提示词仓库 —— 检索侧「从用户问题里抽关键词」的合同文本。
+
+重要：本文件里所有三引号字符串都是【数据】（原样发给大模型的提示词模板），
+不是注释！一个字符都不能改，否则查询改写行为直接变样。
+
+注意区分两套「关键词抽取」模板（名字相近，用途完全不同）：
+    * minirag_query2kwd —— 【活代码】：KGSearch.query_rewrite（search.py）用的
+      就是它。特点：让 LLM 从「实体类型池」里挑出用户问题可能涉及的类型
+      （answer_type_keywords），同时抽出问题里的具体实体（entities_from_query）。
+      类型池不是凭空给的——是建图阶段把「实体类型 → 样例实体名」映射
+      （ty2ents chunk）查出来拼进去的（见 utils.get_entity_type2samples）。
+    * keywords_extraction —— 【死模板】：LightRAG 查询侧的另一套写法，
+      本仓库没有任何代码引用它（留档备查）。rag/nlp/search.py 等处的
+      关键词抽取走的是别的提示词，与这里无关。
+
+占位符约定（调用方用 str.format 填空）：
+    minirag_query2kwd：
+        {query}     → 用户的问题原文
+        {TYPE_POOL} → 实体类型池的 JSON（{"PERSON": ["张三", ...], ...}）
+        模板里成对出现的双花括号 {{ }} 是转义，表示「字面花括号」，
+        填空后原样保留（因为示例里的 JSON 自己带花括号）
+    keywords_extraction（未使用）：
+        {query} → 用户问题；{examples} → few-shot 示例
 """
 
 PROMPTS = {}
 
+# ── 查询改写主模板：KGSearch.query_rewrite 用它把问题翻译成两类关键词 ──
+# 产出要求（JSON 两个键）：
+#   answer_type_keywords —— 从类型池里选最多 3 个最可能的答案类型（如 LOCATION）
+#   entities_from_query  —— 从问题原文抽出的具体实体/细节（检索时取前 5 个）
 PROMPTS["minirag_query2kwd"] = """---Role---
 
 You are a helpful assistant tasked with identifying both answer-type and low-level keywords in the user's query.
@@ -155,6 +179,8 @@ Output:
 
 """
 
+# ── 高/低层关键词抽取模板 —— 本仓库无代码引用，留档备查 ─────────────────
+# （真正在用的高层关键词抽取见 rag/nlp/search.py 的 Dealer 路径，不是这一份）
 PROMPTS["keywords_extraction"] = """---Role---
 
 You are a helpful assistant tasked with identifying both high-level and low-level keywords in the user's query.
@@ -185,6 +211,7 @@ Output:
 
 """
 
+# keywords_extraction 的三个 few-shot 示例（同样未被引用）
 PROMPTS["keywords_extraction_examples"] = [
     """Example 1:
 
