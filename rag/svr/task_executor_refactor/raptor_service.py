@@ -13,11 +13,29 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-"""
-Raptor Service Module.
+"""RAPTOR 摘要生产服务（重构版任务执行器的生产路径）—— 摘要树的制造车间。
 
-Provides [`RaptorService`](rag/svr/task_executor_refactor/raptor_service.py:48) for RAPTOR
-(Recursive Abstractive Processing for Tree-Organized Retrieval) summary generation.
+RAPTOR（Recursive Abstractive Processing for Tree-Organized Retrieval）
+的思路：把文档的原始切片按向量聚类，让 LLM 给每簇写摘要，摘要再聚类
+再摘要，层层叠成一棵树。树建好之后，本服务把它「物化」成索引里的行，
+树的价值才能被检索用上。物化产物有三种形态：
+
+1. 逐条摘要切片（``raptor_kwd="raptor"``）——默认产物。每条摘要就是一
+   个普通可检索切片：带分词正文（content_ltks）、带向量（q_{维度}_vec），
+   混在原始切片里参与常规混合检索。用户问「这份文档整体讲了什么」时，
+   覆盖整节内容的摘要往往比任何单个原始切片得分更高——这就是 RAPTOR
+   增强检索的全部机制：不改变检索算法，只是往候选池里放进「站得更高」
+   的候选。
+2. 单行整树（``raptor_kwd="raptor_tree"``，available_int=0 不可检索）——
+   is_tree=True 路径的产物，整棵树序列化成一行，供编译模板使用。
+3. 图谱行（``compile_kwd="raptor_graph"``，available_int=0 不可检索）——
+   由 _persist_raptor_graph_to_es 在摘要入库后生成：把摘要按层级投影成
+   {entities, relations} 图结构存成一行，供前端「结构图」页签和
+   深度思考（harness）的导航工具读取展示。
+
+此外本服务还负责两件事：断点续建（入库前先查该文档已有哪些建树方法
+的摘要，已有就跳过）、旧摘要清理（重跑前排好清理计划，新摘要插入
+成功后才真正删旧的）。
 """
 
 import copy
@@ -49,48 +67,67 @@ from rag.svr.task_executor_refactor.task_context import TaskContext
 
 
 def _sum_tree_text_tokens(tree) -> int:
-    """Count tokens across every ``title`` string in the RAPTOR tree.
+    """统计整棵 RAPTOR 树里所有 ``title`` 摘要文本的 token 总数 —— 摘要字数会计。
 
-    Mirrors the legacy ``tk_count`` semantic (sum over summary texts)
-    so the orchestrator's downstream logging / billing keeps working
-    when the tree path replaces the per-summary rows. Walks the dict
-    iteratively to avoid recursion-limit issues on deep trees.
+    单行整树（raptor_tree）路径不再产出逐条摘要行，但上游编排的日志/
+    计费仍沿用老的 tk_count 口径（各层摘要文本的 token 总和），
+    本函数就是补上这个统计：遍历树上每个节点的 title 累加。
+    用栈做迭代遍历，树再深也不会撞递归深度限制。
+
+    输入参数的样子（is_tree=True 时 Raptor.__call__ 返回的树字典）：
+        tree = {
+            "title": "全文总览：风险控制与合规要点",
+            "children": [
+                {"title": "第一章 市场风险概述", "children": []},
+                {"title": "第二章 信用风险评估", "children": []},
+            ],
+        }
+
+    返回值的样子：
+        213   # 所有节点 title 的 token 数之和；输入不是字典时为 0
     """
     if not isinstance(tree, dict):
         return 0
     total = 0
-    stack = [tree]
+    stack = [tree]  # 用显式栈代替递归：深度优先遍历整棵树
     while stack:
         node = stack.pop()
         if not isinstance(node, dict):
-            continue
+            continue  # 防御性跳过：children 里混入非字典元素时忽略
         title = node.get("title")
         if isinstance(title, str) and title:
-            total += num_tokens_from_string(title)
+            total += num_tokens_from_string(title)  # 该节点的摘要文本计入总数
         children = node.get("children")
         if isinstance(children, list):
-            stack.extend(children)
+            stack.extend(children)  # 子节点压栈待处理
     return total
 
 
 class RaptorService:
-    """Service for RAPTOR summary generation.
+    """RAPTOR 摘要生产服务 —— 围绕一个任务上下文干四类活的车间主任。
 
-    This service handles:
-    - RAPTOR chunk method detection (checkpoint)
-    - RAPTOR summary generation per document or dataset-level
-    - Stale RAPTOR chunk cleanup
-    - Auto-disable rules for certain file types
+    四类活：
+    1. 断点检测：入库前查某文档/数据集已有哪些建树方法的摘要，有则跳过；
+    2. 摘要生产：按文档逐个（scope="file"）或全库合并（scope="dataset"）
+       跑 RAPTOR，产出摘要切片行；
+    3. 旧摘要清理计划：重跑时把要删的旧摘要排成计划，插入成功后执行；
+    4. 自动禁用规则：Excel/CSV、表格型 PDF 不做 RAPTOR。
     """
 
     def __init__(
         self,
         ctx: TaskContext,
     ):
-        """Initialize RaptorService.
+        """服务开张：绑定本次任务的上下文 —— 车间领料。
 
-        Args:
-            ctx: TaskContext containing task configuration and execution resources.
+        输入参数的样子：
+            ctx = TaskContext(...)
+            # 任务上下文：带着租户/知识库/文档/解析器配置（含 raptor 配置）、
+            # 进度回调 progress_cb、干跑拦截器 write_interceptor 等
+            # 执行资源，本服务所有读写都通过它进行
+
+        初始化后的内部成员：
+            self._task_context   # 原样保存的任务上下文
         """
         self._task_context = ctx
 
@@ -103,30 +140,52 @@ class RaptorService:
         vector_size: int,
         doc_ids: List[str],
     ) -> Tuple[List[Dict], int, List[Tuple[str, Optional[str]]]]:
-        """Generate RAPTOR summaries for selected documents.
+        """给指定文档批量生产 RAPTOR 摘要 —— RAPTOR 生产总调度（超时 1 小时）。
 
-        Args:
-            kb_parser_config: Knowledge base parser configuration.
-            chat_mdl: Chat model bundle for RAPTOR.
-            embd_mdl: Embedding model bundle for RAPTOR.
-            vector_size: Vector dimension size.
-            doc_ids: List of document IDs to process.
+        本方法只负责开工前的准备（读配置、收集文档信息），然后按
+        scope 分派给两条产线之一；真正建树和写摘要行在 _generate_raptor。
 
-        Returns:
-            Tuple of (chunks, token_count, cleanup_raptor_chunks).
+        输入参数的样子：
+            kb_parser_config = {
+                "raptor": {"use_raptor": True, "scope": "file", "prompt": "...",
+                           "max_token": 512, "max_cluster": 64,
+                           "clustering_threshold": 0.3, "clustering_ratio": 0.5,
+                           "random_seed": 0},
+                ...
+            }                                # 知识库解析配置（raptor 子项是本次的配方）
+            chat_mdl = <LLMBundle 聊天模型>    # 写摘要用
+            embd_mdl = <LLMBundle 嵌入模型>    # 聚类用（切片向量已在库里，这里主要给摘要编码）
+            vector_size = 1024               # 向量维度（决定向量列名 q_1024_vec）
+            doc_ids = ["doc_001", "doc_002"] # 本批要处理的文档
+
+        返回值的样子：
+            (
+                [   # 生产出的摘要切片行（待插入索引的完整字段字典）
+                    {"id": "3f2a...", "doc_id": "doc_001", "kb_id": ["kb_1"],
+                     "raptor_kwd": "raptor", "content_with_weight": "第一章 市场风险……",
+                     "content_ltks": "第一 章 市场 风险 ……", "q_1024_vec": [0.01, ...],
+                     "raptor_layer_int": 1, ...},
+                    ...
+                ],
+                1850,   # 所有摘要文本的 token 总数（记账用）
+                [("doc_003", "raptor"), ("graph_raptor_x", None)],
+                # 旧摘要清理计划：(文档id, 要保留的建树方法名；None=全删)，
+                # 由调用方在新摘要插入成功后执行
+            )
         """
         raptor_config = kb_parser_config.get("raptor", {})
-        vctr_nm = "q_%d_vec" % vector_size
+        vctr_nm = "q_%d_vec" % vector_size  # 索引里的向量列名带维度，如 q_1024_vec
 
-        res = []
-        tk_count = 0
-        cleanup_raptor_chunks = []
-        max_errors = int(os.environ.get("RAPTOR_MAX_ERRORS", 3))
+        res = []  # 本批生产出的摘要切片行，逐文档累加
+        tk_count = 0  # 摘要文本 token 累计
+        cleanup_raptor_chunks = []  # 旧摘要清理计划，逐条追加
+        max_errors = int(os.environ.get("RAPTOR_MAX_ERRORS", 3))  # LLM 摘要连续失败的容忍上限
 
-        # Collect document info
+        # 先从 MySQL 把每个文档的名字/类型/解析器信息查出来（跳过判定要用）
         doc_info_by_id = self._collect_doc_info(doc_ids)
 
-        # Determine scope
+        # 按 scope 分派两条产线：file=每个文档各建一棵树（默认）；
+        # dataset=全库切片合成一棵树（挂在假文档 GRAPH_RAPTOR_FAKE_DOC_ID 名下）
         if raptor_config.get("scope", "file") == "file":
             res, tk_count = await self._run_file_level_raptor(raptor_config, chat_mdl, embd_mdl, vctr_nm, doc_ids, doc_info_by_id, max_errors, res, tk_count, cleanup_raptor_chunks)
         else:
@@ -136,12 +195,28 @@ class RaptorService:
 
     @classmethod
     def _collect_doc_info(cls, doc_ids: List[str]) -> Dict[str, Dict]:
-        """Collect document info for all doc_ids."""
+        """从 MySQL 批量取回文档的基础档案 —— 文档档案员。
+
+        后面两处要用：自动禁用判定（看文件类型/解析器）、
+        给摘要行填文档名（docnm_kwd）。
+
+        输入参数的样子：
+            doc_ids = ["doc_001", "doc_002", "doc_001"]   # 允许重复，内部先去重
+
+        返回值的样子：
+            {
+                "doc_001": {"name": "风控手册.pdf", "type": ".pdf",
+                            "parser_id": "naive", "parser_config": {"chunk_token_num": 512}},
+                "doc_002": {"name": "产品说明.xlsx", "type": ".xlsx",
+                            "parser_id": "naive", "parser_config": {}},
+            }
+            # 数据库里查不到的 doc_id 不出现在结果里
+        """
         doc_info_by_id = {}
-        for doc_id in set(doc_ids):
+        for doc_id in set(doc_ids):  # set 去重，每个文档只查一次
             ok, source_doc = DocumentService.get_by_id(doc_id)
             if not ok or not source_doc:
-                continue
+                continue  # 文档行不存在（可能刚被删），跳过
             doc_info_by_id[doc_id] = {
                 "name": getattr(source_doc, "name", ""),
                 "type": getattr(source_doc, "type", ""),
@@ -152,30 +227,44 @@ class RaptorService:
 
     async def _run_file_level_raptor(self, raptor_config, chat_mdl, embd_mdl, vctr_nm, doc_ids, doc_info_by_id, max_errors, res, tk_count, cleanup_raptor_chunks):
         tree_builder = "raptor"
-        """Run RAPTOR at file level (per document)."""
+        """文件级产线：每个文档各建一棵摘要树 —— 单文档流水线。
+
+        对每个文档依次做：自动禁用判定 → 断点检测（已有本方法摘要就跳过）
+        → 加载原始切片 → 建树产摘要。顺带管理两类「旧账」：
+        该文档名下旧建树方法的残留摘要、以及库级（dataset 级）摘要
+        ——切到文件级后库级摘要失去存在意义，文件级摘要建成后要清掉。
+
+        参数与返回值同 run_raptor_for_kb：res / tk_count / cleanup_raptor_chunks
+        原地累加后以 (res, tk_count) 返回。
+        """
         ctx = self._task_context
-        fake_doc_id = GRAPH_RAPTOR_FAKE_DOC_ID
-        if self._task_context.write_interceptor:  # dry run mode
+        fake_doc_id = GRAPH_RAPTOR_FAKE_DOC_ID  # 库级摘要挂名的假文档 id
+        if self._task_context.write_interceptor:  # 干跑（dry run）模式：不真查索引
             dataset_methods = set()
         else:
+            # 先看库里是否已存在库级摘要（决定文件级建完后要不要清理它们）
             dataset_methods = await self._get_raptor_chunk_methods(fake_doc_id, ctx.tenant_id, ctx.kb_id)
         remove_dataset_summaries = bool(dataset_methods)
-        has_file_level_target = False
+        has_file_level_target = False  # 本次是否有任何文件级摘要落地（含断点命中）
 
         if dataset_methods:
             self._task_context.progress_cb(msg="[RAPTOR] will remove dataset-level summaries after file-level summaries are available.")
 
         for x, doc_id in enumerate(doc_ids):
+            # 闸门一：结构化数据/表格型 PDF 自动禁用，直接跳到下一篇
             if self._should_skip_raptor(doc_id, doc_info_by_id, raptor_config):
                 self._task_context.progress_cb(prog=(x + 1.0) / len(doc_ids))
                 continue
+            # 断点检测：查该文档名下已有哪些建树方法的摘要
             if self._task_context.write_interceptor:
                 existing_methods = set()
             else:
                 existing_methods = await self._get_raptor_chunk_methods(doc_id, ctx.tenant_id, ctx.kb_id)
             if tree_builder in existing_methods:
+                # 已有本方法的摘要 → 断点命中，无需重建
                 has_file_level_target = True
                 if existing_methods != {tree_builder}:
+                    # 但还残留着旧方法的摘要 → 排进清理计划（保留本方法产物）
                     self._schedule_raptor_cleanup(doc_id, tree_builder, cleanup_raptor_chunks)
                     self._task_context.progress_cb(msg=f"[RAPTOR] doc:{doc_id} will remove old RAPTOR summaries after insert.")
                 self._task_context.progress_cb(msg=f"[RAPTOR] doc:{doc_id} already has {tree_builder} RAPTOR chunks, skipping.")
@@ -183,24 +272,30 @@ class RaptorService:
                 continue
 
             if existing_methods:
+                # 有旧方法摘要但没有本方法的 → 本次属于「迁移」，建成后清旧
                 self._task_context.progress_cb(msg=f"[RAPTOR] doc:{doc_id} will migrate RAPTOR summaries to {tree_builder} after insert.")
 
+            # 从索引取回该文档的原始切片（正文+向量+切片id 三元组）
             chunks = self._load_doc_chunks(doc_id, vctr_nm)
             if not chunks:
-                continue
+                continue  # 没有可用切片（未解析/无向量），无事可做
 
             before_generate = len(res)
+            # 真正的建树+摘要生产：产出待插入的摘要切片行
             new_chunks, new_tk_count = await self._generate_raptor(chunks, doc_id, raptor_config, chat_mdl, embd_mdl, max_errors, doc_info_by_id)
             res.extend(new_chunks)
             tk_count += new_tk_count
 
             if len(res) > before_generate:
+                # 确实产出了新摘要：标记「有文件级成果」，旧方法残留排入清理
                 has_file_level_target = True
                 if existing_methods:
                     self._schedule_raptor_cleanup(doc_id, tree_builder, cleanup_raptor_chunks)
             self._task_context.progress_cb(prog=(x + 1.0) / len(doc_ids))
 
         if remove_dataset_summaries:
+            # 收尾：库里原有库级摘要的去留——只有文件级摘要真正落地了，
+            # 才把库级摘要排进清理（全删）；否则留着兜底
             if has_file_level_target:
                 self._schedule_raptor_cleanup(fake_doc_id, None, cleanup_raptor_chunks)
             else:
@@ -210,13 +305,22 @@ class RaptorService:
 
     async def _run_dataset_level_raptor(self, raptor_config, chat_mdl, embd_mdl, vctr_nm, doc_ids, doc_info_by_id, max_errors, res, tk_count, cleanup_raptor_chunks):
         tree_builder = "raptor"
-        """Run RAPTOR at dataset level (all documents combined)."""
+        """库级产线：全库切片合成一棵摘要树 —— 整库大摘要流水线。
+
+        与文件级产线互为镜像：文件级建成后要清理库级摘要，
+        库级建成后反过来要清理各文档的文件级摘要（两种 scope
+        不共存）。摘要树整体挂在假文档 GRAPH_RAPTOR_FAKE_DOC_ID 名下。
+
+        参数与返回值同 _run_file_level_raptor。
+        """
         ctx = self._task_context
         fake_doc_id = GRAPH_RAPTOR_FAKE_DOC_ID
-        migrated_file_docs = 0
-        file_cleanup_doc_ids = []
-        skipped_doc_ids = set()
+        migrated_file_docs = 0  # 名下有旧文件级摘要、等待清理的文档数
+        file_cleanup_doc_ids = []  # 上述文档的 id 清单
+        skipped_doc_ids = set()  # 被自动禁用规则跳过的文档
 
+        # 预扫描：把被自动禁用跳过的文档记下来；名下已有文件级摘要的
+        # 文档记入清理名单（库级建成后它们的文件级摘要就没用了）
         for doc_id in set(doc_ids):
             if self._should_skip_raptor(doc_id, doc_info_by_id, raptor_config):
                 skipped_doc_ids.add(doc_id)
@@ -232,37 +336,46 @@ class RaptorService:
         if migrated_file_docs:
             self._task_context.progress_cb(msg=f"[RAPTOR] will remove file-level summaries for {migrated_file_docs} docs after dataset-level build succeeds.")
 
+        # 断点检测：库级摘要（假文档名下）是否已有本方法的产物
         if self._task_context.write_interceptor:
             existing_methods = set()
         else:
             existing_methods = await self._get_raptor_chunk_methods(fake_doc_id, ctx.tenant_id, ctx.kb_id)
         if tree_builder in existing_methods:
+            # 断点命中：库级摘要已存在，不用重建
             if existing_methods != {tree_builder}:
+                # 但混着旧方法产物 → 排清理（保留本方法）
                 self._schedule_raptor_cleanup(fake_doc_id, tree_builder, cleanup_raptor_chunks)
                 self._task_context.progress_cb(msg="[RAPTOR] will remove old dataset-level RAPTOR summaries after insert.")
+            # 各文档的文件级摘要也一并排清理（断点命中也算库级落地）
             for doc_id in file_cleanup_doc_ids:
                 self._schedule_raptor_cleanup(doc_id, None, cleanup_raptor_chunks)
             self._task_context.progress_cb(msg=f"[RAPTOR] dataset-level {tree_builder} summaries already exist, skipping.")
             return res, tk_count
 
-        migrate_dataset_summaries = bool(existing_methods)
+        migrate_dataset_summaries = bool(existing_methods)  # 有旧方法库级摘要 = 本次是迁移
         if migrate_dataset_summaries:
             self._task_context.progress_cb(msg=f"[RAPTOR] will migrate dataset-level RAPTOR summaries to {tree_builder} after insert.")
 
+        # 把所有参建文档的原始切片合并装载（跳过被自动禁用的文档）
         chunks = self._load_all_doc_chunks(doc_ids, vctr_nm, skipped_doc_ids)
         if not chunks:
             if skipped_doc_ids and len(skipped_doc_ids) == len(set(doc_ids)):
+                # 全军覆没的原因是自动禁用规则，如实播报
                 self._task_context.progress_cb(msg="[RAPTOR] all documents were skipped by RAPTOR auto-disable rules.")
                 return res, tk_count
+            # 否则多半是文档还没用当前嵌入模型解析过（切片无向量）
             self._task_context.progress_cb(msg="[ERROR] No valid chunks with vectors found. Please ensure documents are parsed with the current embedding model.")
             return res, tk_count
 
         before_generate = len(res)
+        # 建树+摘要生产：全库切片合成一棵树，摘要挂在假文档名下
         new_chunks, new_tk_count = await self._generate_raptor(chunks, fake_doc_id, raptor_config, chat_mdl, embd_mdl, max_errors, doc_info_by_id)
         res.extend(new_chunks)
         tk_count += new_tk_count
 
         if len(res) > before_generate:
+            # 库级摘要真正落地：文件级旧摘要全删；库级旧方法残留也清掉
             for doc_id in file_cleanup_doc_ids:
                 self._schedule_raptor_cleanup(doc_id, None, cleanup_raptor_chunks)
             if migrate_dataset_summaries:
