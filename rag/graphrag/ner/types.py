@@ -42,7 +42,7 @@ class Entity:
     """
 
     text: str
-    label: str  # spaCy NER label: PERSON, ORG, GPE, ...
+    label: str  # spaCy 的实体类型标签：PERSON 人 / ORG 机构 / GPE 地名……
     start_char: int
     end_char: int
     confidence: float = 1.0
@@ -70,10 +70,10 @@ class Relation:
     """
 
     subject: Entity
-    predicate: str  # relation type: "founded_by", "works_for", ...
+    predicate: str  # 关系类型："founded_by"（创立）、"works_for"（任职）之类
     obj: Entity
     confidence: float = 1.0
-    context: str = ""  # surrounding text
+    context: str = ""  # 这条关系出自的上下文原文
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -103,7 +103,9 @@ class ExtractionResult:
 
 
 # spaCy 细标签 → 本应用粗类型 的对照表（18 种细标签归并成 5 类）。
-# 注意：ner/graph_extractor.py 里另有一份同名同内容的本地拷贝，
+# 注意：ner/graph_extractor.py 里另有一份同名但不同内容的本地拷贝（只有 15 项），
+# 比本表少了 PERCENT / CARDINAL / ORDINAL 三个数字类标签
+# （图谱不给纯数字建节点，生产那份就把它们省掉了）。
 # 生产代码用的是那一份；本表目前没有被任何地方 import（留档）。
 SPACY_TO_APP_ENTITY_TYPE: Dict[str, str] = {
     "PERSON": "person",           # 人

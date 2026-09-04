@@ -15,9 +15,14 @@ light 抽取法的实体/关系抽取器 —— GraphRAG 的默认抽取方法�
         → ents, rels = await ext(doc_id, chunks, callback)
           （__call__ 在基类 Extractor 里；本类只提供 _process_single_content）
 
-与 general 版（微软 GraphRAG 风格）的区别只有两点：
-    1. 提示词模板不同（LightRAG 的更简洁）
-    2. 追问补漏时不额外塞示例；其余并发/合并逻辑全在基类，两边共用
+与 general 版（微软 GraphRAG 风格）的三点不同（与 general 版文件头的描述互为镜像）：
+    1. 首轮提问的对话格式不同：本类 system 留空，把整份提示词（含正文）塞进
+       user 消息；general 版把提示词当 system，user 只发一个 "Output:" 让模型补全。
+    2. 追问用的提示词不同：本类用 entity_continue_extraction / entity_if_loop_extraction
+       （来自 light/graph_prompt.py，LightRAG 的措辞）。
+    3. 「还漏吗」的判断标准不同：本类要求回答清洗后恰好等于 "yes"（大小写不敏感）
+       才继续追问；general 版要求恰好一个大写字母 "Y"。
+其余并发/合并逻辑全在基类 Extractor，两边共用。
 """
 
 import logging

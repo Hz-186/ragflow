@@ -450,8 +450,10 @@ class GraphExtractor(Extractor):
         最终向 out_results 追加：
             ({"STEVE JOBS": [{...}], "NEW-YORK": [{...}]},        # 候选节点堆
              {("NEW-YORK", "STEVE JOBS"): [{...}]},                # 候选边堆
-             8)                                                    # 词数当 token 数
+             7)                                                    # spaCy 词元数占位
         """
+        # 上面那个 7 怎么来的：len(doc) 按词元（token）数，连字符和句号也各算一个：
+        # Steve / Jobs / visited / New / - / York / . → 7 个（若按「单词」数则是 5）。
         chunk_key = chunk_key_dp[0]   # 文档 id
         content = chunk_key_dp[1]     # 本段原文
         doc = self._nlp(content)      # 文本过一遍 spaCy
@@ -564,7 +566,8 @@ class GraphExtractor(Extractor):
                     )
                     maybe_edges[pair].append(edge_record)
 
-        # 注意：这里没有真的调 LLM，token_count 只是用词数占位
+        # 注意：这里没有真的调 LLM，token_count 只是用 spaCy 词元数占位
+        # （含标点/连字符，比单词数略大；只用于进度与统计口径统一）
         token_count = len(doc)
         out_results.append((dict(maybe_nodes), dict(maybe_edges), token_count))
         # 进度上报：0.5~0.6 区间（抽取占整篇文档进度的一小段）

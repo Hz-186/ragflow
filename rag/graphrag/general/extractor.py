@@ -250,7 +250,8 @@ class Extractor:
         async def extract_all(doc_id, chunks, max_concurrency=MAX_CONCURRENT_PROCESS_AND_EXTRACT_CHUNK, task_id=""):
             out_results = []   # 收集每段文本的抽取结果三元组
             error_count = 0    # 失败段数计数器
-            # 连续失败超过这个数就中止整篇文档（可用环境变量调），防止对着坏模型空烧
+            # 累计失败超过这个数就中止整篇文档（可用环境变量调），防止对着坏模型空烧
+            # （计数器只增不减，不是「连续失败」：中间成功几段也不会清零）
             max_errors = int(os.environ.get("GRAPHRAG_MAX_ERRORS", 3))
 
             limiter = asyncio.Semaphore(max_concurrency)  # 并发闸门
@@ -394,7 +395,8 @@ class Extractor:
                 {"entity_name": "张三", "entity_type": "PERSON", "description": "张三研究NLP", "source_id": "doc123-1"},
             ]
             第 1 步：类型投票 —— Counter 统计后取票数最高的（平票时排序取先）→ "PERSON"
-            第 2 步：描述去重排序后用 <SEP> 拼成一条 → "张三研究NLP<SEP>张三是教授"
+            第 2 步：描述去重排序后用 <SEP> 拼成一条 → "张三是教授<SEP>张三研究NLP"
+                     （排序按字符编码：前两字相同，第三字 是<研，故「是教授」排前面）
             第 3 步：出处汇总 → ["doc123-0", "doc123-1"]
             第 4 步：描述条数太多（>12）才请 LLM 归纳，否则原样保留
             输出  {"entity_name": "张三", "entity_type": "PERSON",

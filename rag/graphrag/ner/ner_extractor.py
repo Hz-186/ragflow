@@ -146,8 +146,10 @@ class NERExtractor:
             第 3 步：每个词做成明细字典 → [{"text": "Apple", "tag": "NNP",
                                              "dep": "compound", "head": 1, ...}, ...]
             第 4 步：实体 ≥2 个 → 交给 DepRelationExtractor 从句法树抽关系
-                     → [Relation(subject=Steve Jobs, predicate="founded",
-                                 obj=Apple Inc., ...)]
+                     → [Relation(subject=Apple Inc., predicate="founded_by",
+                                 obj=Steve Jobs, confidence=0.90, ...)]
+                     （"was founded by" 是被动句：查映射表 "found+by" → founded_by；
+                       受事 Apple Inc. 做主语、施事 Steve Jobs 做宾语，被动句置信度固定 0.90）
             第 5 步：打包成 ExtractionResult 返回
 
         返回长这样：

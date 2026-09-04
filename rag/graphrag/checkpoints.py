@@ -57,7 +57,7 @@ def stable_checkpoint_key(*parts: Any) -> str:
                   两者都是为了让「内容相同 → 字符串逐字节相同」）
             → '["community","0","C3",["北京大学","张三"]]'
         第 2 步：对字符串做 sha256 哈希
-        输出  "7f3c2a9e1b...（64 位十六进制串）"
+        输出  "5a9fa62948...（64 位十六进制串）"
     """
     # ensure_ascii=False 让中文保持原样而不是变成 \u8f6c 义码，纯粹为了日志可读
     payload = json.dumps(parts, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -92,9 +92,9 @@ def resolution_checkpoint_key(entity_type: str, pairs: list[tuple[str, str]]) ->
         输入  entity_type = "person"
              pairs = [("张三", "小张"), ("李四", "老李")]
         第 1 步：每对内部排序 —— ("小张","张三") 和 ("张三","小张") 视为同一对
-             → [["小张", "张三"], ["老李", "李四"]]
+             → [["小张", "张三"], ["李四", "老李"]]   # 对内字典序小的在前（小<张、李<老）
         第 2 步：整体再排序，消除配对出现顺序的影响
-             → [["老李", "李四"], ["小张", "张三"]]
+             → [["小张", "张三"], ["李四", "老李"]]   # 对间按首字比（小<李），恰好顺序没变
         第 3 步：拼成 ("resolution", "person", 排好序的配对列表) 做哈希
 
     返回值同样是 64 位十六进制串。
@@ -148,8 +148,8 @@ def _load_checkpoints_sync(tenant_id: str, kb_id: str, checkpoint_type: str, pag
 
     返回值长这样（键=存档点编号，值=当时存的 LLM 结果）：
         {
-            "7f3c2a9e1b...": {"merged_entity": {"entity_name": "张三", ...}},
-            "a81d05c3f2...": {"report": "本社区围绕北京大学...", ...},
+            "fecfd3d7a9...": {"merged_entity": {"entity_name": "张三", ...}},
+            "5a9fa62948...": {"report": "本社区围绕北京大学...", ...},
         }
         —— 一个存档都没有时返回空字典 {}
     """
@@ -196,7 +196,7 @@ async def save_checkpoint(tenant_id: str, kb_id: str, checkpoint_type: str, chec
 
     参数长这样：
         checkpoint_type = "graphrag_checkpoint_resolution"
-        checkpoint_key  = "7f3c2a9e1b..."          # stable_checkpoint_key 算出的编号
+        checkpoint_key  = "fecfd3d7a9..."          # stable_checkpoint_key 算出的编号
         payload         = {"merged_entity": {...}}  # 这一步的 LLM 结果，任意可 JSON 化对象
 
     返回值：True 存档成功 / False 失败（只记日志不抛错 —— 存档丢了顶多重跑一小步，

@@ -206,7 +206,10 @@ def run(graph: nx.Graph, args: dict[str, Any]) -> dict[int, dict[str, dict]]:
                 result[community_id] = {"weight": 0, "nodes": []}
             result[community_id]["nodes"].append(node_id)
             # 圈子权重 = 圈内所有节点的（rank × weight）之和；
-            # rank 是 pagerank 值，没有就当 0；weight 没有就当 1
+            # rank 是节点的「连接数/度数」（utils.py 的 graph_merge 里写入：
+            #   g1.nodes[名字]["rank"] = int(node_degree[1])，来自 nx.degree），
+            # 注意别和另一个属性 "pagerank"（nx.pagerank 算出的浮点数）搞混；
+            # rank 没有就当 0；weight 没有就当 1
             result[community_id]["weight"] += graph.nodes[node_id].get("rank", 0) * graph.nodes[node_id].get("weight", 1)
         # 第 3 步：本层所有圈子的权重归一化——除以最大权重，最大的圈子变 1.0
         weights = [comm["weight"] for _, comm in result.items()]
