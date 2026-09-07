@@ -33,25 +33,25 @@ from ._common import (
 )
 
 
-# ----- REFINE concurrency control -----
+# ----- REFINE 并发控制配置 -----
 
-WIKI_REFINE_MAX_CONCURRENT = 20  # shared LLM pool size used by the Wiki runner
+WIKI_REFINE_MAX_CONCURRENT = 20  # 维基编译运行器共享的大模型并发连接池容量
 
 
-# ----- constants ----
+# ----- 核心编译常量 -----
 
-# compile_kwd values
+# 编译存储类型标识（compile_kwd）
 WIKI_PAGE_COMPILE_KWD = "wiki_page"
 WIKI_PLAN_GROUP_COMPILE_KWD = "wiki_plan_group"
 WIKI_DOC_PAGE_SOURCE_COMPILE_KWD = "wiki_doc_page_source"
 WIKI_CANONICAL_ENTITY_COMPILE_KWD = "wiki_canonical_entity"
 
-# Entity matching thresholds (not exposed in YAML)
-ENTITY_MERGE_THRESHOLD = 0.90  # auto-merge
-ENTITY_AMBIGUOUS_LOW = 0.75  # LLM confirm boundary
-ENTITY_PAIRWISE_BLOCK_SIZE = 1024  # blockwise embedding matrix block size
+# 实体匹配与消歧相似度阈值（硬编码内部常量）
+ENTITY_MERGE_THRESHOLD = 0.90  # 向量相似度达到 0.90 时自动合并为同一规范实体
+ENTITY_AMBIGUOUS_LOW = 0.75  # 介于 0.75 到 0.90 之间时判定为模糊重合，唤起大模型裁决
+ENTITY_PAIRWISE_BLOCK_SIZE = 1024  # 分块向量两两相似度计算时的批次块大小
 
-# Number of concurrent KNN queries for entity matching
+# 实体匹配时的 KNN 向量检索并发数
 ENTITY_MATCH_KNN_CONCURRENT = 20
 CANONICAL_PERSIST_CONCURRENT = 20
 PAGE_ROUTER_KNN_CONCURRENT = 20
@@ -59,10 +59,10 @@ WIKI_GROUP_LLM_MAX_CONCURRENT = 8
 WIKI_GROUP_LLM_CANDIDATE_SIZE = 24
 WIKI_ROUTE_LLM_BATCH_SIZE = 12
 
-WIKI_TOPIC_FALLBACK = "General"  # bucket for pages that match no topic
+WIKI_TOPIC_FALLBACK = "General"  # 未匹配到任何主题的维基页面的默认保底主题分桶
 WIKI_PAGE_TOPIC_CANDIDATE_LIMIT = 50
 
-# Page Router thresholds (kept as code constants — not exposed in YAML)
+# 页面路由器阈值与聚类参数
 PAGE_ROUTER_MAYBE_THRESHOLD = 0.50
 PAGE_ROUTER_TOP_K = 5
 PAGE_ROUTER_MAX_CANDIDATES = 12
@@ -73,94 +73,209 @@ PAGE_CLUSTER_HARD_MAX_SIZE = 8
 PAGE_CLUSTER_MAX_ITERATIONS = 20
 PAGE_CLUSTER_CONVERGENCE_EPSILON = 1e-4
 
-# Re-synthesis triggers (both modes)
+# 页面触发重构合成（Re-synthesis）的判定条件阈值（双模式通用）
 RE_SYNTHESIS_MIN_SOURCES = 5
 RE_SYNTHESIS_GROWTH_RATIO = 1.5
 RE_SYNTHESIS_MIN_CLAIMS = 15
 RE_SYNTHESIS_MIN_VERSIONS = 3
 
-# Evidence quality (WeKnora-style verbatim chunk sourcing).
-# The page-writer sees the ACTUAL source-chunk text (not just the condensed
-# claim statement) so pages stay fact-grounded and information-dense.
-WIKI_SOURCE_BUDGET_CHARS = 32_768  # cap on verbatim chunk text fed to the writer
-WIKI_SOURCE_BUDGET_RUNES = 12_000  # per-chunk-batch budget (rune-based, mirrors WeKnora)
+# 证据质量与原文注入预算（参考 WeKnora 逐字分块溯源方案）：
+# 页面编写器直接查阅真实的源分块原文（而非仅看浓缩后的声明短语），确保页面论述翔实、事实充分
+WIKI_SOURCE_BUDGET_CHARS = 32_768  # 供给页面编写器查阅的原始分块文本字符数硬上限
+WIKI_SOURCE_BUDGET_RUNES = 12_000  # 单批次分块字符数预算（基于符文计数计量）
 
 
-# ----- helpers ---------------------------------------------------------------
+# ----- 内部辅助函数 -----------------------------------------------------
 
 
 def _wiki_log_stats(stage: str, event: str, **fields) -> None:
-    """Emit machine-readable compilation statistics for one pipeline stage."""
+    """输出维基增量编译流水线中某个阶段的统计日志 —— 统计记录工。
+
+    参数:
+        stage: 流水线阶段名称，字符串类型。
+            示例: "entity_matching"
+        event: 当前发生的具体事件标识，字符串类型。
+            示例: "batch_finished"
+        **fields: 附加的任意度量指标或上下文字段。
+            示例: {"matched_count": 15, "duration_ms": 120}
+
+    返回值:
+        None
+    """
+    # 步骤1: 将阶段、事件以及扩展字段序列化为 JSON 字符串并写入日志
+    # 数据长相示例:
+    # {"stage": "entity_matching", "event": "batch_finished", "duration_ms": 120, "matched_count": 15}
     logging.info("wiki stats %s", json.dumps({"stage": stage, "event": event, **fields}, ensure_ascii=False, sort_keys=True))
 
 
 def _wiki_derive_page_id(term: str, prefix: str = "concept") -> str:
-    """Derive a URL-safe page identifier from a concept/entity name.
+    """将概念或实体名称转换为 URL 安全且规范的页面唯一标识符 —— 页面标识生成器。
 
-    Example: "Smartphone Industry" → "concept/smartphone-industry"
+    参数:
+        term: 概念名或实体名称字符串。
+            示例: "Smartphone Industry"
+        prefix: 页面前缀路径，默认为 "concept"。
+            示例: "concept"
+
+    返回值:
+        格式化后的页面 ID 路径字符串。
+        示例: "concept/smartphone-industry"
     """
+    # 步骤1: 移除非字母数字和中文的特殊符号，替换为连字符并转小写
+    # 输入: "Smartphone Industry!"
+    # 转换后 slug: "smartphone-industry"
     slug = re.sub(r"[^a-zA-Z0-9\u4e00-\u9fff]+", "-", term).strip("-").lower()
+    # 步骤2: 与前缀拼接成完整的页面路径
+    # 输出示例: "concept/smartphone-industry"
     return f"{prefix}/{slug}"
 
 
 def _entity_to_query_text(entity: dict) -> str:
+    """从实体字典中提取核心名称、别名、描述及声明，拼装成用于向量匹配或文本检索的特征文本 —— 实体特征检索词拼装工。
+
+    参数:
+        entity: 包含实体或概念属性信息的字典。
+            长相示例:
+            {
+                "entity_name": "苹果公司",
+                "aliases": ["Apple", "苹果"],
+                "definition_excerpt": "全球知名的高科技企业",
+                "claims": [
+                    {"statement": "苹果公司设计并销售 iPhone 智能手机。"},
+                    {"statement": "苹果公司总部位于美国加州。"}
+                ]
+            }
+
+    返回值:
+        拼接后的单行检索特征字符串。
+        示例: "苹果公司 Apple 苹果 全球知名的高科技企业 苹果公司设计并销售 iPhone 智能手机。 苹果公司总部位于美国加州。"
+    """
+    # 步骤1: 提取主名称（兼容 entity_name / name / term 字段）
+    # 提取结果示例: ["苹果公司"]
     parts = [entity.get("entity_name") or entity.get("name") or entity.get("term") or ""]
+    # 步骤2: 提取别名并规范化为列表，截取最多前 5 个别名
+    # 提取结果示例: ["Apple", "苹果"]
     aliases = entity.get("aliases") or []
     if isinstance(aliases, str):
         aliases = [aliases]
     parts.extend(str(alias) for alias in aliases[:5] if alias)
+    # 步骤3: 提取定义摘录或实体描述文本
+    # 提取结果示例: "全球知名的高科技企业"
     description = entity.get("definition_excerpt") or entity.get("description") or entity.get("statement", "")
     if description:
         parts.append(str(description))
+    # 步骤4: 提取最多前 3 条陈述声明内容
+    # 提取结果示例: ["苹果公司设计并销售 iPhone 智能手机。", "苹果公司总部位于美国加州。"]
     for claim in (entity.get("claims") or [])[:3]:
         if not isinstance(claim, dict):
             continue
         statement = claim.get("statement") or claim.get("text")
         if statement:
             parts.append(str(statement))
+    # 步骤5: 用单个空格连接所有片段并返回
+    # 输出示例: "苹果公司 Apple 苹果 全球知名的高科技企业 苹果公司设计并销售 iPhone 智能手机。"
     return " ".join(parts)
 
 
 def _strip_think(text: str) -> str:
+    """剥离大模型输出中的深度思考链标签（如 </think>），提取真正有用的正文 —— 思考链清洗工。
+
+    参数:
+        text: 待处理的大模型原始返回字符串。
+            示例: "</think>\n```json\n[{\"name\": \"AI\"}]\n```"
+
+    返回值:
+        剥离思考链后的干净正文字符串。
+        示例: "```json\n[{\"name\": \"AI\"}]\n```"
+    """
+    # 步骤1: 基础校验与去除首尾空白字符
     if not isinstance(text, str):
         return ""
     text = text.strip()
+    # 步骤2: 若以 </think> 结束标签作为起始部分，截断并只取标签之后的内容
+    # 输入: "</think>\n[{\"name\": \"AI\"}]"
+    # 输出: "[{\"name\": \"AI\"}]"
     if text.startswith("</think>"):
         return text.split("</think>", 1)[-1].strip()
     return text
 
 
 def _wiki_parse_json_array(text: str) -> list | None:
-    """Extract one JSON array from an LLM response."""
+    """从文本中定位最外层的中括号并解析出 JSON 数组对象 —— JSON列表抽取解析工。
+
+    参数:
+        text: 包含 JSON 数组的文本字符串（可能夹带前置或后置解释性文字）。
+            示例: "根据提取，实体列表如下：\n[{\"name\": \"量子计算\", \"type\": \"concept\"}]\n希望对你有帮助。"
+
+    返回值:
+        成功解析出的 Python 列表对象；若未找到中括号或反序列化失败则返回 None。
+        长相示例:
+        [
+            {"name": "量子计算", "type": "concept"}
+        ]
+    """
+    # 步骤1: 校验输入类型
     if not isinstance(text, str):
         return None
+    # 步骤2: 寻找文本中最先出现的 '[' 和最后出现的 ']'
+    # 截取范围索引示例: start=13, end=61
     start = text.find("[")
     end = text.rfind("]")
     if start < 0 or end < start:
         return None
+    # 步骤3: 尝试进行 JSON 反序列化
+    # 截取子串: "[{\"name\": \"量子计算\", \"type\": \"concept\"}]"
     try:
         value = json.loads(text[start : end + 1])
     except (json.JSONDecodeError, TypeError):
         return None
+    # 步骤4: 确保返回值确实为 list 类型
     return value if isinstance(value, list) else None
 
 
 async def _chat_mdl_ask(chat_mdl, system_prompt: str, user_prompt: str, temperature: float = 0.0) -> str:
+    """调用大模型异步聊天接口进行单轮文本生成，并自动进行上下文截断与思考链清理 —— 大模型交互执行工。
+
+    参数:
+        chat_mdl: 大模型客户端实例。
+        system_prompt: 系统提示词，用于设定模型角色与输出格式约束。
+            示例: "你是一个专业的知识图谱实体消歧专家，请以 JSON 格式输出结果。"
+        user_prompt: 用户输入的指令与上下文材料。
+            示例: "请判定以下两个实体是否指向同一概念：实体A: Apple，实体B: 苹果公司。"
+        temperature: 采样温度，默认为 0.0 表示确定性输出。
+            示例: 0.0
+
+    返回值:
+        经过清理的大模型回答正文字符串。
+        示例: "[{\"decision\": \"merge\", \"reason\": \"均为苹果公司别名\"}]"
+    """
+    # 步骤1: 组装标准对话消息格式
+    # 消息列表结构示例:
+    # [
+    #     {"role": "system", "content": "你是一个专业的知识图谱..."},
+    #     {"role": "user", "content": "请判定以下两个实体..."}
+    # ]
     msg = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
+    # 步骤2: 检查并截断消息使其适配模型的最大上下文窗口限制
     try:
         _, msg = message_fit_in(msg, chat_mdl.max_length)
     except Exception:
         logging.exception("wiki incremental: message_fit_in failed; sending untrimmed")
+    # 步骤3: 获取模型生成配置参数字典，例如 {"temperature": 0.0}
     request_conf = _knowledge_compile_gen_conf(chat_mdl, {"temperature": temperature})
+    # 步骤4: 发起异步聊天请求
     try:
         raw = await chat_mdl.async_chat(msg[0]["content"], msg[1:], request_conf)
     except Exception:
         raise
     if isinstance(raw, tuple):
         raw = raw[0]
+    # 步骤5: 清洗大模型输出（剥除思维链标签）并检测底层报错行
+    # 清洗前: "</think>\n[{\"decision\": \"merge\"}]"
+    # 清洗后 response: "[{\"decision\": \"merge\"}]"
     response = _strip_think(raw or "")
     if any(line.lstrip().startswith("**ERROR**") for line in response.splitlines()):
         raise RuntimeError(f"Wiki LLM call failed: {response}")
@@ -172,12 +287,43 @@ def _wiki_should_re_synthesize(
     new_source_doc_ids: set[str],
     next_version: int,
 ) -> bool:
+    """判定已有的维基页面是否累积了足够多的新信息，从而需要触发彻底重写（重新综合） —— 重写阈值判定工。
+
+    参数:
+        page: 已编译保存的页面历史数据字典。
+            长相示例:
+            {
+                "slug_kwd": "concept/machine-learning",
+                "source_doc_ids": ["doc_001", "doc_002"],
+                "claims": [{"statement": "声明1"}, {"statement": "声明2"}],
+                "synthesis_version_int": 1
+            }
+        new_source_doc_ids: 本次增量变更中关联到该页面的新文档 ID 集合。
+            示例: {"doc_003", "doc_004", "doc_005"}
+        next_version: 页面即将生成的下一个版本序号（整数）。
+            示例: 4
+
+    返回值:
+        布尔值。True 表示必须彻底全量重写该页面；False 表示仅做轻量增量修补。
+        示例: True
+    """
+    # 步骤1: 合并现有来源文档集合与新来源集合，计算合并后的总文档数
+    # existing_sources 示例: {"doc_001", "doc_002"}
+    # total_sources 示例: {"doc_001", "doc_002", "doc_003", "doc_004", "doc_005"} (长度为 5)
     existing_sources = set(page.get("source_doc_ids", []))
     total_sources = existing_sources | new_source_doc_ids
+    # 步骤2: 提取当前累积的声明总条数以及自上次全量重写以来的版本迭代间隔
+    # claim_count 示例: 18
+    # last_synth_ver 示例: 1, next_version 示例: 4 -> versions_since 示例: 3
     claim_count = len(page.get("claims", []))
     last_synth_ver = _as_int(page.get("synthesis_version_int"), 1)
     versions_since = next_version - last_synth_ver
 
+    # 步骤3: 校验四重触发条件：
+    # 1. 来源文档总数达到最小阈值 (>= 5)
+    # 2. 声明总数达到最小阈值 (>= 15)
+    # 3. 距离上次全量综合至少经过了指定版本数 (>= 3)
+    # 4. 文档规模增长比例超过阈值 (>= 1.5 倍)
     return (
         len(total_sources) >= RE_SYNTHESIS_MIN_SOURCES
         and claim_count >= RE_SYNTHESIS_MIN_CLAIMS
@@ -187,23 +333,37 @@ def _wiki_should_re_synthesize(
 
 
 async def _wiki_load_chunk_texts(tenant_id: str, kb_id: str, chunk_ids: list[str]) -> dict[str, str]:
-    """Fetch verbatim chunk text from the doc store by chunk id.
+    """根据分块 ID 列表从底层文档存储引擎中批量读取分块的原始文本内容 —— 原文分块批量提取工。
 
-    Returns ``{chunk_id: content_with_weight}``. Used to ground page writing in
-    the ACTUAL source text (WeKnora-style evidence) rather than the condensed
-    claim statements. Mirrors ``wiki._wiki_load_chunks_by_id`` which lives in
-    the old-mode module and is intentionally NOT imported here.
+    参数:
+        tenant_id: 租户唯一标识字符串。
+            示例: "tenant_001"
+        kb_id: 知识库唯一标识字符串。
+            示例: "kb_999"
+        chunk_ids: 待检索的分块 ID 列表。
+            长相示例: ["chk_01", "chk_02", "chk_03"]
+
+    返回值:
+        分块 ID 到其对应文本内容的字典映射。
+        长相示例:
+        {
+            "chk_01": "深度学习是机器学习的一个分支...",
+            "chk_02": "卷积神经网络常用于图像识别领域..."
+        }
     """
     if not chunk_ids:
         return {}
     from common.doc_store.doc_store_base import OrderByExpr
 
+    # 步骤1: 确定租户对应的文档库索引名称并去重分块 ID
+    # unique 输入: ["chk_01", "chk_02", "chk_01"] -> 输出: ["chk_01", "chk_02"]
     index = search.index_name(tenant_id)
     unique = [c for c in dict.fromkeys(chunk_ids) if isinstance(c, str) and c]
     if not unique:
         return {}
     out: dict[str, str] = {}
     BATCH = 500
+    # 步骤2: 按批次（每批 500 个 ID）向 docStoreConn 发起搜索，拉取 content_with_weight 字段
     for i in range(0, len(unique), BATCH):
         batch = unique[i : i + BATCH]
         try:
@@ -223,12 +383,14 @@ async def _wiki_load_chunk_texts(tenant_id: str, kb_id: str, chunk_ids: list[str
         except Exception:
             logging.exception("wiki: batch chunk fetch failed (%d ids)", len(batch))
             field_map = {}
+        # 步骤3: 收集当前批次读取到的文本
+        # field_map 示例: {"chk_01": {"content_with_weight": "深度学习..."}}
         for cid, row in field_map.items():
             content = row.get("content_with_weight")
             if isinstance(content, str) and content:
                 out[cid] = content
-    # Honor the rune budget: do not accumulate verbatim text we won't feed the
-    # writer (mirrors WeKnora maxRunesPerCitationBatch=12000).
+    # 步骤4: 遵循字符预算上限（WIKI_SOURCE_BUDGET_RUNES = 12000），超出部分停止累积以防上下文爆炸
+    # total_runes 示例: 15400 -> 截断保留在预算内的分块
     total_runes = sum(len(v) for v in out.values())
     if total_runes > WIKI_SOURCE_BUDGET_RUNES:
         trimmed: dict[str, str] = {}
@@ -239,17 +401,43 @@ async def _wiki_load_chunk_texts(tenant_id: str, kb_id: str, chunk_ids: list[str
                 break
             trimmed[cid] = content
         out = trimmed
+    # 输出示例: {"chk_01": "深度学习...", "chk_02": "卷积神经网络..."}
     return out
 
 
 def _wiki_enrich_source_chunks(source_chunks: list[dict], chunk_texts: dict[str, str]) -> list[dict]:
-    """Merge verbatim chunk text into source_chunks.
+    """将文档库中读取到的分块逐字真实原文注入到证据分块列表中 —— 证据分块原文装配工。
 
-    Each source_chunk entry is ``{"id": <chunk_id>, "text": <claim-original>}``.
-    When the verbatim chunk content is available it REPLACES ``text`` (the
-    writer should read the source, not the condensed claim); otherwise the
-    claim text is kept as a fallback. Preserves original order and dedups by id.
+    参数:
+        source_chunks: 包含分块引用的轻量列表。
+            长相示例:
+            [
+                {"id": "chk_01", "text": "精炼后的摘要陈述"},
+                {"chunk_id": "chk_02", "text": "另一条摘要"}
+            ]
+        chunk_texts: 分块 ID 到底层数据库真实原文的映射字典。
+            长相示例:
+            {
+                "chk_01": "深度学习是机器学习的一个分支，它通过模拟人脑结构..."
+            }
+
+    返回值:
+        装配了真实逐字原文且已按 ID 去重的分块字典列表。
+        长相示例:
+        [
+            {
+                "id": "chk_01",
+                "text": "深度学习是机器学习的一个分支，它通过模拟人脑结构...",
+                "_verbatim": True
+            },
+            {
+                "id": "chk_02",
+                "text": "另一条摘要",
+                "_verbatim": False
+            }
+        ]
     """
+    # 步骤1: 遍历来源分块列表并根据 chunk ID 去重
     enriched: list[dict] = []
     seen: set[str] = set()
     for sc in source_chunks:
@@ -260,6 +448,9 @@ def _wiki_enrich_source_chunks(source_chunks: list[dict], chunk_texts: dict[str,
         if cid in seen:
             continue
         seen.add(cid)
+        # 步骤2: 检查是否有该分块的逐字原文，若有则优先使用真实原文替代精炼陈述，并标记 _verbatim
+        # 组装结果项示例:
+        # {"id": "chk_01", "text": "深度学习...", "_verbatim": True}
         verbatim = chunk_texts.get(cid)
         enriched.append(
             {
@@ -271,20 +462,28 @@ def _wiki_enrich_source_chunks(source_chunks: list[dict], chunk_texts: dict[str,
     return enriched
 
 
-# ----- Canonical Entity Index CRUD -----------------------------------------
+# ----- 规范实体索引持久化（CRUD） -----------------------------------------
 
 
 async def _wiki_has_any_pages(tenant_id: str, kb_id: str) -> bool:
-    """Return True if the KB has at least one compiled wiki_page row.
+    """检查指定的知识库中是否已经成功编译过任何维基页面 —— 维基页面存在探测器。
 
-    Used to detect whether a build has ever succeeded — if no page exists but
-    MAP rows do, the previous build was interrupted and should be restarted
-    as a full build rather than treated as incremental.
+    参数:
+        tenant_id: 租户标识字符串。
+            示例: "tenant_001"
+        kb_id: 知识库标识字符串。
+            示例: "kb_999"
+
+    返回值:
+        布尔值。True 表示存在编译好的 wiki_page 记录；False 表示完全为空或索引尚未建立。
+        示例: True
     """
     index = search.index_name(tenant_id)
     try:
+        # 步骤1: 检查存储索引是否存在，若不存在则直接判定无页面
         if not settings.docStoreConn.index_exist(index, kb_id):
             return False
+        # 步骤2: 检索 compile_kwd 为 wiki_page 的任意一条记录
         res = await thread_pool_exec(
             settings.docStoreConn.search,
             ["slug_kwd"],
@@ -297,6 +496,7 @@ async def _wiki_has_any_pages(tenant_id: str, kb_id: str) -> bool:
             index,
             [kb_id],
         )
+        # 步骤3: 判断是否有字段返回
         return bool(settings.docStoreConn.get_fields(res, ["slug_kwd"]))
     except Exception:
         logging.exception("wiki: _wiki_has_any_pages failed for kb=%s", kb_id)
@@ -307,13 +507,36 @@ async def _load_canonical_entities(
     tenant_id: str,
     kb_id: str,
 ) -> dict[str, dict]:
-    """Load all canonical entity rows. Returns {entity_name: row}."""
+    """从底层的文档存储引擎中全量分页加载所有规范化实体记录 —— 规范实体全量装载工。
+
+    参数:
+        tenant_id: 租户标识字符串。
+            示例: "tenant_001"
+        kb_id: 知识库标识字符串。
+            示例: "kb_999"
+
+    返回值:
+        规范实体主名称映射到其完整记录字典的映射表。
+        长相示例:
+        {
+            "深度学习": {
+                "entity_kwd": "深度学习",
+                "entity_type_kwd": "concept",
+                "aliases": ["Deep Learning", "DL"],
+                "source_doc_ids": ["doc_01"],
+                "source_chunk_ids": ["chk_01", "chk_02"],
+                "mention_count_int": 10
+            }
+        }
+    """
+    # 步骤1: 校验索引是否存在
     index = search.index_name(tenant_id)
     if not settings.docStoreConn.index_exist(index, kb_id):
         return {}
     results: dict[str, dict] = {}
     offset = 0
     page_size = 1000
+    # 步骤2: 循环分页检索 compile_kwd 等于 wiki_canonical_entity 的记录
     while True:
         try:
             res = await thread_pool_exec(
@@ -338,16 +561,18 @@ async def _load_canonical_entities(
         except Exception:
             logging.exception("wiki: failed to load canonical entities for kb=%s", kb_id)
             return results
+        # 步骤3: 规范化解析每条记录的名称与序列化字段
+        # 单条行数据 row 示例: {"entity_kwd": "深度学习", "aliases": "[\"DL\"]", "mention_count_int": "10"}
         for row in field_map.values():
             name = row.get("entity_kwd", "")
             if isinstance(name, list):
-                # entity_kwd is analyzed by whitespace-# (shared schema field),
-                # so Infinity may return it as a token list. Rejoin with spaces
-                # to reconstruct the canonical entity name.
+                # Infinity 搜索引擎可能会将分词后的 kwd 返回为分词列表，需要使用空格重新拼接
+                # 输入示例: ["深度", "学习"] -> 拼接后: "深度 学习"
                 name = " ".join(str(t) for t in name if t)
             name = str(name or "").strip()
             if name:
-                # Deserialize JSON fields
+                # 反序列化 JSON 数组字段
+                # 转换示例: "[\"DL\"]" -> ["DL"]
                 for fld in ("aliases", "source_doc_ids", "source_chunk_ids"):
                     val = row.get(fld)
                     if isinstance(val, str):
@@ -355,18 +580,19 @@ async def _load_canonical_entities(
                             row[fld] = json.loads(val) if val else []
                         except (json.JSONDecodeError, TypeError):
                             row[fld] = []
+                # 转换提及频次为整型
                 mc = row.get("mention_count_int", 0)
                 if isinstance(mc, str):
                     mc = int(mc) if mc.isdigit() else 0
                 row["mention_count_int"] = mc
-                # entity_type_kwd is a *_kwd field → Infinity returns it as a
-                # list (e.g. ['concept']). Normalize to a scalar so downstream
-                # checks like `entity_type == "concept"` work correctly.
+                # 规整 entity_type_kwd 为纯标量字符串，避免数组包裹导致匹配失效
+                # 输入示例: ["concept"] -> 输出: "concept"
                 et = row.get("entity_type_kwd")
                 if isinstance(et, list):
                     et = et[0] if et else ""
                 row["entity_type_kwd"] = str(et or "entity").strip()
                 results[name] = row
+        # 步骤4: 检查是否还有下一页，若条数小于分页上限则退出循环
         if len(field_map) < page_size:
             break
         offset += page_size
@@ -384,8 +610,48 @@ def _build_canonical_entity_doc(
     embedding: list[float] | None = None,
     source_chunk_ids: list[str] | None = None,
 ) -> dict:
-    """Build a canonical entity row for insert or update."""
+    """构建一条用于插入或更新规范实体库的完整文档字典 —— 规范实体记录生成器。
+
+    参数:
+        tenant_id: 租户标识字符串。
+            示例: "tenant_001"
+        kb_id: 知识库标识字符串。
+            示例: "kb_999"
+        entity_name: 规范实体的标准主名称。
+            示例: "量子计算"
+        entity_type: 实体类别，如 concept、entity 等。
+            示例: "concept"
+        aliases: 实体的同义词/别名列表。
+            长相示例: ["Quantum Computing", "量子运算"]
+        source_doc_ids: 提及该实体的文档 ID 列表。
+            长相示例: ["doc_01", "doc_02"]
+        claim_count: 该实体累计被声明或提及的次数。
+            示例: 15
+        embedding: 实体的语义嵌入向量（可选）。
+            长相示例: [0.012, -0.045, 0.089, ...]
+        source_chunk_ids: 提及该实体的具体分块 ID 列表（可选）。
+            长相示例: ["chk_01", "chk_02"]
+
+    返回值:
+        符合文档存储 Schema 的待入库字典。
+        长相示例:
+        {
+            "id": "wiki_canonical_entity_kb_999_量子计算",
+            "entity_kwd": "量子计算",
+            "entity_type_kwd": "concept",
+            "aliases": "[\"Quantum Computing\", \"量子运算\"]",
+            "source_doc_ids": ["doc_01", "doc_02"],
+            "source_chunk_ids": ["chk_01", "chk_02"],
+            "mention_count_int": 15,
+            "compile_kwd": "wiki_canonical_entity",
+            "kb_id": "kb_999",
+            "q_768_vec": [0.012, -0.045, ...]
+        }
+    """
+    # 步骤1: 确定向量维度与生成稳定的行全局主键 ID
     dim = len(embedding) if embedding else 768
+    # 步骤2: 组装文档核心元数据字段与 JSON 序列化
+    # 结构示例: {"id": "...", "entity_kwd": "量子计算", "aliases": "[\"Quantum Computing\"]"}
     doc = {
         "id": _stable_row_id(WIKI_CANONICAL_ENTITY_COMPILE_KWD, kb_id, entity_name),
         "entity_kwd": entity_name,
@@ -397,6 +663,7 @@ def _build_canonical_entity_doc(
         "compile_kwd": WIKI_CANONICAL_ENTITY_COMPILE_KWD,
         "kb_id": kb_id,
     }
+    # 步骤3: 若传入了向量，则动态匹配对应维度的向量列名（如 q_768_vec 或 q_1024_vec）
     if embedding is not None:
         vec_col = f"q_{dim}_vec"
         doc[vec_col] = embedding
@@ -413,7 +680,31 @@ async def _update_canonical_entity(
     claim_count: int,
     source_chunk_ids: list[str] | None = None,
 ) -> None:
-    """Update a known canonical row without an existence query."""
+    """直接异步更新底层文档库中已存在的规范实体记录 —— 规范实体记录更新工。
+
+    参数:
+        tenant_id: 租户标识字符串。
+            示例: "tenant_001"
+        kb_id: 知识库标识字符串。
+            示例: "kb_999"
+        entity_name: 待更新实体的标准主名称。
+            示例: "量子计算"
+        entity_type: 实体类别。
+            示例: "concept"
+        aliases: 实体别名列表。
+            示例: ["Quantum Computing"]
+        source_doc_ids: 来源文档 ID 列表。
+            示例: ["doc_01"]
+        claim_count: 累计提及次数。
+            示例: 16
+        source_chunk_ids: 来源分块 ID 列表（可选）。
+            示例: ["chk_01"]
+
+    返回值:
+        None
+    """
+    # 步骤1: 确定索引名并构建规范实体文档
+    # doc 示例: {"id": "...", "entity_kwd": "量子计算", ...}
     index = search.index_name(tenant_id)
     doc = _build_canonical_entity_doc(
         tenant_id,
@@ -425,6 +716,7 @@ async def _update_canonical_entity(
         claim_count,
         source_chunk_ids=source_chunk_ids,
     )
+    # 步骤2: 执行底层文档库更新操作
     await thread_pool_exec(
         settings.docStoreConn.update,
         {"compile_kwd": [WIKI_CANONICAL_ENTITY_COMPILE_KWD], "entity_kwd": entity_name},
@@ -439,7 +731,21 @@ async def _delete_canonical_entity(
     kb_id: str,
     entity_name: str,
 ) -> None:
-    """Delete a canonical entity row."""
+    """从底层文档库中删除指定的规范实体记录 —— 规范实体记录删除工。
+
+    参数:
+        tenant_id: 租户标识字符串。
+            示例: "tenant_001"
+        kb_id: 知识库标识字符串。
+            示例: "kb_999"
+        entity_name: 待删除的规范实体标准主名称。
+            示例: "过时概念"
+
+    返回值:
+        None
+    """
+    # 步骤1: 获取对应索引并通过 compile_kwd 与 entity_kwd 执行删除
+    # 删除条件示例: {"compile_kwd": ["wiki_canonical_entity"], "entity_kwd": ["过时概念"]}
     index = search.index_name(tenant_id)
     await thread_pool_exec(
         settings.docStoreConn.delete,
@@ -455,7 +761,23 @@ async def _knn_search_canonical(
     embedding: list[float],
     threshold: float = ENTITY_MERGE_THRESHOLD,
 ) -> tuple[str, float] | None:
-    """KNN search canonical entity index. Returns (entity_name, score) or None."""
+    """在规范实体索引中根据向量嵌入执行最近邻 KNN 检索，寻找高度相似的已有实体 —— 向量近邻实体检索工。
+
+    参数:
+        tenant_id: 租户标识字符串。
+            示例: "tenant_001"
+        kb_id: 知识库标识字符串。
+            示例: "kb_999"
+        embedding: 目标实体的浮点向量列表。
+            长相示例: [0.015, -0.032, 0.088, ..., 0.004]
+        threshold: 判定为同一实体的余弦相似度门槛，默认为 ENTITY_MERGE_THRESHOLD (0.90)。
+            示例: 0.90
+
+    返回值:
+        若找到高于阈值的已有实体，返回二元元组 (实体主名称, 相似度分数)；否则返回 None。
+        长相示例: ("量子计算", 0.942)
+    """
+    # 步骤1: 构造基于余弦距离的稠密向量匹配表达式 MatchDenseExpr
     index = search.index_name(tenant_id)
     dim = len(embedding)
     match_expr = MatchDenseExpr(
@@ -466,6 +788,7 @@ async def _knn_search_canonical(
         topn=1,
         extra_options={"similarity": threshold},
     )
+    # 步骤2: 在知识库中检索最相似的 Top-1 规范实体
     res = await thread_pool_exec(
         settings.docStoreConn.search,
         ["entity_kwd", "_score"],
@@ -478,6 +801,8 @@ async def _knn_search_canonical(
         index,
         [kb_id],
     )
+    # 步骤3: 提取实体名称与评分，满足阈值则返回
+    # field_map 示例: {"doc_id_1": {"entity_kwd": "量子计算", "_score": 0.942}}
     field_map = settings.docStoreConn.get_fields(res, ["entity_kwd", "_score"])
     for row in field_map.values():
         name = row.get("entity_kwd", "")
@@ -485,38 +810,80 @@ async def _knn_search_canonical(
             name = " ".join(str(t) for t in name if t)
         name = str(name or "").strip()
         score = row.get("_score", 0.0)
+        # 输入: name="量子计算", score=0.942, threshold=0.90
+        # 输出: ("量子计算", 0.942)
         if name and score >= threshold:
             return name, score
     return None
 
 
 def _normalize_key(name: str) -> str:
-    """Lowercase + strip whitespace + strip ASCII punctuation."""
+    """去除实体名称中的所有标点符号并转为小写，用于进行无标点字面比对 —— 实体键名标准化归一工。
+
+    参数:
+        name: 原始实体名称字符串。
+            示例: "  Apple, Inc.  "
+
+    返回值:
+        清洗归一化后的键名字符串。
+        示例: "apple inc"
+    """
     if not isinstance(name, str):
         return ""
+    # 步骤1: 正则匹配并清除所有非字母数字下划线空白符，转小写后去除首尾空白
+    # 输入: "  Apple, Inc.  "
+    # 输出: "apple inc"
     return re.sub(r"[^\w\s]", "", name.lower()).strip()
 
 
-# ----- Entity Matching -----------------------------------------------------
+# ----- 实体匹配与消歧（Entity Matching） -------------------------------------
 
 
 def _extract_raw_entities(map_results: list[dict]) -> tuple[list[dict], dict[str, list[dict]]]:
-    """Extract lightweight entity/concept metadata + a claim index from MAP.
+    """从 MAP 阶段产出的文档提取结果中抽取出轻量级实体/概念元数据并构建陈述声明索引 —— 原始实体元数据抽取工。
 
-    Returns a tuple:
-      (entities, claim_index)
-        entities:   list of LIGHTWEIGHT dicts {name, type, aliases, claim_count,
-                    source_doc_ids, source_chunk_ids} — NO full claim text, so Entity Matching
-                    operates on small metadata (mirrors old-mode dedup).
-        claim_index: {name: [claim_dict, ...]} — full claim text kept separately,
-                    loaded on-demand only for affected entities after matching.
+    参数:
+        map_results: 各文档经 MAP 步骤提取出的结构化字典列表。
+            长相示例:
+            [
+                {
+                    "doc_id": "doc_01",
+                    "entities": [{"name": "人工智能", "type": "concept", "aliases": ["AI"]}],
+                    "concepts": [{"term": "深度学习", "aliases": ["DL"]}],
+                    "claims": [{"entity_name": "人工智能", "statement": "AI是前沿计算机技术。", "chunk_id": "chk_01"}],
+                    "relations": [{"from": "人工智能", "to": "深度学习", "chunk_id": "chk_02"}]
+                }
+            ]
+
+    返回值:
+        包含两个元素的元组: (轻量实体列表, 实体声明索引字典)。
+        长相示例:
+        (
+            [
+                {
+                    "name": "人工智能",
+                    "type": "concept",
+                    "aliases": ["AI"],
+                    "claim_count": 1,
+                    "source_doc_ids": ["doc_01"],
+                    "source_chunk_ids": ["chk_01", "chk_02"]
+                }
+            ],
+            {
+                "人工智能": [
+                    {"entity_name": "人工智能", "statement": "AI是前沿计算机技术。", "chunk_id": "chk_01"}
+                ]
+            }
+        )
     """
     raw: dict[str, dict] = {}
     claim_index: dict[str, list[dict]] = {}
+    # 步骤1: 遍历每个文档的 MAP 提取结果
     for mr in map_results:
         doc_id = mr.get("doc_id", "")
 
-        # Process entities[]
+        # 步骤2: 解析并合并常规实体列表 entities[]
+        # 单条实体项 ent 示例: {"name": "人工智能", "type": "concept", "aliases": ["AI"]}
         for ent in mr.get("entities") or []:
             if isinstance(ent, str):
                 ent = json.loads(ent)
@@ -535,7 +902,8 @@ def _extract_raw_entities(map_results: list[dict]) -> tuple[list[dict], dict[str
             raw[name]["source_doc_ids"].add(doc_id)
             raw[name]["source_chunk_ids"].update(_wiki_claim_chunk_ids(ent))
 
-        # Process concepts[]
+        # 步骤3: 解析并合并核心概念列表 concepts[]，默认赋予 type 为 "concept"
+        # 单条概念项 concept 示例: {"term": "深度学习", "aliases": ["DL"]}
         for concept in mr.get("concepts") or []:
             if isinstance(concept, str):
                 concept = json.loads(concept)
@@ -554,8 +922,8 @@ def _extract_raw_entities(map_results: list[dict]) -> tuple[list[dict], dict[str
             raw[term]["source_doc_ids"].add(doc_id)
             raw[term]["source_chunk_ids"].update(_wiki_claim_chunk_ids(concept))
 
-        # Process claims, tracking count (metadata) but storing full text only
-        # in claim_index (kept separate, loadable on demand).
+        # 步骤4: 解析陈述声明 claims[]，仅统计声明频次并单独存入 claim_index（按需懒加载完整正文）
+        # 单条声明项 claim 示例: {"entity_name": "人工智能", "statement": "AI是前沿计算机技术。", "chunk_id": "chk_01"}
         for claim in mr.get("claims") or []:
             if isinstance(claim, str):
                 claim = json.loads(claim)
@@ -567,8 +935,8 @@ def _extract_raw_entities(map_results: list[dict]) -> tuple[list[dict], dict[str
                 raw[subj]["source_chunk_ids"].update(_wiki_claim_chunk_ids(claim))
                 claim_index.setdefault(subj, []).append(claim)
 
-        # A relation is grounded evidence for both endpoints even when MAP did
-        # not emit a dedicated claim for either one.
+        # 步骤5: 解析实体间关系 relations[]，即使未提取声明，关系两端的实体也记录关联的分块 ID 作为证据
+        # 单条关系项 relation 示例: {"from": "人工智能", "to": "深度学习", "chunk_id": "chk_02"}
         for relation in mr.get("relations") or []:
             if isinstance(relation, str):
                 relation = json.loads(relation)
@@ -577,6 +945,8 @@ def _extract_raw_entities(map_results: list[dict]) -> tuple[list[dict], dict[str
                 if endpoint in raw:
                     raw[endpoint]["source_chunk_ids"].update(relation_chunks)
 
+    # 步骤6: 将集合转化为列表并整理为最终元数据清单
+    # 单项 entry 示例: {"name": "人工智能", "source_doc_ids": ["doc_01"], "source_chunk_ids": ["chk_01"]}
     result = []
     for entry in raw.values():
         entry["source_doc_ids"] = list(entry["source_doc_ids"])
@@ -595,11 +965,59 @@ async def _wiki_match_entities(
     incremental: bool,
     progress: Callable[[str], None] | None = None,
 ) -> tuple[dict[str, dict], dict[str, str]]:
-    """Entity Matching: raw entities → canonical entities.
+    """将抽取的原始轻量实体与已有规范实体库进行精确匹配、KNN 向量检索及大模型核对消歧 —— 实体消歧对齐工。
 
-    Returns:
-        canonical_map: {canonical_name: merged_entry}
-        name_resolution: {raw_name: canonical_name}entries still need semantic matching
+    参数:
+        raw_entities: 抽取的轻量级实体元数据列表。
+            长相示例:
+            [
+                {
+                    "name": "Apple Inc.",
+                    "type": "entity",
+                    "aliases": ["Apple"],
+                    "claim_count": 2,
+                    "source_doc_ids": ["doc_01"],
+                    "source_chunk_ids": ["chk_01"]
+                }
+            ]
+        existing_canonical: 已存在的规范实体记录字典。
+            长相示例:
+            {
+                "苹果公司": {
+                    "entity_kwd": "苹果公司",
+                    "aliases": ["Apple", "苹果电脑"],
+                    "mention_count_int": 5,
+                    "source_doc_ids": ["doc_00"]
+                }
+            }
+        embd_mdl: 向量嵌入模型实例。
+        chat_mdl: 大模型客户端实例。
+        tenant_id: 租户标识字符串。
+            示例: "tenant_001"
+        kb_id: 知识库标识字符串。
+            示例: "kb_999"
+        incremental: 是否为增量编译模式（布尔值）。
+            示例: True
+        progress: 进度通知回调函数（可选）。
+
+    返回值:
+        二元元组: (最终规范实体表, 原始实体名到规范实体名映射字典)。
+        长相示例:
+        (
+            {
+                "苹果公司": {
+                    "name": "苹果公司",
+                    "type": "entity",
+                    "aliases": ["Apple", "Apple Inc."],
+                    "claim_count": 7,
+                    "source_doc_ids": ["doc_00", "doc_01"]
+                }
+            },
+            {
+                "Apple Inc.": "苹果公司",
+                "苹果公司": "苹果公司"
+            }
+        )
     """
 
     def _progress(msg: str) -> None:
@@ -615,37 +1033,35 @@ async def _wiki_match_entities(
             return max(total, 1)
         return max(10, min(200, total // 10))
 
-    # Step 1: Exact match against canonical index
+    # 步骤1: 字面精确匹配阶段 —— 将归一化后的别名与名称构建扁平映射表
+    # exact_flat 映射示例: {"apple": "苹果公司", "苹果公司": "苹果公司"}
     _progress(f"exact matching {len(raw_entities)} raw entries against {len(existing_canonical)} canonical entries ...")
-    exact_flat: dict[str, str] = {}  # normalized_name → canonical_name
+    exact_flat: dict[str, str] = {}
     for cname, centry in existing_canonical.items():
-        # Use the non-analyzed `aliases` JSON field (deserialized in
-        # _load_canonical_entities) plus the entity name itself. Do NOT rely on
-        # `aliases_flat_kwd`: it is an analyzed varchar (whitespace-#) that
-        # Infinity returns as a token list, losing the "||" structure.
         aliases = centry.get("aliases")
         if not isinstance(aliases, list):
             continue
         for alias in [cname] + [a for a in aliases if isinstance(a, str)]:
             exact_flat[_normalize_key(alias)] = cname
 
-    name_resolution: dict[str, str] = {}  # raw_name → canonical_name
+    name_resolution: dict[str, str] = {}  # 原始名称 -> 规范名称
     llm_merge_pairs: list[dict[str, str]] = []
-    unmatched: list[dict] = []  # entities not matched by exact
+    unmatched: list[dict] = []  # 未能通过字面直接匹配上的实体
     for entry in raw_entities:
         raw_name = entry["name"]
         norm = _normalize_key(raw_name)
+        # 输入: raw_name="Apple", norm="apple" -> 匹配到 exact_flat: "苹果公司"
         if norm in exact_flat:
             name_resolution[raw_name] = exact_flat[norm]
         else:
             unmatched.append(entry)
     _progress(f"exact matched {len(name_resolution)}; {len(unmatched)} entries still need semantic matching.")
 
-    # Step 2: KNN match for unmatched entities
-    # Single search at ENTITY_AMBIGUOUS_LOW (0.75), classify by score:
-    #   0.90+  → auto-merge (direct_match)
-    #   0.75-0.90 → LLM confirm for entity types only
-    #   <0.75  → no match
+    # 步骤2: 对未精确匹配的实体发起向量 KNN 相似度匹配
+    # 分数段规则:
+    #   >= 0.90: 直接自动对齐合并
+    #   0.75 - 0.90: 模糊区间，概念类型直接并入，实体类型提交大模型二次确认
+    #   < 0.75: 判定为新实体
     if unmatched and embd_mdl and existing_canonical:
         query_texts = [_entity_to_query_text(e) for e in unmatched]
         embeddings, _ = await thread_pool_exec(embd_mdl.encode, query_texts)
@@ -671,12 +1087,14 @@ async def _wiki_match_entities(
 
         still_unmatched: list[dict] = []
         maybe_pairs: list[tuple[dict, str]] = []
+        # 处理 KNN 结果分流
+        # knn_results 项示例: ({"name": "iPhone 15", "type": "entity"}, "苹果iPhone手机", 0.88)
         for entry, cname, score in knn_results:
             if cname and score >= ENTITY_MERGE_THRESHOLD:
-                # Direct merge
+                # 达到 0.90 以上，直接判定为同一实体
                 name_resolution[entry["name"]] = cname
             elif cname and score >= ENTITY_AMBIGUOUS_LOW:
-                # Ambiguous: LLM confirm for entity types only
+                # 位于 0.75 ~ 0.90 之间，若是 concept 直接合并，若是普通 entity 加入待确认列表
                 if entry["type"] == "concept":
                     name_resolution[entry["name"]] = cname
                 else:
@@ -684,7 +1102,8 @@ async def _wiki_match_entities(
             else:
                 still_unmatched.append(entry)
 
-        # LLM confirm for maybe pairs (entity only, 0.75-0.90)
+        # 步骤2.1: 调用大模型确认模糊候选对
+        # maybe_pairs 示例: [({"name": "iPhone 15", ...}, "苹果iPhone手机")]
         if maybe_pairs and chat_mdl:
             confirmed = await _wiki_confirm_batch(
                 [(e["name"], cname) for e, cname in maybe_pairs],
@@ -701,9 +1120,8 @@ async def _wiki_match_entities(
 
         unmatched = still_unmatched
 
-    # Step 3: Intra-build pairwise (only on first build, i.e., non-incremental)
-    # Blockwise matrix multiplication avoids O(N²) Python loops and materializing
-    # an N×N matrix (OOM risk); peak memory is O(block²).
+    # 步骤3: 本次编译批次内部的两两两相消歧（仅在首次构建非增量模式下执行）
+    # 使用分块矩阵乘法计算两两余弦相似度，避免 N^2 膨胀
     if not incremental and len(unmatched) > 1 and embd_mdl:
         query_texts = [_entity_to_query_text(e) for e in unmatched]
         embeddings, _ = await thread_pool_exec(embd_mdl.encode, query_texts)
@@ -728,9 +1146,8 @@ async def _wiki_match_entities(
 
             n = len(unmatched)
             block_size = ENTITY_PAIRWISE_BLOCK_SIZE
-            # Group by type: only entities of the SAME type are pairwise candidates
-            # (entity-vs-entity, concept-vs-concept).  This mirrors old behavior
-            # of passing type_key so cross-type pairs are never merged.
+            # 仅在同类别实体间进行两两比对（entity vs entity，concept vs concept）
+            # groups 示例: {"entity": [0, 2], "concept": [1, 3]}
             groups: dict[str, list[int]] = {}
             for idx, entry in enumerate(unmatched):
                 groups.setdefault(entry.get("type", "entity"), []).append(idx)
@@ -743,7 +1160,7 @@ async def _wiki_match_entities(
                     left_vectors = matrix[left_indices]
                     for right_start in range(left_start, len(group_indices), block_size):
                         right_indices = group_indices[right_start : right_start + block_size]
-                        sims = left_vectors @ matrix[right_indices].T  # [B, B] BLAS
+                        sims = left_vectors @ matrix[right_indices].T  # 矩阵点积计算相似度
                         if right_start == left_start:
                             candidate_mask = np.triu(sims >= ENTITY_AMBIGUOUS_LOW, k=1)
                         else:
@@ -756,7 +1173,7 @@ async def _wiki_match_entities(
                             else:
                                 ambiguous_pairs.append((left_indices[row], right_indices[col]))
 
-            # Apply auto-merges with union-find (higher evidence wins)
+            # 步骤3.1: 使用并查集自动合并达到阈值的实体对（声明数较多的作为主实体）
             for i, j in auto_pairs:
                 ri, rj = _root(i), _root(j)
                 if ri == rj:
@@ -766,10 +1183,10 @@ async def _wiki_match_entities(
                 else:
                     merged_into[ri] = rj
 
-            # Keep only ambiguous pairs still in separate groups
+            # 过滤出仍处于不同聚类中的模糊实体对
             still_ambiguous = [(i, j) for i, j in ambiguous_pairs if _root(i) != _root(j)]
 
-            # LLM confirm for ambiguous pairs (first build only)
+            # 步骤3.2: 调用大模型核验首建模式下的模糊对
             if still_ambiguous and chat_mdl:
                 llm_candidates = [(unmatched[i]["name"], unmatched[j]["name"]) for i, j in still_ambiguous]
                 confirmed = await _wiki_confirm_batch(llm_candidates, chat_mdl)
@@ -786,7 +1203,7 @@ async def _wiki_match_entities(
                                 merged_into[ri] = rj
                                 llm_merge_pairs.append({"from": unmatched[ri]["name"], "into": unmatched[rj]["name"], "scope": "intra_build"})
 
-            # Apply merges
+            # 步骤3.3: 应用聚类合并，合并别名与引用
             merged_indices: dict[int, list[int]] = {}
             for i in range(n):
                 pi = _root(i)
@@ -798,9 +1215,6 @@ async def _wiki_match_entities(
                     master = unmatched[indices[0]]
                     for idx in indices[1:]:
                         slave = unmatched[idx]
-                        # Lightweight entries have no 'claims' field; only
-                        # metadata is aggregated (claim text lives in claim_index
-                        # and is aggregated later via name_resolution).
                         master["claim_count"] += slave["claim_count"]
                         master["source_doc_ids"] = list(set(master["source_doc_ids"]) | set(slave["source_doc_ids"]))
                         master["source_chunk_ids"] = list(set(master.get("source_chunk_ids", [])) | set(slave.get("source_chunk_ids", [])))
@@ -811,19 +1225,18 @@ async def _wiki_match_entities(
                     new_unmatched.append(unmatched[indices[0]])
             unmatched = new_unmatched
 
-    # Step 4: Build canonical map
+    # 步骤4: 组装最终规范实体表 canonical_map
     canonical_map: dict[str, dict] = {}
     for entry in unmatched:
         cname = entry["name"]
         canonical_map[cname] = entry
         name_resolution.setdefault(cname, cname)
 
-    # Also load existing canonical entries that match
+    # 补充被引用的已存在规范实体
     for raw_name, cname in name_resolution.items():
         if cname not in canonical_map:
             existing = existing_canonical.get(cname)
             if existing:
-                # Lightweight entry — claims loaded separately on demand
                 merged = {
                     "name": cname,
                     "type": existing.get("entity_type_kwd", "entity"),
@@ -834,8 +1247,7 @@ async def _wiki_match_entities(
                 }
                 canonical_map[cname] = merged
 
-    # Aggregate lightweight metadata (claim_count, source_doc_ids) across all
-    # raw entities that resolved to the same canonical name.
+    # 步骤5: 聚合所有映射到同一规范实体的原始实体的元数据（声明数、文档来源、别名）
     for entry in raw_entities:
         raw_name = entry["name"]
         cname = name_resolution.get(raw_name, raw_name)
@@ -854,10 +1266,12 @@ async def _wiki_match_entities(
             aliases.discard(cname)
             canonical_map[cname]["aliases"] = sorted(aliases)
 
+    # 步骤6: 记录统计指标日志
     for merge in llm_merge_pairs:
         _wiki_log_stats("MATCH", "llm_merge", kb_id=kb_id, incremental=incremental, **merge)
     _wiki_log_stats("MATCH", "llm_merge_summary", kb_id=kb_id, incremental=incremental, before=len(raw_entities), after=len(canonical_map), llm_merge_count=len(llm_merge_pairs))
 
+    # 输出示例: ({"苹果公司": {...}}, {"Apple": "苹果公司"})
     return canonical_map, name_resolution
 
 
@@ -865,18 +1279,27 @@ async def _wiki_confirm_batch(
     candidates: list[tuple[str, str]],
     chat_mdl,
 ) -> list[tuple[str, str]]:
-    """Batch LLM confirm — adapted from old _common.py pattern.
+    """向大语言模型分批发起核对请求，判定实体名候选对是否指向现实世界中的同一实体 —— 实体同一性大模型核对工。
 
-    Takes [(name_a, name_b), ...], returns confirmed [(name_a, name_b), ...].
+    参数:
+        candidates: 待判定的实体名称对列表。
+            长相示例: [("Apple", "苹果公司"), ("OpenAI", "Google")]
+        chat_mdl: 大语言模型客户端实例。
+
+    返回值:
+        经过大模型核验确认指向同一实体的名称对列表。
+        长相示例: [("Apple", "苹果公司")]
     """
     if not candidates:
         return []
-    # Split into batches of 50
+    # 步骤1: 按照每批最多 50 对切分候选
     batch_size = 50
     confirmed = []
     for i in range(0, len(candidates), batch_size):
         batch = candidates[i : i + batch_size]
         prompt_lines = []
+        # 步骤2: 组装序号对比行
+        # prompt_lines 示例: ['1. "Apple" vs "苹果公司"', '2. "OpenAI" vs "Google"']
         for j, (a, b) in enumerate(batch):
             prompt_lines.append(f'{j + 1}. "{a}" vs "{b}"')
         prompt = (
@@ -887,10 +1310,12 @@ async def _wiki_confirm_batch(
             "where true = SAME entity, false = DIFFERENT.\n\n" + "\n".join(prompt_lines)
         )
         try:
+            # 步骤3: 异步向大模型请求判断结果
             resp = await _chat_mdl_ask(chat_mdl, "You are a KB dedup assistant.", prompt)
             if resp:
                 resp = resp.strip()
-                # Extract JSON array
+                # 步骤4: 正则抽取 JSON 布尔数组
+                # 抽取匹配示例: "[true, false]" -> json.loads 后: [True, False]
                 arr_match = re.search(r"\[.*?\]", resp, re.DOTALL)
                 if arr_match:
                     booleans = json.loads(arr_match.group(0))
@@ -899,6 +1324,7 @@ async def _wiki_confirm_batch(
                             confirmed.append(batch[j])
         except Exception:
             logging.exception("wiki: LLM confirm batch failed")
+    # 输出示例: [("Apple", "苹果公司")]
     return confirmed
 
 
@@ -907,14 +1333,37 @@ async def _search_existing_pages(
     kb_id: str,
     select_fields: list[str],
 ) -> dict[str, dict]:
-    """Load all wiki_page rows in this KB."""
+    """从底层文档存储库中全量分页读取当前知识库已编译生成的所有维基页面 —— 已建页面装载工。
+
+    参数:
+        tenant_id: 租户标识字符串。
+            示例: "tenant_001"
+        kb_id: 知识库标识字符串。
+            示例: "kb_999"
+        select_fields: 需要检索读取的字段名列表。
+            长相示例: ["slug_kwd", "title_kwd", "source_doc_ids", "claims"]
+
+    返回值:
+        页面 slug 映射到该页面完整数据字典的字典表。
+        长相示例:
+        {
+            "concept/deep-learning": {
+                "id": "wiki_page_kb_999_deep-learning",
+                "slug_kwd": "concept/deep-learning",
+                "title_kwd": "深度学习",
+                "source_doc_ids": ["doc_01"]
+            }
+        }
+    """
     index = search.index_name(tenant_id)
+    # 步骤1: 检查存储索引是否存在
     if not settings.docStoreConn.index_exist(index, kb_id):
         return {}
 
     results: dict[str, dict] = {}
     offset = 0
     page_size = 1000
+    # 步骤2: 循环分页检索 compile_kwd 为 wiki_page 的所有记录
     while True:
         try:
             res = await thread_pool_exec(
@@ -933,10 +1382,9 @@ async def _search_existing_pages(
         except Exception:
             logging.exception("wiki: failed to load existing pages for kb=%s", kb_id)
             return results
+        # 步骤3: 遍历行记录，规范化 slug 字段并保留底层的全局主键 id
+        # 单条行数据示例: {"slug_kwd": "concept/deep-learning", "title_kwd": "深度学习"}
         for row_id, row in field_map.items():
-            # Keep the storage document id.  FINALIZE must update by id so
-            # markdown values go through the document update fast path and
-            # retain their newlines.
             row["id"] = row_id
             slug = row.get("slug_kwd", row.get("page_id", ""))
             if isinstance(slug, list):
@@ -944,6 +1392,7 @@ async def _search_existing_pages(
             slug = str(slug or "").strip()
             if slug:
                 results[slug] = row
+        # 步骤4: 判断是否已加载完所有数据
         if len(field_map) < page_size:
             break
         offset += page_size
@@ -956,21 +1405,43 @@ async def _load_map_relations(
     excluded_doc_ids: set[str] | None = None,
     chunk_state: dict[str, dict] | None = None,
 ) -> list[dict]:
-    """Load all extracted (from, to, type) relations from wiki_map_extract rows.
+    """从已持久化的 MAP 提取记录中读取所有实体间的语义关系三元组 —— 实体语义边加载工。
 
-    These are the semantic edges the LLM extracted during MAP. When both
-    endpoints correspond to compiled wiki pages they become page-to-page
-    connections (outlinks), which is far more reliable than hoping REFINE
-    sprinkled [[wikilinks]] into prose.
+    参数:
+        tenant_id: 租户标识字符串。
+            示例: "tenant_001"
+        kb_id: 知识库标识字符串。
+            示例: "kb_999"
+        excluded_doc_ids: 需要排除忽略的失效或已禁用文档 ID 集合（可选）。
+            长相示例: {"doc_old_01"}
+        chunk_state: 当前知识库的激活分块状态字典（可选）。
+            长相示例:
+            {
+                "chk_01": {"chunk_hash": "a1b2c3", "doc_id": "doc_01"}
+            }
+
+    返回值:
+        提取出的语义关系字典列表。
+        长相示例:
+        [
+            {
+                "from": "人工智能",
+                "to": "机器学习",
+                "type": "parent_field"
+            }
+        ]
     """
+    # 步骤1: 若未传入分块状态，则自动读取当前生效的 MAP 状态快照
     if chunk_state is None:
         from rag.advanced_rag.knowlege_compile.wiki import _wiki_load_active_map_state
 
         chunk_state = await _wiki_load_active_map_state(tenant_id, kb_id)
     from rag.advanced_rag.knowlege_compile.wiki import _wiki_load_map_extracts_for_state
 
+    # 步骤2: 加载匹配分块状态的所有 MAP 提取结果
     extracts = await _wiki_load_map_extracts_for_state(tenant_id, kb_id, chunk_state)
     relations: list[dict] = []
+    # 步骤3: 提取并过滤关系，排除禁用文档中的关系
     for extract in extracts:
         if excluded_doc_ids and str(extract.get("doc_id") or "") in excluded_doc_ids:
             continue
@@ -979,6 +1450,8 @@ async def _load_map_relations(
                 continue
             source = relation.get("from")
             target = relation.get("to")
+            # 单条关系输入示例: {"from": "人工智能", "to": "机器学习", "type": "parent_field"}
+            # 过滤收集输出示例: {"from": "人工智能", "to": "机器学习", "type": "parent_field"}
             if isinstance(source, str) and isinstance(target, str):
                 relations.append({"from": source, "to": target, "type": relation.get("type", "related")})
     return relations
@@ -990,14 +1463,32 @@ async def _wiki_load_pages_for_graph(
     excluded_doc_ids: set[str] | None = None,
     chunk_state: dict[str, dict] | None = None,
 ) -> list[dict]:
-    """Reload compiled wiki_page rows and project them onto the canvas-graph
-    shape expected by ``dataset_wiki_generator.build_wiki_page_graph``.
+    """全量读取已编译的维基页面并将其转换为图谱画布所需的统一节点与出链数据结构 —— 图谱画布节点投影工。
 
-    Each returned page has: {slug, title, summary, entity_names,
-    source_chunk_ids, source_doc_ids, outlinks, page_type}. Used by the
-    incremental entry point to materialize the artifact canvas graph after
-    ``wiki_compile_incremental`` persists pages (which it does internally
-    without returning the page list).
+    参数:
+        tenant_id: 租户标识字符串。
+            示例: "tenant_001"
+        kb_id: 知识库标识字符串。
+            示例: "kb_999"
+        excluded_doc_ids: 排除的文档 ID 集合（可选）。
+            示例: {"doc_deleted"}
+        chunk_state: 激活的分块状态快照（可选）。
+
+    返回值:
+        符合画布图谱 Schema 的页面对象字典列表。
+        长相示例:
+        [
+            {
+                "slug": "concept/deep-learning",
+                "title": "深度学习",
+                "summary": "深度学习是机器学习的重要分支...",
+                "page_type": "concept",
+                "entity_names": ["深度学习", "Deep Learning"],
+                "outlinks": ["concept/machine-learning"],
+                "source_chunk_ids": ["chk_01"],
+                "source_doc_ids": ["doc_01"]
+            }
+        ]
     """
     from common.doc_store.doc_store_base import OrderByExpr
 
@@ -1014,6 +1505,7 @@ async def _wiki_load_pages_for_graph(
     ]
     pages: list[dict] = []
     offset, page_size = 0, 1000
+    # 步骤1: 分页查询 compile_kwd 为 wiki_page 的所有记录
     while True:
         try:
             res = await thread_pool_exec(
@@ -1032,6 +1524,7 @@ async def _wiki_load_pages_for_graph(
         except Exception:
             logging.exception("wiki: failed to load pages for graph kb=%s", kb_id)
             return pages
+        # 步骤2: 提取页面属性并优先从 Markdown 正文中解析 [[wikilinks]] 出链
         for row in field_map.values():
             slug = row.get("slug_kwd")
             if isinstance(slug, (list, tuple)):
@@ -1039,12 +1532,6 @@ async def _wiki_load_pages_for_graph(
             slug = str(slug or "").strip()
             if not slug:
                 continue
-            # outlinks_kwd is a *_kwd field analyzed by whitespace-#: Infinity
-            # shreds the stored JSON list and get_fields reads it back as [] (or
-            # a mangled token list). The reliable source of edges is the
-            # [[wikilinks]] actually present in the page body (auto-link +
-            # relation-based injection both write them). Prefer content-derived
-            # outlinks; fall back to the kwd field only if content has none.
             outlinks = _wiki_extract_outlinks_from_content(str(row.get("md_with_weight") or ""), kb_id)
             if not outlinks:
                 outlinks = _as_str_list(row.get("outlinks_kwd"))
@@ -1069,11 +1556,8 @@ async def _wiki_load_pages_for_graph(
         if len(field_map) < page_size:
             break
         offset += page_size
-    # A page may contain no generated wikilink even though MAP extracted a
-    # semantic relation.  Rebuild the graph from those grounded MAP relations
-    # as a fallback; otherwise wiki_entity rows exist but wiki_relation stays
-    # empty.  Page slugs remain the graph identities, while member names,
-    # titles, and slug suffixes are accepted as relation endpoints.
+
+    # 步骤3: 若正文中出链稀疏，加载 MAP 阶段抽取的语义关系作为保底出链填充图谱连线
     if pages:
         name_to_slug: dict[str, str] = {}
         for page in pages:
@@ -1097,6 +1581,7 @@ async def _wiki_load_pages_for_graph(
             logging.exception("wiki: failed to load MAP relations for graph fallback kb=%s", kb_id)
             map_relations = []
         pages_by_slug = {page["slug"]: page for page in pages}
+        # 步骤3.1: 将关系的起点与终点映射为页面 slug 并写入 outlinks
         for relation in map_relations:
             source = name_to_slug.get(str(relation.get("from") or "").strip())
             target = name_to_slug.get(str(relation.get("to") or "").strip())
@@ -1112,24 +1597,31 @@ _WIKILINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
 
 
 def _wiki_extract_outlinks_from_content(content: str, kb_id: str = "") -> list[str]:
-    """Extract unique internal link targets from page markdown, in order.
+    """从页面的 Markdown 正文中按顺序提取所有去重后的内部维基链接目标 slug —— 内链目标提取工。
 
-    Accepts both the raw ``[[slug]]`` form and the rendered Markdown form
-    ``[text](artifact/{kb_id}/{slug})``. Used to backfill graph edges from
-    page bodies (outlinks_kwd is a *_kwd field Infinity shreds on read-back).
+    参数:
+        content: 包含维基标记的页面正文字符串。
+            示例: "更多信息请参考 [[concept/deep-learning|深度学习]] 与 [卷积网络](artifact/kb_999/concept/cnn)"
+        kb_id: 知识库标识字符串（用于匹配已渲染的 artifact 链接，可选）。
+            示例: "kb_999"
+
+    返回值:
+        去重且保持出现顺序的页面 slug 列表。
+        长相示例: ["concept/deep-learning", "concept/cnn"]
     """
     if not content:
         return []
     seen: set[str] = set()
     outlinks: list[str] = []
+    # 步骤1: 正则提取 [[slug]] 或 [[slug|display_text]] 格式的链接
     for m in _WIKILINK_RE.finditer(content):
-        # ``[[page_slug|display text]]`` stores the page identity before the
-        # pipe.  The display text is only presentation data and must never be
-        # used as the graph target.
+        # 截取管道符 | 之前的 slug 作为真实图谱目标
+        # 匹配示例: "concept/deep-learning|深度学习" -> 提取 link: "concept/deep-learning"
         link = m.group(1).split("|", 1)[0].strip()
         if link and link not in seen:
             seen.add(link)
             outlinks.append(link)
+    # 步骤2: 若传入了 kb_id，提取已被渲染为标准 Markdown artifact 格式的链接
     if kb_id:
         kb_esc = re.escape(str(kb_id))
         for m in re.finditer(rf"\]\(artifact/{kb_esc}/([^)]+)\)", content):
@@ -1137,18 +1629,32 @@ def _wiki_extract_outlinks_from_content(content: str, kb_id: str = "") -> list[s
             if slug and slug not in seen:
                 seen.add(slug)
                 outlinks.append(slug)
+    # 输出示例: ["concept/deep-learning", "concept/cnn"]
     return outlinks
 
 
 def _inside_wikilink(content: str, pos: int) -> bool:
-    """Return True iff position ``pos`` falls inside an existing [[...]] span."""
+    """判定指定字符位置下标是否处于任何双中括号 [[...]] 链接语法区间内部 —— 维基链接内部判定工。
+
+    参数:
+        content: 完整的文本正文字符串。
+            示例: "介绍关于 [[concept/ai]] 的概念"
+        pos: 待判断的目标字符索引整数。
+            示例: 10
+
+    返回值:
+        布尔值。True 表示 pos 位于 [[ 和 ]] 之间；False 表示在外部。
+        示例: True
+    """
+    # 步骤1: 向前寻找距离 pos 最近的开括号 "[["
     open_pos = content.rfind("[[", 0, pos)
     if open_pos < 0:
         return False
-    # Find the FIRST "]]" that closes the "[[...]]" starting at open_pos
+    # 步骤2: 向后寻找闭合当前开括号的第一个 "]]"
     close_pos = content.find("]]", open_pos + 2)
     if close_pos < 0:
         close_pos = len(content)
+    # 步骤3: 判定 pos 是否完全落入中括号内容区间内
     return open_pos + 2 <= pos < close_pos
 
 
@@ -1157,17 +1663,25 @@ _WIKI_SIMPLE_LINK_RE = re.compile(r"\[\[([^\[\]\|]+?)\]\]")
 
 
 def _wiki_render_links(content: str, kb_id: str, valid_slugs: set[str]) -> str:
-    """Render internal ``[[slug]]`` / ``[[slug|text]]`` wikilinks into
-    navigable Markdown links ``[text](artifact/{kb_id}/{slug})``.
+    """将正文中的 [[slug]] 与 [[slug|text]] 替换为前端可跳转导航的标准 Markdown 链接 —— 维基链接渲染工。
 
-    This is the format the frontend wiki viewer can deep-link (plain ``[[...]]``
-    renders as text and cannot navigate). Targets not in ``valid_slugs`` are
-    left as plain text (their label only). Mirrors the old-mode behaviour.
+    参数:
+        content: 包含双中括号原始维基标记的正文字符串。
+            示例: "参见 [[concept/ai|人工智能]] 以及 [[concept/unknown]]"
+        kb_id: 知识库标识字符串。
+            示例: "kb_999"
+        valid_slugs: 当前知识库中所有合法且真实存在的页面 slug 集合。
+            长相示例: {"concept/ai", "concept/machine-learning"}
+
+    返回值:
+        替换渲染后的 Markdown 正文字符串。
+        示例: "参见 [人工智能](artifact/kb_999/concept/ai) 以及 concept/unknown"
     """
     if not content:
         return content
     kb = str(kb_id)
 
+    # 步骤1: 针对简单无管道链接的处理闭包：若合法则转换为 [label](artifact/kb/slug)，否则降级为纯文本
     def _simple(m: re.Match) -> str:
         slug = m.group(1).strip()
         if slug not in valid_slugs:
@@ -1175,6 +1689,7 @@ def _wiki_render_links(content: str, kb_id: str, valid_slugs: set[str]) -> str:
         label = slug.rsplit("/", 1)[-1] if "/" in slug else slug
         return f"[{label}](artifact/{kb}/{slug})"
 
+    # 步骤2: 针对带管道文本链接的处理闭包：若合法则转换为 [text](artifact/kb/slug)，否则降级保留 text
     def _piped(m: re.Match) -> str:
         slug = m.group(1).strip()
         text = m.group(2).strip()
@@ -1182,19 +1697,26 @@ def _wiki_render_links(content: str, kb_id: str, valid_slugs: set[str]) -> str:
             return text
         return f"[{text}](artifact/{kb}/{slug})"
 
+    # 步骤3: 先替换带管道的复杂链接，再替换简单链接
     rendered = _WIKI_PIPE_LINK_RE.sub(_piped, content)
     rendered = _WIKI_SIMPLE_LINK_RE.sub(_simple, rendered)
     return rendered
 
 
 def _wiki_resolve_dead_slug(link: str, valid_ids: set[str], name_slug: dict[str, str]) -> str | None:
-    """WeKnora-style fuzzy resolution of a dead wikilink to a live page.
+    """针对失效的死链 slug 进行多级模糊匹配与反向寻址，找回重命名后的目标页面 —— 死链模糊寻址工。
 
-    A ``[[dead_slug]]`` may fail to match a valid page because the target page
-    was renamed / its slug changed, or because the writer used an alias. Try,
-    in order: exact match, normalized-slug match, display-text reverse lookup
-    (via ``name_slug``), then bigram-token similarity over the plain names.
-    Returns a valid target slug or ``None`` (caller then degrades to text).
+    参数:
+        link: 页面正文中提取出的原始链接 slug 字符串。
+            示例: "deep_learning"
+        valid_ids: 当前合法的全部页面 slug 集合。
+            长相示例: {"concept/deep-learning", "concept/machine-learning"}
+        name_slug: 纯名称、标题及别名映射到真实页面 slug 的反向索引字典。
+            长相示例: {"deep-learning": "concept/deep-learning"}
+
+    返回值:
+        匹配成功的合法页面 slug 字符串，若无法匹配则返回 None。
+        示例: "concept/deep-learning"
     """
     if not link:
         return None
@@ -1206,13 +1728,15 @@ def _wiki_resolve_dead_slug(link: str, valid_ids: set[str], name_slug: dict[str,
     l_norm = _norm(link)
     p_norm = _norm(plain)
 
-    # 1. Exact / normalized target.
+    # 步骤1: 精确匹配或归一化（统一连字符和小写）匹配
+    # 输入 link: "deep-learning" 命中 valid_ids: {"concept/deep-learning"}
     if link in valid_ids:
         return link
     if l_norm in valid_ids:
         return l_norm
 
-    # 2. Display-text reverse lookup via name_slug (plain names + titles + aliases).
+    # 步骤2: 通过显示名与别名反向查找映射表 name_slug
+    # 输入 plain: "deep learning" 命中 name_slug: {"deep-learning": "concept/deep-learning"}
     if plain in name_slug:
         return name_slug[plain]
     if p_norm in {_norm(k) for k in name_slug}:
@@ -1220,7 +1744,7 @@ def _wiki_resolve_dead_slug(link: str, valid_ids: set[str], name_slug: dict[str,
             if _norm(k) == p_norm:
                 return v
 
-    # 3. Bigram-token similarity over plain names (longest tokens, then best match).
+    # 步骤3: 计算两两双字符 Bigram 集合的 Jaccard 相似度与词分块重叠度
     def _bigrams(text: str) -> set[str]:
         return {text[i : i + 2] for i in range(max(0, len(text) - 1))}
 
@@ -1230,8 +1754,7 @@ def _wiki_resolve_dead_slug(link: str, valid_ids: set[str], name_slug: dict[str,
     for cand_name, cand_slug in name_slug.items():
         c_norm = _norm(cand_name)
         c_tokens = c_norm.split("-")
-        # Require at least one shared token (or a shared prefix token) to avoid
-        # linking unrelated pages.
+        # 必须至少包含一个相同的 token
         if not (set(p_tokens) & set(c_tokens)):
             continue
         cb = _bigrams(c_norm)
@@ -1241,15 +1764,28 @@ def _wiki_resolve_dead_slug(link: str, valid_ids: set[str], name_slug: dict[str,
         score = len(p_bigrams & cb) / denom
         if best is None or score > best[0]:
             best = (score, cand_slug)
+    # 步骤4: 相似度达到 0.5 以上则采纳为目标页面
     if best and best[0] >= 0.5:
         return best[1]
     return None
 
 
 def _as_str_list(raw) -> list[str]:
-    """Coerce a stored field (JSON string / list / None) into a list of str."""
+    """将存储层返回的各种非规范格式（JSON 字符串、标量、列表、None）安全强转为纯字符串列表 —— 字符串列表强制转换工。
+
+    参数:
+        raw: 任意待转换的原始数据。
+            示例: '["tag1", "tag2"]' 或 "tag1" 或 None
+
+    返回值:
+        转换后的纯字符串列表。
+        长相示例: ["tag1", "tag2"]
+    """
+    # 步骤1: 处理 None 空值
     if raw is None:
         return []
+    # 步骤2: 若为字符串，尝试解析 JSON 数组，解析失败则包裹为单元素列表
+    # 输入: '["a", "b"]' -> 解析为 ["a", "b"]
     if isinstance(raw, str):
         if not raw:
             return []
@@ -1258,13 +1794,28 @@ def _as_str_list(raw) -> list[str]:
         except (json.JSONDecodeError, TypeError):
             return [raw]
         return _as_str_list(val)
+    # 步骤3: 若为列表或元组，强转各非空元素为字符串
+    # 输入: [1, 2] -> 输出: ["1", "2"]
     if isinstance(raw, (list, tuple)):
         return [str(v) for v in raw if v is not None]
     return []
 
 
 def _as_int(raw, default: int = 0) -> int:
-    """Coerce numeric doc-store fields, which some backends return as strings."""
+    """将存储层返回的数值字段（可能是字符串形式）安全转换为整数 —— 整数类型强制转换工。
+
+    参数:
+        raw: 待转换的值，如字符串、浮点数或 None。
+            示例: "123"
+        default: 转换失败时的默认缺省值，默认为 0。
+            示例: 0
+
+    返回值:
+        转换后的整型数值。
+        示例: 123
+    """
+    # 步骤1: 尝试强转为 int，若异常则返回 default
+    # 输入: "123" -> 输出: 123
     try:
         return int(raw)
     except (TypeError, ValueError):
@@ -1272,30 +1823,66 @@ def _as_int(raw, default: int = 0) -> int:
 
 
 def _wiki_claim_chunk_ids(claim: dict) -> list[str]:
-    """Return the source chunk id(s) a MAP claim is attributed to.
+    """从 MAP 阶段产出的陈述声明或实体对象中稳健提取其来源分块 ID 列表 —— 声明分块溯源提取工。
 
-    MAP (``wiki._wiki_resolve_chunk_ids``) rewrites every item's
-    ``source_chunk_id`` into ``chunk_ids=[real_id]`` (an array). Later stages
-    must read the array, falling back to the singular ``source_chunk_id`` for
-    robustness.
+    参数:
+        claim: 声明或实体字典，包含分块引用字段。
+            长相示例:
+            {
+                "statement": "声明内容",
+                "chunk_ids": ["chk_01", "chk_02"]
+            }
+            或
+            {
+                "statement": "声明内容",
+                "source_chunk_id": "chk_03"
+            }
+
+    返回值:
+        提取出的纯字符串分块 ID 列表。
+        长相示例: ["chk_01", "chk_02"]
     """
+    # 步骤1: 校验输入类型
     if not isinstance(claim, dict):
         return []
+    # 步骤2: 优先获取复数形式的 chunk_ids 列表
+    # ids 输入示例: ["chk_01", "chk_02"]
     ids = claim.get("chunk_ids")
     if isinstance(ids, str):
         ids = [ids]
     if isinstance(ids, (list, tuple)):
         return [str(c) for c in ids if c]
+    # 步骤3: 兜底读取单数形式的 source_chunk_id 字符串
+    # s 输入示例: "chk_03" -> 输出: ["chk_03"]
     s = claim.get("source_chunk_id")
     return [str(s)] if s else []
 
 
 def _wiki_dedupe_claims(claims: list[dict]) -> list[dict]:
+    """基于声明陈述内容、来源文档以及溯源分块组合键对陈述声明进行严格去重 —— 声明列表去重工。
+
+    参数:
+        claims: 待去重的声明字典列表。
+            长相示例:
+            [
+                {"statement": "AI是前沿技术", "source_doc_id": "doc_01", "chunk_ids": ["chk_01"]},
+                {"statement": "AI是前沿技术", "source_doc_id": "doc_01", "chunk_ids": ["chk_01"]}
+            ]
+
+    返回值:
+        去重后保留首次出现的声明字典列表。
+        长相示例:
+        [
+            {"statement": "AI是前沿技术", "source_doc_id": "doc_01", "chunk_ids": ["chk_01"]}
+        ]
+    """
     result: list[dict] = []
     seen: set[tuple[str, str, tuple[str, ...]]] = set()
+    # 步骤1: 遍历声明并根据 (statement, source_doc_id, chunk_ids_tuple) 构建唯一签名去重
     for claim in claims:
         if not isinstance(claim, dict):
             continue
+        # 签名三元组示例: ("AI是前沿技术", "doc_01", ("chk_01",))
         key = (
             str(claim.get("statement") or claim.get("text") or ""),
             str(claim.get("source_doc_id") or ""),
@@ -1313,23 +1900,46 @@ def _wiki_topics_for_docs(
     doc_topics: dict[str, list[str]] | None,
     topic_pool: dict[str, str] | None = None,
 ) -> list[str]:
+    """根据给定的文档 ID 列表聚合提取其所属的主题标签，并结合主题池去重归一 —— 文档主题聚合工。
+
+    参数:
+        doc_ids: 待聚合的文档 ID 集合或列表。
+            长相示例: ["doc_01", "doc_02"]
+        doc_topics: 文档 ID 到主题标签列表的映射字典（可选）。
+            长相示例:
+            {
+                "doc_01": ["人工智能", "深度学习"],
+                "doc_02": ["计算机视觉"]
+            }
+        topic_pool: 全局已知主题池字典（可选）。
+            长相示例: {"ai": "人工智能"}
+
+    返回值:
+        去重后且过滤掉 General 兜底标签的主题字符串列表。
+        长相示例: ["人工智能", "深度学习", "计算机视觉"]
+    """
     topics: list[str] = []
     seen: set[str] = set()
+    # 步骤1: 遍历文档 ID，收集 doc_topics 中的有效主题
+    # 单个文档主题输入示例: doc_id="doc_01" -> ["人工智能", "深度学习"]
     for doc_id in doc_ids:
         for topic in (doc_topics or {}).get(doc_id, []):
             if not isinstance(topic, str):
                 continue
             topic = topic.strip()
             key = _normalize_key(topic)
+            # 过滤空值与兜底的 General 标签
             if not topic or key == _normalize_key(WIKI_TOPIC_FALLBACK) or key in seen:
                 continue
             seen.add(key)
             topics.append(topic)
+    # 步骤2: 合并全局主题池中的已知主题
     for topic in (topic_pool or {}).values():
         key = _normalize_key(topic)
         if topic and key not in seen:
             seen.add(key)
             topics.append(topic)
+    # 输出示例: ["人工智能", "深度学习", "计算机视觉"]
     return topics
 
 
@@ -1338,6 +1948,24 @@ async def _wiki_prepare_topic_embeddings(
     embd_mdl,
     extra_topics: list[str] | None = None,
 ) -> dict[str, object]:
+    """对所有涉及的主题名称进行批量向量化编码，返回主题名到向量的映射字典 —— 主题向量编码工。
+
+    参数:
+        doc_topics: 各文档对应的主题标签列表字典。
+            长相示例: {"doc_01": ["自然语言处理", "信息抽取"]}
+        embd_mdl: 文本向量嵌入模型客户端实例。
+        extra_topics: 额外补充的主题标签列表（可选）。
+            长相示例: ["大语言模型"]
+
+    返回值:
+        主题标签名称到其浮点向量数组的映射字典。
+        长相示例:
+        {
+            "自然语言处理": [0.012, -0.045, 0.089, ...]
+        }
+    """
+    # 步骤1: 提取所有有效主题并去重排序（过滤掉通用兜底主题 General）
+    # 提取结果 topics 示例: ["大语言模型", "信息抽取", "自然语言处理"]
     topics = sorted(
         {
             topic
@@ -1349,7 +1977,9 @@ async def _wiki_prepare_topic_embeddings(
     )
     if not topics or embd_mdl is None:
         return {}
+    # 步骤2: 异步并发调用向量模型进行批量文本向量化
     embeddings, _ = await thread_pool_exec(embd_mdl.encode, topics)
+    # 步骤3: 组装主题到向量的字典映射并返回
     return {topic: vector for topic, vector in zip(topics, embeddings, strict=True)}
 
 
@@ -1359,11 +1989,31 @@ def _wiki_topic_query_text(
     source_chunks: list[dict] | None,
     existing_page: dict | None = None,
 ) -> str:
+    """提取页面的标题、历史摘要、证据陈述及原文分块，拼装为用于主题向量召回的上下文特征字符串 —— 主题检索特征构建工。
+
+    参数:
+        page_title: 页面标题字符串。
+            示例: "量子计算"
+        claims: 页面关联的声明字典列表（可选）。
+            长相示例: [{"statement": "量子计算利用量子比特进行高速运算。"}]
+        source_chunks: 来源证据分块列表（可选）。
+            长相示例: [{"text": "量子计算是基于量子力学规律调控量子信息单元..."}]
+        existing_page: 已存在的页面记录字典（可选）。
+            长相示例: {"summary_with_weight": "量子计算的前沿应用..."}
+
+    返回值:
+        紧凑拼装的单行特征文本。
+        示例: "title=量子计算; summary=量子计算的前沿应用...; evidence=量子计算利用量子比特进行高速运算。; source=量子计算是基于量子力学..."
+    """
+    # 步骤1: 拼接标题
     parts = [f"title={page_title}"] if page_title else []
+    # 步骤2: 拼接已有摘要
     if existing_page:
         summary = existing_page.get("summary_with_weight") or ""
         if summary:
             parts.append(f"summary={summary}")
+    # 步骤3: 提取最多前 8 条核心陈述声明
+    # evidence 示例: ["量子计算利用量子比特进行高速运算。"]
     evidence = []
     for claim in (claims or [])[:8]:
         if isinstance(claim, dict):
@@ -1372,6 +2022,8 @@ def _wiki_topic_query_text(
                 evidence.append(str(text))
     if evidence:
         parts.append(f"evidence={' | '.join(evidence)}")
+    # 步骤4: 提取最多前 4 个来源分块的文本（每条截断至前 500 字符）
+    # chunk_text 示例: ["量子计算是基于量子力学规律..."]
     chunk_text = []
     for chunk in (source_chunks or [])[:4]:
         if isinstance(chunk, dict):
@@ -1380,6 +2032,7 @@ def _wiki_topic_query_text(
                 chunk_text.append(str(text)[:500])
     if chunk_text:
         parts.append(f"source={' | '.join(chunk_text)}")
+    # 步骤5: 以分号连接返回最终查询文本
     return "; ".join(parts)
 
 
@@ -1392,7 +2045,26 @@ async def _wiki_rank_topic_candidates(
     topic_embeddings: dict[str, object] | None,
     embd_mdl,
 ) -> list[str]:
-    """Use embedding only to recall topic candidates; LLM remains the selector."""
+    """通过余弦向量相似度计算页面内容与主题的匹配得分，对候选主题进行重排序筛选 —— 主题候选重排序工。
+
+    参数:
+        page_title: 页面标题。
+            示例: "深度学习"
+        claims: 声明列表（可选）。
+            长相示例: [{"statement": "深度学习是机器学习的重要分支"}]
+        source_chunks: 来源分块列表（可选）。
+        existing_page: 已存在的页面记录字典（可选）。
+        topic_candidates: 候选主题列表。
+            长相示例: ["机器学习", "计算机科学", "生物信息学"]
+        topic_embeddings: 预编码的主题向量缓存字典（可选）。
+            长相示例: {"机器学习": [0.01, 0.05, ...]}
+        embd_mdl: 文本嵌入模型实例。
+
+    返回值:
+        按语义相关度降序排序的候选主题列表（最多截取 50 个）。
+        长相示例: ["机器学习", "计算机科学", "生物信息学"]
+    """
+    # 步骤1: 候选主题去重与格式整理
     candidates = []
     seen: set[str] = set()
     for topic in topic_candidates or []:
@@ -1406,6 +2078,7 @@ async def _wiki_rank_topic_candidates(
     if len(candidates) <= 1 or embd_mdl is None:
         return candidates[:WIKI_PAGE_TOPIC_CANDIDATE_LIMIT]
 
+    # 步骤2: 生成页面检索特征文本并编码为特征向量
     query_text = _wiki_topic_query_text(page_title, claims, source_chunks, existing_page)
     query_embedding, _ = await thread_pool_exec(embd_mdl.encode, [query_text])
     query = np.asarray(query_embedding[0], dtype=np.float32)
@@ -1414,6 +2087,7 @@ async def _wiki_rank_topic_candidates(
         return candidates[:WIKI_PAGE_TOPIC_CANDIDATE_LIMIT]
     query = query / query_norm
 
+    # 步骤3: 检查是否有尚未向量化的主题，进行增量编码
     local_topic_embeddings = dict(topic_embeddings or {})
     missing_topics = [topic for topic in candidates if topic not in local_topic_embeddings]
     if missing_topics:
@@ -1422,6 +2096,8 @@ async def _wiki_rank_topic_candidates(
         if topic_embeddings is not None:
             topic_embeddings.update({topic: vector for topic, vector in zip(missing_topics, encoded, strict=True)})
 
+    # 步骤4: 计算页面向量与各主题向量的点积余弦相似度并按得分降序排序
+    # ranked 项示例: (0.875, "机器学习")
     ranked = []
     for topic in candidates:
         vector = np.asarray(local_topic_embeddings.get(topic), dtype=np.float32) if topic in local_topic_embeddings else None
@@ -1431,22 +2107,43 @@ async def _wiki_rank_topic_candidates(
         score = float(np.dot(query, vector / norm)) if norm > 0 else -1.0
         ranked.append((score, topic))
     ranked.sort(key=lambda item: (-item[0], item[1]))
+    # 输出示例: ["机器学习", "计算机科学"]
     return [topic for _, topic in ranked[:WIKI_PAGE_TOPIC_CANDIDATE_LIMIT]]
 
 
 def _wiki_decide_concept_pages(all_concepts: list[dict]) -> list[dict]:
-    """Return every concept as a wiki page.
+    """将 MAP 阶段抽取出的全部核心概念直接转化为独立的维基页面描述字典（模式 A 专属） —— 概念页面决策工。
 
-    Mode A compiles EVERY entity AND concept into its own page, so no depth
-    filter is applied here. A concept that was extracted by MAP (it exists in
-    ``concepts[]``) is compiled even if it has no dedicated claim rows — its
-    page is enriched from the source chunks of the document(s) where it
-    appears.
+    参数:
+        all_concepts: 从文档中提取的概念字典列表。
+            长相示例:
+            [
+                {
+                    "term": "深度学习",
+                    "claims": [{"statement": "深度学习模拟神经元...", "source_doc_id": "doc_01"}]
+                }
+            ]
+
+    返回值:
+        概念维基页面规格描述列表。
+        长相示例:
+        [
+            {
+                "page_id": "concept/deep-learning",
+                "page_title": "深度学习",
+                "concept": {"term": "深度学习", ...},
+                "claims": [{"statement": "深度学习模拟神经元...", "source_doc_id": "doc_01"}],
+                "source_doc_ids": ["doc_01"]
+            }
+        ]
     """
     pages = []
+    # 步骤1: 遍历每一个概念，提取其声明与关联来源文档 ID
     for concept in all_concepts:
         claims = concept.get("claims", [])
         source_docs = set(c.get("source_doc_id") for c in claims if c.get("source_doc_id"))
+        # 步骤2: 推导标准页面 ID 与标题，组装页面对象
+        # 组装结果项示例: {"page_id": "concept/deep-learning", "page_title": "深度学习", "claims": [...]}
         pages.append(
             {
                 "page_id": _wiki_derive_page_id(concept["term"]),
@@ -1459,7 +2156,7 @@ def _wiki_decide_concept_pages(all_concepts: list[dict]) -> list[dict]:
     return pages
 
 
-# ----- REDUCE (shared, per-entity) ------------------------------------------
+# ----- 统一 REDUCE 增量消解（基于单实体） ---------------------------------
 
 
 async def _wiki_reduce_entity(
@@ -1473,17 +2170,53 @@ async def _wiki_reduce_entity(
     source_doc_ids: list[str] | None = None,
     source_chunk_ids: list[str] | None = None,
 ) -> dict:
-    """Per-entity REDUCE: compute additions/retractions vs existing page.
+    """对单个实体计算其相对于已有页面的陈述声明增量、撤销声明及动作类型（create/update/delete/noop） —— 单实体增量消解工。
 
-    Returns dict with action (create|update|delete|noop), additions, retractions,
-    and entity_type for downstream filtering.
+    参数:
+        entity_name: 规范实体或概念主名称。
+            示例: "人工智能"
+        new_claims: 本次增量抽取出的新声明列表。
+            长相示例: [{"statement": "AI 发展迅猛", "source_doc_id": "doc_02", "chunk_ids": ["chk_02"]}]
+        existing_page: 已存在的页面记录字典（若为全新实体则为 None）。
+            长相示例:
+            {
+                "claims": "[{\"statement\": \"AI是计算机学科\", \"source_doc_id\": \"doc_01\"}]",
+                "source_chunk_ids": ["chk_01"]
+            }
+        deleted_doc_ids: 本次编译中被删除的文档 ID 集合。
+            长相示例: {"doc_old"}
+        invalidated_chunk_ids: 失效或被编辑修改的分块 ID 集合（可选）。
+            长相示例: {"chk_old"}
+        entity_type: 实体类别，默认为 "entity"。
+            示例: "concept"
+        aliases: 实体别名列表（可选）。
+            长相示例: ["AI", "机器智能"]
+        source_doc_ids: 关联来源文档 ID 列表（可选）。
+            长相示例: ["doc_02"]
+        source_chunk_ids: 关联来源分块 ID 列表（可选）。
+            长相示例: ["chk_02"]
+
+    返回值:
+        描述实体状态变更的动作差异字典。
+        长相示例:
+        {
+            "action": "update",
+            "entity_name": "人工智能",
+            "entity_type": "concept",
+            "aliases": ["AI"],
+            "additions": [{"statement": "AI 发展迅猛", "source_doc_id": "doc_02"}],
+            "retractions": [],
+            "source_chunk_ids": ["chk_02"],
+            "retained_source_doc_ids": ["doc_01", "doc_02"],
+            "has_delta": True
+        }
     """
+    # 步骤1: 若该实体尚无已编译的维基页面（全新实体）
     if existing_page is None:
         if isinstance(entity_type, list):
             entity_type = entity_type[0] if entity_type else "entity"
         entity_type = str(entity_type or "entity").strip()
-        # Claims are not the only evidence: entity/concept rows and relations
-        # carry their own source chunk attribution from MAP.
+        # 若既无新声明也无来源分块证据，直接标记为无操作 noop
         if not new_claims and not source_chunk_ids:
             return {
                 "action": "noop",
@@ -1495,6 +2228,7 @@ async def _wiki_reduce_entity(
                 "retained_source_doc_ids": [],
                 "has_delta": False,
             }
+        # 否则触发新建页面的 create 动作
         return {
             "action": "create",
             "entity_name": entity_name,
@@ -1506,10 +2240,8 @@ async def _wiki_reduce_entity(
             "has_delta": True,
         }
 
+    # 步骤2: 若页面已存在，反序列化提取现有声明列表
     existing_claims = existing_page.get("claims", [])
-    # The stored `claims` column is a JSON string (json.dumps in _wiki_refine_page).
-    # Normalize to a list of dicts defensively — iterating a raw string yields
-    # characters and breaks every `c.get(...)` below.
     if isinstance(existing_claims, str):
         try:
             existing_claims = json.loads(existing_claims) if existing_claims else []
@@ -1524,21 +2256,27 @@ async def _wiki_reduce_entity(
     existing_chunk_ids = set(_as_str_list(existing_page.get("source_chunk_ids")))
     all_page_evidence_invalidated = bool(existing_chunk_ids) and existing_chunk_ids <= invalidated_set
 
+    # 步骤3: 计算需撤销的旧声明 retractions（来源文档已被删除，或关联分块已失效）
+    # retractions 示例: [{"statement": "失效声明", "source_doc_id": "doc_old"}]
     retractions = [
         c for c in existing_claims if c.get("source_doc_id") in deleted_set or bool(set(_wiki_claim_chunk_ids(c)) & invalidated_set) or (all_page_evidence_invalidated and not _wiki_claim_chunk_ids(c))
     ]
 
+    # 步骤4: 计算保留的声明与新增的声明 additions
+    # retained_claims 示例: [{"statement": "有效声明", "source_doc_id": "doc_01"}]
     retained_claims = [c for c in existing_claims if c not in retractions]
-
     retained_texts = {c.get("statement", c.get("text", "")) for c in retained_claims}
     additions = [c for c in new_claims if c.get("statement", c.get("text", "")) not in retained_texts]
 
+    # 步骤5: 综合全部保留与新增的文档 ID，计算最新的分块证据集合
     all_doc_ids = (
         {c.get("source_doc_id") for c in retained_claims if c.get("source_doc_id")} | {c.get("source_doc_id") for c in additions if c.get("source_doc_id")} | (set(source_doc_ids or []) - deleted_set)
     )
     current_chunk_ids = sorted(set(source_chunk_ids or []) if source_chunk_ids else existing_chunk_ids - invalidated_set)
     evidence_changed = set(current_chunk_ids) != existing_chunk_ids
 
+    # 步骤6: 判定最终动作类型（delete / update / noop）
+    # 若所有文档来源均已消失，标记为删除 delete
     if not all_doc_ids:
         return {
             "action": "delete",
@@ -1549,6 +2287,7 @@ async def _wiki_reduce_entity(
             "source_chunk_ids": current_chunk_ids,
             "has_delta": True,
         }
+    # 若有新增、撤销或证据分块变化，标记为更新 update
     elif additions or retractions or evidence_changed:
         return {
             "action": "update",
@@ -1561,6 +2300,7 @@ async def _wiki_reduce_entity(
             "retained_source_doc_ids": list(all_doc_ids),
             "has_delta": True,
         }
+    # 否则标记为无变化 noop
     return {
         "action": "noop",
         "entity_name": entity_name,
@@ -1582,10 +2322,34 @@ async def _wiki_reduce_batch(
     name_resolution: dict[str, str] | None = None,
     map_results: list[dict] | None = None,
 ) -> list[dict]:
-    """Parallel per-entity REDUCE over a batch of affected canonical names.
+    """并发调度针对受本次变更影响的所有规范实体执行增量 REDUCE 消解计算 —— 实体批次增量消解工。
 
-    Uses canonical_claims (from Entity Matching) instead of raw MAP claims.
+    参数:
+        affected_names: 产生变动或受影响的规范实体名称集合。
+            长相示例: {"深度学习", "机器学习"}
+        existing_pages: 已存在的页面记录字典。
+        deleted_doc_ids: 本轮删除的文档 ID 集合。
+        invalidated_chunk_ids: 失效分块 ID 集合（可选）。
+        canonical_claims: 规范实体到其累积声明列表的映射字典（可选）。
+            长相示例: {"深度学习": [{"statement": "..."}]}
+        canonical_map: 规范实体元数据映射字典（可选）。
+        name_resolution: 原始名称到规范名称的对齐映射（可选）。
+        map_results: 原始 MAP 阶段输出（可选，用于未传 canonical_claims 时的兜底回退）。
+
+    返回值:
+        产生实质性增量变更（has_delta=True）的实体消解动作列表。
+        长相示例:
+        [
+            {
+                "action": "update",
+                "entity_name": "深度学习",
+                "additions": [...],
+                "retractions": [...]
+            }
+        ]
     """
+    # 步骤1: 构建实体名/页面 slug 到已有页面对象的反向索引
+    # name_to_page 示例: {"深度学习": {"slug_kwd": "concept/deep-learning", ...}}
     name_to_page: dict[str, dict] = {}
     for pid, page in existing_pages.items():
         for n in _as_str_list(page.get("entity_names_kwd")):
@@ -1593,11 +2357,11 @@ async def _wiki_reduce_batch(
         slug = pid.split("/")[-1] if "/" in pid else pid
         name_to_page.setdefault(slug, page)
 
-    # Use canonical claims if provided (post-entity-matching)
+    # 步骤2: 确定声明来源数据（优先使用经实体匹配消歧后的 canonical_claims）
     if canonical_claims is not None:
         claims_source = canonical_claims
     else:
-        # Fallback: aggregate from raw MAP results
+        # 回退逻辑: 从原始 MAP 结果中聚合并重定向名称
         claims_source = {}
         for mr in map_results:
             for c in mr.get("claims", []):
@@ -1611,10 +2375,10 @@ async def _wiki_reduce_batch(
     for name in affected_names:
         claims_source.setdefault(name, [])
 
+    # 步骤3: 为每个受影响的实体创建单实体消解异步任务
     tasks = []
     for name in affected_names:
         claims = claims_source.get(name, [])
-        # Determine entity_type from canonical_map
         entity_type = "entity"
         if canonical_map and name in canonical_map:
             entity_type = canonical_map[name].get("type", "entity")
@@ -1640,11 +2404,13 @@ async def _wiki_reduce_batch(
         )
     if not tasks:
         return []
+    # 步骤4: 并发等待所有实体的 REDUCE 计算完成并过滤具有有效变化的项
     results = await asyncio.gather(*tasks)
+    # 输出示例: [{"action": "update", "entity_name": "深度学习", "has_delta": True}]
     return [r for r in results if r.get("has_delta")]
 
 
-# ----- doc_page_source tracking ---------------------------------------------
+# ----- 文档与页面来源溯源关系记录（doc_page_source） -----------------------
 
 
 async def _wiki_update_doc_page_source(
@@ -1656,9 +2422,30 @@ async def _wiki_update_doc_page_source(
     chunk_hashes: dict[str, str] | None = None,
     map_checksum: str | None = None,
 ) -> None:
-    """Record which pages and entities this document contributes to."""
+    """记录并持久化单个文档对各个维基页面及实体的编译贡献追溯关系 —— 文档来源贡献记账工。
+
+    参数:
+        tenant_id: 租户标识字符串。
+            示例: "tenant_001"
+        kb_id: 知识库标识字符串。
+            示例: "kb_999"
+        doc_id: 来源文档 ID 字符串。
+            示例: "doc_01"
+        page_ids: 该文档所贡献的全部页面 ID 列表。
+            长相示例: ["concept/deep-learning", "concept/ai"]
+        entity_names: 该文档中提及或产出的实体名称列表（可选）。
+            长相示例: ["深度学习", "人工智能"]
+        chunk_hashes: 文档内各分块 ID 到其哈希值的映射字典（可选）。
+            长相示例: {"chk_01": "hash_abc"}
+        map_checksum: 文档在 MAP 抽取阶段的指纹校验和（可选）。
+            示例: "chksum_xyz"
+
+    返回值:
+        None
+    """
     index = search.index_name(tenant_id)
 
+    # 步骤1: 检索该文档是否已有来源贡献记录
     condition = {
         "compile_kwd": [WIKI_DOC_PAGE_SOURCE_COMPILE_KWD],
         "doc_id": [doc_id],
@@ -1677,6 +2464,7 @@ async def _wiki_update_doc_page_source(
     )
     existing_map = settings.docStoreConn.get_fields(existing, ["id", "page_ids", "entity_names", "source_chunk_hashes", "map_checksum"])
 
+    # 步骤2: 若已有记录，继承原有的分块哈希、校验和与实体名
     if existing_map:
         for row in existing_map.values():
             if chunk_hashes is None:
@@ -1691,6 +2479,14 @@ async def _wiki_update_doc_page_source(
                 entity_names = json.loads(saved_names) if isinstance(saved_names, str) else saved_names
             break
 
+    # 步骤3: 组装待存储的文档来源关系记录
+    # doc 结构示例:
+    # {
+    #     "id": "wiki_doc_page_source_kb_999_doc_01",
+    #     "doc_id": "doc_01",
+    #     "page_ids": "[\"concept/deep-learning\"]",
+    #     "compile_kwd": "wiki_doc_page_source"
+    # }
     doc = {
         "id": _stable_row_id(WIKI_DOC_PAGE_SOURCE_COMPILE_KWD, kb_id, doc_id),
         "doc_id": doc_id,
@@ -1701,13 +2497,10 @@ async def _wiki_update_doc_page_source(
         "map_checksum": map_checksum or "",
         "compile_kwd": WIKI_DOC_PAGE_SOURCE_COMPILE_KWD,
     }
+    # 步骤4: 根据已有记录情况，执行精确主键更新或插入操作
     if existing_map:
         await thread_pool_exec(
             settings.docStoreConn.update,
-            # ``doc_id`` is shared by source chunks, MAP resume rows, and this
-            # tracking row. Updating by doc_id rewrites every one of them into
-            # ``wiki_doc_page_source``. The tracking row has a stable unique
-            # id, so updates must always use that identity.
             {"id": doc["id"]},
             doc,
             index,
@@ -1727,12 +2520,32 @@ async def _wiki_load_doc_page_source(
     kb_id: str,
     doc_id: str,
 ) -> dict | None:
-    """Load doc_page_source record for a document."""
+    """读取指定文档对于维基页面与实体的历史贡献追溯记录 —— 文档来源追溯读取工。
+
+    参数:
+        tenant_id: 租户标识字符串。
+            示例: "tenant_001"
+        kb_id: 知识库标识字符串。
+            示例: "kb_999"
+        doc_id: 待查询的文档 ID 字符串。
+            示例: "doc_01"
+
+    返回值:
+        反序列化后的文档追溯关系字典；若无记录则返回 None。
+        长相示例:
+        {
+            "page_ids": ["concept/deep-learning"],
+            "entity_names": ["深度学习"],
+            "source_chunk_hashes": {"chk_01": "hash_abc"},
+            "map_checksum": "checksum_123"
+        }
+    """
     index = search.index_name(tenant_id)
     condition = {
         "compile_kwd": [WIKI_DOC_PAGE_SOURCE_COMPILE_KWD],
         "doc_id": [doc_id],
     }
+    # 步骤1: 检索 compile_kwd 为 wiki_doc_page_source 的单条记录
     res = await thread_pool_exec(
         settings.docStoreConn.search,
         ["page_ids", "entity_names", "source_chunk_hashes", "map_checksum"],
@@ -1746,6 +2559,7 @@ async def _wiki_load_doc_page_source(
         [kb_id],
     )
     field_map = settings.docStoreConn.get_fields(res, ["page_ids", "entity_names", "source_chunk_hashes", "map_checksum"])
+    # 步骤2: 解析 JSON 字符串为原生 Python 列表与字典并返回
     for row in field_map.values():
         return {
             "page_ids": json.loads(row.get("page_ids", "[]")) if isinstance(row.get("page_ids"), str) else row.get("page_ids", []),
@@ -1756,7 +2570,7 @@ async def _wiki_load_doc_page_source(
     return None
 
 
-# ----- Mode A: no-plan REFINE -----------------------------------------------
+# ----- 模式 A：无规划单概念 REFINE 精炼生成 ---------------------------------
 
 
 async def _wiki_refine_page(
@@ -1788,17 +2602,85 @@ async def _wiki_refine_page(
     topic_pool_lock: asyncio.Lock | None = None,
     member_evidence: list[dict] | None = None,
 ) -> dict | None:
-    """Run a single Mode A REFINE action on one concept page.
+    """在模式 A 下执行单篇维基概念页面的 REFINE 润色生成、增量修改、全量重写或页面删除 —— 页面精炼编译器。
 
-    Returns updated wiki_page dict, or None if deleted.
+    参数:
+        mode: 精炼操作模式，支持 "generate"（新建）、"modify"（增量修改）、"re-synthesize"（全量重写）、"delete"（物理删除）。
+            示例: "generate"
+        page_id: 页面全局唯一标识 slug。
+            示例: "concept/deep-learning"
+        page_title: 页面展示标题。
+            示例: "深度学习"
+        existing_page: 该页面已保存的历史数据字典（可选）。
+            长相示例:
+            {
+                "id": "wiki_page_kb_999_deep-learning",
+                "slug_kwd": "concept/deep-learning",
+                "title_kwd": "深度学习",
+                "md_with_weight": "正文内容...",
+                "source_doc_ids": ["doc_01"]
+            }
+        page_type_kwd: 页面类型关键字，默认为 "concept"。
+            示例: "concept"
+        additions: 本次增量待融入的新声明字典列表（可选）。
+            长相示例: [{"statement": "深度学习在视觉领域表现优异", "source_doc_id": "doc_02"}]
+        retractions: 本次增量需剔除的陈旧声明字典列表（可选）。
+            长相示例: [{"statement": "旧版失效声明", "source_doc_id": "doc_old"}]
+        source_chunks: 关联的来源证据分块列表（可选）。
+            长相示例: [{"id": "chk_01", "text": "分块原始正文...", "_verbatim": True}]
+        claims: 属于该页面的完整声明列表（可选）。
+        available_pages: 可供正文插入 [[wikilinks]] 内部链接的目标页面 slug 列表（可选）。
+            长相示例: ["concept/machine-learning", "concept/neural-network"]
+        contextual_hints: 额外补充的上下文关联提示字符串。
+            示例: "## Context: Related Entities\n- [[concept/ai]] — subfield"
+        chat_mdl: 大语言模型客户端实例。
+        embd_mdl: 向量嵌入模型客户端实例。
+        tenant_id: 租户标识字符串。
+            示例: "tenant_001"
+        kb_id: 知识库标识字符串。
+            示例: "kb_999"
+        page_version: 页面当前的修订版本序号（整数）。
+            示例: 1
+        entity_names: 归属于本页面的实体名称列表（可选）。
+            长相示例: ["深度学习", "Deep Learning"]
+        page_embedding: 预先计算好的页面向量嵌入（可选）。
+        embed_routing_context: 是否将成员名称与正文拼接后再做向量编码（布尔值）。
+            示例: False
+        source_doc_ids: 关联来源文档 ID 列表（可选）。
+            长相示例: ["doc_01", "doc_02"]
+        topic_candidates: 候选主题标签列表（可选）。
+            长相示例: ["人工智能", "计算机视觉"]
+        topic_selection_stats: 主题选择度量计数器字典（可选）。
+            长相示例: {"selected": 5, "new": 1}
+        topic_embeddings: 主题名到向量数组的缓存映射字典（可选）。
+        topic_pool: 全局已知主题池字典（可选）。
+        topic_pool_lock: 主题池并发操作异步互斥锁（可选）。
+        member_evidence: 多实体归并至同一页面时的成员详细证据列表（可选）。
+            长相示例: [{"name": "成员A", "claims": [...], "source_chunk_ids": ["chk_01"]}]
+
+    返回值:
+        编译持久化后的最新 wiki_page 字典；若为 delete 模式且成功则返回 None。
+        长相示例:
+        {
+            "id": "wiki_page_kb_999_concept/deep-learning",
+            "slug_kwd": "concept/deep-learning",
+            "title_kwd": "深度学习",
+            "md_with_weight": "# 深度学习\n\n深度学习是机器学习的重要分支...",
+            "summary_with_weight": "深度学习利用多层神经网络...",
+            "topic_kwd": "人工智能",
+            "page_version_int": 2,
+            "source_doc_ids": ["doc_01", "doc_02"]
+        }
     """
     from common.misc_utils import thread_pool_exec
 
-    # Blank page_id would produce `slug_kwd: [""]` queries → Infinity 3052.
+    # 步骤1: 校验页面 ID 合法性，过滤空字符串
     if not page_id or not str(page_id).strip():
         return existing_page
     page_version = _as_int(page_version)
 
+    # 步骤2: 根据页面内容特征对候选主题进行向量相似度重排与筛选
+    # topic_candidates 输出示例: ["人工智能", "计算机视觉"]
     topic_candidates = await _wiki_rank_topic_candidates(
         page_title,
         claims,
@@ -1809,6 +2691,7 @@ async def _wiki_refine_page(
         embd_mdl,
     )
 
+    # 步骤3: 若为 delete 模式，从底层存储引擎物理删除该页面并清理历史提交记录
     if mode == "delete":
         deleted_count = await thread_pool_exec(
             settings.docStoreConn.delete,
@@ -1825,10 +2708,7 @@ async def _wiki_refine_page(
         FileCommitService.delete_page_history(kb_id, page_type_kwd, commit_slug)
         return None
 
-    # WeKnora-style verbatim evidence: load the ACTUAL source-chunk text for
-    # every referenced chunk id so the writer is grounded in the source, not
-    # just in the condensed claim statements. This runs per-page (incremental
-    # friendly) and is bounded by WIKI_SOURCE_BUDGET_CHARS.
+    # 步骤4: 批量读取来源分块的真实逐字原文注入 source_chunks，确保大模型立足真实依据
     if source_chunks:
         chunk_ids = [sc.get("id") or sc.get("chunk_id") for sc in source_chunks if (sc.get("id") or sc.get("chunk_id"))]
         if chunk_ids:
@@ -1839,7 +2719,7 @@ async def _wiki_refine_page(
             except Exception:
                 logging.exception("wiki: verbatim chunk enrichment failed for page %s", page_id)
 
-    # Build the prompt based on mode
+    # 步骤5: 根据不同的操作模式组装系统提示词与用户输入提示词
     if mode == "generate":
         system_prompt = _WIKI_MODE_A_GENERATE_SYSTEM
         user_prompt = _build_mode_a_generate_prompt(
@@ -1868,7 +2748,7 @@ async def _wiki_refine_page(
             force_full=True,
             member_evidence=member_evidence,
         )
-    else:  # modify
+    else:  # modify 增量修改
         system_prompt = _WIKI_MODE_A_MODIFY_SYSTEM
         user_prompt = _build_mode_a_modify_prompt(
             page_id,
@@ -1885,7 +2765,7 @@ async def _wiki_refine_page(
             member_evidence=member_evidence,
         )
 
-    # Call LLM
+    # 步骤6: 异步调用大模型进行正文起草或更新
     response = await _chat_mdl_ask(
         chat_mdl,
         system_prompt,
@@ -1893,11 +2773,10 @@ async def _wiki_refine_page(
     )
 
     if not response or not response.strip():
-        return existing_page  # keep existing
+        return existing_page  # 保持原状
 
-    # Parse response metadata. Topic is selected semantically by the same LLM
-    # that planned/wrote the page; it must not be overwritten later by a
-    # knowledge-base-wide embedding nearest-neighbour pass.
+    # 步骤7: 解析响应头部元数据（SUMMARY / TITLE / TOPIC）并截取正文
+    # response 输入示例: "SUMMARY: 概述...\nTITLE: 深度学习\nTOPIC: 人工智能\n# 深度学习..."
     content_lines = response.strip().splitlines()
     summary = ""
     title = ""
@@ -1924,8 +2803,7 @@ async def _wiki_refine_page(
     if not content:
         return existing_page
 
-    # Build the wiki_page dict. Single-member pages keep their original title;
-    # only grouped pages may receive a synthesized title from the LLM.
+    # 步骤8: 规范化标题与主题标签
     existing = existing_page or {}
     member_names = {str(name).strip() for name in (entity_names or []) if str(name).strip()}
     if len(member_names) <= 1:
@@ -1941,6 +2819,7 @@ async def _wiki_refine_page(
     candidate_keys = {_normalize_key(candidate) for candidate in topic_candidates or [] if candidate}
     is_new_topic = bool(topic and topic_key not in candidate_keys)
     added_to_candidates = False
+    # 步骤8.1: 若生成了新主题且存在主题池，并发安全地注册到主题池并计算向量
     if is_new_topic and topic_pool is not None:
         added_to_candidates = topic_key not in topic_pool
         if topic_pool_lock is not None:
@@ -1986,6 +2865,7 @@ async def _wiki_refine_page(
             tuple(sorted(_wiki_claim_chunk_ids(claim))),
         )
 
+    # 步骤9: 计算生效的最终声明集合 effective_claims，并收集溯源文档和分块 ID
     retraction_keys = {_claim_key(claim) for claim in (retractions or []) if isinstance(claim, dict)}
     effective_claims = [] if mode == "generate" else [claim for claim in existing_claims if _claim_key(claim) not in retraction_keys]
     seen_claims = {_claim_key(claim) for claim in effective_claims}
@@ -1996,9 +2876,6 @@ async def _wiki_refine_page(
         if key not in seen_claims:
             seen_claims.add(key)
             effective_claims.append(claim)
-    # Claims are the authoritative provenance after applying retractions.  Do
-    # not seed these fields from the old page: doing so keeps deleted or moved
-    # documents attached to the page forever.
     doc_ids: list[str] = []
     source_chunk_ids: set[str] = set()
     for claim in effective_claims:
@@ -2018,9 +2895,7 @@ async def _wiki_refine_page(
             if did and did not in doc_ids:
                 doc_ids.append(did)
 
-    # Mode B embeds the generated page subject for subsequent routing. A
-    # centroid of member vectors favors lexical similarity and loses thematic
-    # relations (for example a company and a technology it develops).
+    # 步骤10: 为生成的页面计算特征向量嵌入与分词
     from rag.nlp import rag_tokenizer
 
     if page_embedding is None:
@@ -2039,11 +2914,11 @@ async def _wiki_refine_page(
         embeddings, _ = await thread_pool_exec(embd_mdl.encode, [embedding_text])
         page_embedding = embeddings[0]
 
-    # Derive vector dimension from the embedding shape
     emb_arr = np.asarray(page_embedding)
     vec_dim = int(emb_arr.shape[0]) if emb_arr.ndim >= 1 and emb_arr.shape[0] else 768
     content_ltks = rag_tokenizer.tokenize(content)
 
+    # 步骤11: 组装待持久化的 wiki_page 文档字典
     page = {
         "id": _stable_row_id(WIKI_PAGE_COMPILE_KWD, kb_id, page_id),
         "slug_kwd": page_id,
@@ -2064,13 +2939,11 @@ async def _wiki_refine_page(
         "content_ltks": content_ltks,
         "content_sm_ltks": rag_tokenizer.fine_grained_tokenize(content_ltks),
     }
-    # Insert vector (adds q_{dim}_vec field)
     vec_col = f"q_{vec_dim}_vec"
     page[vec_col] = page_embedding.tolist() if hasattr(page_embedding, "tolist") else page_embedding
 
-    # Persist
+    # 步骤12: 写入底层的文档数据库（执行更新或插入）
     index = search.index_name(tenant_id)
-
     existing_entry = await thread_pool_exec(
         settings.docStoreConn.search,
         ["slug_kwd"],
@@ -2099,10 +2972,7 @@ async def _wiki_refine_page(
             kb_id,
         )
 
-    # Keep generated pages in the same version history as manual edits.  The
-    # incremental compiler is the normal Wiki path, so without this record the
-    # first generated page (and subsequent generated revisions) are invisible
-    # to the commits API.
+    # 步骤13: 在版本历史系统 FileCommitService 中登记该次页面的更新/新建提交记录
     from api.db.services.file_commit_service import FileCommitService
 
     content_before = ""
@@ -2124,20 +2994,33 @@ async def _wiki_refine_page(
     except Exception:
         logging.exception("wiki: generated page version record failed for page=%s", page_id)
 
+    # 输出示例: {"id": "...", "slug_kwd": "concept/deep-learning", "title_kwd": "深度学习"}
     return page
 
 
 def _build_source_chunks_block(source_chunks: list[dict], max_budget: int = WIKI_SOURCE_BUDGET_CHARS) -> str:
-    """Render the verbatim source-chunk block for the writer prompt.
+    """将分块字典列表渲染为送入大模型提示词的逐字来源证据上下文文本块 —— 证据分块提示词渲染工。
 
-    Chunks carrying verbatim text (``_verbatim=True``) are labelled clearly so
-    the writer treats them as ground truth; the whole block is capped at
-    ``max_budget`` characters. Missing/empty chunks are dropped.
+    参数:
+        source_chunks: 来源证据分块字典列表。
+            长相示例:
+            [
+                {"id": "chk_01", "text": "深度学习是机器学习分支...", "_verbatim": True},
+                {"id": "chk_02", "text": "卷积神经网络是关键模型...", "_verbatim": False}
+            ]
+        max_budget: 最大字符预算限制，默认为 WIKI_SOURCE_BUDGET_CHARS (32768)。
+            示例: 32768
+
+    返回值:
+        格式化拼接后的多行分块原文文本块。
+        长相示例:
+        "[SOURCE chk_01]\n深度学习是机器学习分支...\n\n[CHUNK chk_02]\n卷积神经网络是关键模型..."
     """
     if not source_chunks:
         return ""
     parts: list[str] = []
     total = 0
+    # 步骤1: 遍历分块，根据 _verbatim 标记分别渲染为 [SOURCE {cid}] 或 [CHUNK {cid}]
     for c in source_chunks:
         cid = c.get("id") or c.get("chunk_id")
         text = c.get("content_with_weight") or c.get("text") or ""
@@ -2147,12 +3030,14 @@ def _build_source_chunks_block(source_chunks: list[dict], max_budget: int = WIKI
             block = f"[SOURCE {cid}]\n{text}"
         else:
             block = f"[CHUNK {cid}]\n{text}"
+        # 步骤2: 检查字符预算限制，超出则停止累加并中断循环
         if total + len(block) + 2 > max_budget:
             break
         parts.append(block)
         total += len(block) + 2
     if not parts:
         return ""
+    # 步骤3: 若达到预算上限，追加预算截断提示
     if total >= max_budget:
         parts.append("[…further source chunks omitted to fit context budget…]")
     return "\n\n".join(parts)
@@ -2168,11 +3053,34 @@ def _build_mode_a_generate_prompt(
     topic_candidates: list[str] | None = None,
     member_evidence: list[dict] | None = None,
 ) -> str:
+    """组装模式 A 下全新概念维基页面生成（generate）所需的大模型用户提示词 —— 新建页面提示词构建工。
+
+    参数:
+        page_id: 页面 slug 标识。
+            示例: "concept/deep-learning"
+        page_title: 页面标题。
+            示例: "深度学习"
+        claims: 声明字典列表。
+            长相示例: [{"statement": "深度学习模拟神经元网络"}]
+        source_chunks: 来源证据分块列表。
+        available_pages: 可用的内部页面列表。
+            长相示例: ["concept/ai", "concept/ml"]
+        contextual_hints: 关联上下文提示文本。
+        topic_candidates: 候选主题列表（可选）。
+            长相示例: ["计算机科学", "人工智能"]
+        member_evidence: 聚合成员详细证据（可选）。
+
+    返回值:
+        Markdown 格式的用户提示词全文字符串。
+        长相示例:
+        "## Concept Page Identity\n- Page ID: concept/deep-learning\n- Title: 深度学习\n\n## Source Chunks...\n[SOURCE chk_01]\n深度学习是..."
+    """
+    # 步骤1: 渲染来源分块文本块与声明清单
     chunks_text = _build_source_chunks_block(source_chunks)
     claims_text = "\n".join(f"- {c.get('statement', c.get('text', ''))}" for c in claims) if claims else "(no claims)"
-
     member_text = _build_member_evidence_block(member_evidence)
 
+    # 步骤2: 组装多部分构成的 Markdown 用户提示词并返回
     return f"""## Concept Page Identity
 - Page ID: {page_id}
 - Title: {page_title}
@@ -2210,6 +3118,33 @@ def _build_mode_a_modify_prompt(
     force_full: bool = False,
     member_evidence: list[dict] | None = None,
 ) -> str:
+    """组装模式 A 下页面增量修改（modify）或全量重写（re-synthesize）所需的大模型用户提示词 —— 页面编辑提示词构建工。
+
+    参数:
+        page_id: 页面 slug 标识。
+            示例: "concept/deep-learning"
+        page_title: 页面标题。
+            示例: "深度学习"
+        existing_page: 现有页面记录字典（可选）。
+        additions: 新增声明列表（可选）。
+            长相示例: [{"statement": "新增成果声明"}]
+        retractions: 撤销声明列表（可选）。
+            长相示例: [{"statement": "过时失效声明"}]
+        claims: 全部声明列表。
+        source_chunks: 来源分块列表。
+        available_pages: 可引用的页面 ID 列表。
+        contextual_hints: 上下文提示文本。
+        topic_candidates: 候选主题列表（可选）。
+        force_full: 是否强制全量重写（布尔值，True 对应 re-synthesize，False 对应增量 modify）。
+            示例: False
+        member_evidence: 成员证据列表（可选）。
+
+    返回值:
+        Markdown 格式的用户提示词全文字符串。
+        长相示例:
+        "## Page Identity\n- Page ID: concept/deep-learning\n- Title: 深度学习\n\n## Current Page Content (modify this):\n# 深度学习\n深度学习是...\n\n## Newly Added Claims:\n- 新增成果声明"
+    """
+    # 步骤1: 提取已有正文与主题标签
     existing_content = existing_page.get("md_with_weight", "") if existing_page else ""
     existing_topic = existing_page.get("topic_kwd", "") if existing_page else ""
     if isinstance(existing_topic, (list, tuple)):
@@ -2217,6 +3152,7 @@ def _build_mode_a_modify_prompt(
     topic_block = chr(10).join(f"- {topic}" for topic in (topic_candidates or [])[:WIKI_PAGE_TOPIC_CANDIDATE_LIMIT])
     member_text = _build_member_evidence_block(member_evidence)
 
+    # 步骤2: 若为增量修改模式（force_full=False），突出展示新增与撤回声明
     if not force_full:
         additions_text = "\n".join(f"- {c.get('statement', c.get('text', ''))}" for c in (additions or [])) if additions else "(none)"
         retractions_text = "\n".join(f"- {c.get('statement', c.get('text', ''))}" for c in (retractions or [])) if retractions else "(none)"
@@ -2253,7 +3189,7 @@ def _build_mode_a_modify_prompt(
 {contextual_hints}
 """
     else:
-        # Full re-synthesis: all claims + all source chunks (larger budget)
+        # 步骤3: 若为全量重新综合模式（force_full=True），使用放大后的分块预算（120,000字符）与全量声明
         chunks_text = _build_source_chunks_block(source_chunks, max_budget=120_000)
         claims_text = "\n".join(f"- {c.get('statement', c.get('text', ''))}" for c in claims)
 
@@ -2284,10 +3220,28 @@ def _build_mode_a_modify_prompt(
 
 
 def _build_member_evidence_block(member_evidence: list[dict] | None) -> str:
-    """Render per-member evidence so grouped pages cannot silently omit members."""
+    """将聚合页面的各成员实体证据渲染为独立小节，确保多实体归并时每个成员均被大模型充分覆盖 —— 成员证据分块渲染工。
+
+    参数:
+        member_evidence: 各成员实体的证据字典列表（可选）。
+            长相示例:
+            [
+                {
+                    "name": "成员实体A",
+                    "claims": [{"statement": "实体A的描述陈述"}],
+                    "source_chunk_ids": ["chk_01", "chk_02"]
+                }
+            ]
+
+    返回值:
+        Markdown 格式的成员分块说明文本。
+        长相示例:
+        "### Member: 成员实体A\nClaims:\n- 实体A的描述陈述\nSource chunk IDs: chk_01, chk_02"
+    """
     if not member_evidence:
         return ""
     blocks: list[str] = []
+    # 步骤1: 遍历每个成员，提取其主名称、专属声明列表与溯源分块 ID
     for member in member_evidence:
         name = str(member.get("name") or "").strip()
         if not name:
@@ -2298,11 +3252,12 @@ def _build_member_evidence_block(member_evidence: list[dict] | None) -> str:
             or "(no extracted claims; use the member's source evidence)"
         )
         chunk_ids = ", ".join(str(cid) for cid in member.get("source_chunk_ids") or [] if cid)
+        # 步骤2: 组装该成员的说明块
         blocks.append(f"### Member: {name}\nClaims:\n{claims_text}\nSource chunk IDs: {chunk_ids or '(none)'}")
     return "\n\n".join(blocks)
 
 
-# System prompts for Mode A
+# 模式 A 系统提示词定义（保留原逻辑规则与约束指令）
 
 _WIKI_MODE_A_GENERATE_SYSTEM = """You are a wiki COMPILER. Generate a new wiki page for the given concept using the provided source chunks and extracted claims.
 
@@ -2390,8 +3345,26 @@ def _wiki_build_contextual_hints(
     existing_page: dict | None,
     all_relations: dict[str, list[dict]],
 ) -> str:
-    """Build contextual hints prompt block from related_pages."""
+    """从已有页面元数据及全局关系表中提取与本页面相关的实体和概念，组装为上下文提示小节 —— 页面关联提示词构建工。
+
+    参数:
+        page_id: 页面 slug 标识。
+            示例: "concept/deep-learning"
+        existing_page: 现有页面数据记录字典（可选）。
+            长相示例: {"related_kb_pages_kwd": "[\"concept/machine-learning\"]"}
+        all_relations: 全局实体名称到关系字典列表的映射表。
+            长相示例:
+            {
+                "深度学习": [{"entity_name": "机器学习", "type": "subfield"}]
+            }
+
+    返回值:
+        格式化后的 Markdown 关联实体上下文提示词文本。
+        长相示例:
+        "## Context: Related Entities & Concepts\nReference them in the opening paragraph and relevant sections:\n- [[机器学习]] — subfield"
+    """
     related = []
+    # 步骤1: 优先从 existing_page 的 related_kb_pages_kwd 字段解析
     if existing_page:
         rp = existing_page.get("related_kb_pages_kwd")
         if rp:
@@ -2403,12 +3376,16 @@ def _wiki_build_contextual_hints(
                     related = [rp]
             elif isinstance(rp, list):
                 related = rp
+    # 步骤2: 若无显式关联字段，从全局关系字典中提取实体关联
     if not related:
         for name in _as_str_list(existing_page.get("entity_names_kwd") if existing_page else None):
             related.extend(all_relations.get(name, []))
     if not related:
         return ""
 
+    # 步骤3: 格式化为 Markdown 清单（截取最多前 10 项）
+    # 单项输入示例: {"entity_name": "机器学习", "type": "subfield"}
+    # 输出示例行: "- [[机器学习]] — subfield"
     lines = ["## Context: Related Entities & Concepts", "Reference them in the opening paragraph and relevant sections:"]
     for r in related[:10]:
         if isinstance(r, dict):
@@ -2423,13 +3400,34 @@ def _wiki_build_contextual_hints(
     return "\n".join(lines)
 
 
-# ----- Mode B Page Router (embedding candidates + LLM decision) ------------
+# ----- 模式 B 页面路由器（向量候选召回 + 大模型语义决断） ------------------
 
 
 def _wiki_entity_planning_text(entity: dict, *, max_claims: int = 3) -> str:
+    """将实体的名称、别名、描述、精选陈述及关系三元组拼装为供大模型规划聚类的紧凑单行文本 —— 实体规划描述构建工。
+
+    参数:
+        entity: 包含实体元数据的字典。
+            长相示例:
+            {
+                "entity_name": "苹果公司",
+                "aliases": ["Apple", "苹果电脑"],
+                "definition_excerpt": "美国跨国高科技公司",
+                "claims": [{"statement": "苹果公司发布了 iPhone 15 手机。"}],
+                "relations": [{"counterpart": "iPhone", "type": "produces"}]
+            }
+        max_claims: 最多包含的声明陈述条数，默认为 3。
+            示例: 3
+
+    返回值:
+        单行紧凑键值描述字符串。
+        示例: "name=苹果公司; aliases=Apple, 苹果电脑; description=美国跨国高科技公司; evidence=苹果公司发布了 iPhone 15 手机。; relations=produces: iPhone"
+    """
+    # 步骤1: 提取实体名称、别名及定义摘录
     name = str(entity.get("entity_name") or entity.get("name") or entity.get("term") or "").strip()
     aliases = ", ".join(_as_str_list(entity.get("aliases"))[:5])
     description = str(entity.get("definition_excerpt") or entity.get("description") or "").strip()
+    # 步骤2: 提取最多 max_claims 条陈述声明
     claims = []
     for claim in (entity.get("claims") or [])[:max_claims]:
         if isinstance(claim, dict):
@@ -2443,6 +3441,7 @@ def _wiki_entity_planning_text(entity: dict, *, max_claims: int = 3) -> str:
         parts.append(f"description={description}")
     if claims:
         parts.append(f"evidence={' | '.join(claims)}")
+    # 步骤3: 提取最多 8 条图谱关联关系
     relations = []
     for relation in (entity.get("relations") or [])[:8]:
         if not isinstance(relation, dict):
@@ -2453,6 +3452,7 @@ def _wiki_entity_planning_text(entity: dict, *, max_claims: int = 3) -> str:
             relations.append(f"{relation_type}: {counterpart}")
     if relations:
         parts.append(f"relations={' | '.join(relations)}")
+    # 输出示例: "name=苹果公司; aliases=Apple; ..."
     return "; ".join(parts)
 
 
@@ -2460,9 +3460,29 @@ async def _wiki_llm_partition_candidate(
     entities: list[dict],
     chat_mdl,
 ) -> list[list[dict]] | None:
-    """Ask the LLM to partition one embedding-generated candidate community."""
+    """请求大语言模型对单个通过向量粗聚类聚合的候选社区进行语义细分切分 —— 实体社区大模型细分工。
+
+    参数:
+        entities: 属于同一粗聚类社区的实体字典列表。
+            长相示例:
+            [
+                {"entity_name": "iPhone", "definition_excerpt": "智能手机"},
+                {"entity_name": "iPad", "definition_excerpt": "平板电脑"},
+                {"entity_name": "特斯拉Model 3", "definition_excerpt": "电动汽车"}
+            ]
+        chat_mdl: 大语言模型客户端实例。
+
+    返回值:
+        经过大模型细分归并后的实体分组二维列表；若解析失败或下标不合规则返回 None。
+        长相示例:
+        [
+            [{"entity_name": "iPhone", ...}, {"entity_name": "iPad", ...}],
+            [{"entity_name": "特斯拉Model 3", ...}]
+        ]
+    """
     if len(entities) <= 1:
         return [entities]
+    # 步骤1: 组装带编号的实体规划清单
     numbered = "\n".join(f"{idx}: {_wiki_entity_planning_text(entity)}" for idx, entity in enumerate(entities))
     prompt = f"""Group the following knowledge-base entities into coherent encyclopedia pages.
 Each page must have one clear subject. Group entities only when a reader would naturally expect them to be explained on the same page. Do not use entity types as grouping rules because types are user-defined.
@@ -2472,11 +3492,13 @@ Every ID from 0 through {len(entities) - 1} must appear exactly once. A group ma
 
 Entities:
 {numbered}"""
+    # 步骤2: 调用大模型并提取返回的嵌套数组 JSON
     response = await _chat_mdl_ask(chat_mdl, "You plan concise, semantically coherent encyclopedia pages.", prompt)
     raw_groups = _wiki_parse_json_array(response)
     if raw_groups is None:
         return None
 
+    # 步骤3: 校验下标合法性（每个下标恰好出现一次且不超出实体范围）
     seen: set[int] = set()
     groups: list[list[dict]] = []
     for raw_group in raw_groups:
@@ -2501,14 +3523,34 @@ async def _wiki_llm_group_entities(
     semaphore: asyncio.Semaphore | None = None,
     kb_id: str = "",
 ) -> list[list[dict]]:
-    """Use embeddings for candidate communities and the LLM for final groups."""
+    """先利用向量嵌入进行社区粗划分，再并发调用大模型对各个粗社区进行语义精准聚类成组 —— 语义粗召回与精分组工。
+
+    参数:
+        entities: 待聚类分组的实体字典列表。
+            长相示例: [{"entity_name": "深度学习"}, {"entity_name": "机器学习"}]
+        embeddings: 对应的实体向量列表。
+        chat_mdl: 大模型客户端实例。
+        semaphore: 并发请求限流信号量（可选）。
+        kb_id: 知识库标识字符串（可选）。
+            示例: "kb_999"
+
+    返回值:
+        分组后的二维实体字典列表。
+        长相示例:
+        [
+            [{"entity_name": "深度学习"}, {"entity_name": "机器学习"}],
+            [{"entity_name": "量子力学"}]
+        ]
+    """
     if len(entities) <= 1:
         _wiki_log_stats("PLAN", "group_summary", kb_id=kb_id, before=len(entities), after=len(entities), reduction_count=0, merged_group_count=0)
         return [entities]
+    # 步骤1: 根据目标社区容量，使用球面 K-Means 初步聚合为若干候选社区
     candidate_count = max(1, int(np.ceil(len(entities) / WIKI_GROUP_LLM_CANDIDATE_SIZE)))
     candidates = _wiki_cluster_entities(entities, embeddings, target_count=candidate_count)
     semaphore = semaphore or asyncio.Semaphore(WIKI_GROUP_LLM_MAX_CONCURRENT)
 
+    # 步骤2: 针对单个社区进行大模型细分分组的闭包任务
     async def _partition(candidate: list[dict]) -> list[list[dict]]:
         groups = None
         for attempt in range(2):
@@ -2528,11 +3570,11 @@ async def _wiki_llm_group_entities(
                 "PLAN", "llm_group_candidate", kb_id=kb_id, before=len(candidate), after=len(groups), reduction_count=sum(len(group) - 1 for group in groups), merged_group_count=len(merged_groups)
             )
             return groups
-        # Embeddings only form the retrieval community. They must not decide
-        # the final page boundary when the LLM is unavailable or invalid.
+        # 若大模型两次尝试均失败，降级为各实体独立成单项组，严禁用纯向量切分强行替代大模型决断
         _wiki_log_stats("PLAN", "llm_group_unresolved", kb_id=kb_id, before=len(candidate), after=len(candidate), retry_count=2)
         return [[entity] for entity in candidate]
 
+    # 步骤3: 并发执行所有候选社区的大模型分组
     grouped = await asyncio.gather(*(_partition(candidate) for candidate in candidates))
     groups = [group for candidate_groups in grouped for group in candidate_groups]
     _wiki_log_stats(
@@ -2551,11 +3593,28 @@ async def _wiki_llm_route_batches(
     route_items: list[tuple[dict, list[dict]]],
     chat_mdl,
 ) -> dict[int, str]:
-    """Choose an existing page or NEW for each entity in bounded batches."""
+    """分批次并发请求大模型进行实体路由决策，选择归入现有维基页面或新建页面 —— 实体归属路由决策工。
+
+    参数:
+        route_items: 路由待决条目列表，每项为元组 (实体字典, 候选页面字典列表)。
+            长相示例:
+            [
+                (
+                    {"name": "iPad Pro"},
+                    [{"page_id": "concept/apple", "title": "苹果公司", "score": 0.88}]
+                )
+            ]
+        chat_mdl: 大模型客户端实例。
+
+    返回值:
+        条目序号映射到决策页面 ID 或 "NEW" 的映射字典。
+        长相示例: {0: "concept/apple", 1: "NEW"}
+    """
     if not route_items:
         return {}
     semaphore = asyncio.Semaphore(WIKI_GROUP_LLM_MAX_CONCURRENT)
 
+    # 步骤1: 针对单个切片批次（最多 12 项）向大模型发起路由请求
     async def _route_batch(batch: list[tuple[int, dict, list[dict]]]) -> dict[int, str]:
         lines = []
         allowed: dict[int, set[str]] = {}
@@ -2602,6 +3661,7 @@ Items:
                 result[item_id] = page_id
         return result
 
+    # 步骤2: 为全部条目附加自增序号，并切分为固定尺寸的批次执行
     indexed_items = [(item_id, entity, candidates) for item_id, (entity, candidates) in enumerate(route_items)]
 
     async def _run(items: list[tuple[int, dict, list[dict]]]) -> dict[int, str]:
@@ -2610,18 +3670,42 @@ Items:
         return {item_id: page_id for result in results for item_id, page_id in result.items()}
 
     decisions = await _run(indexed_items)
+    # 步骤3: 补漏重试未得到有效决策的项
     missing = [item for item in indexed_items if item[0] not in decisions]
     if missing:
-        # Retry only missing/invalid items. A malformed item in one batch must
-        # not make correctly routed entities pay for a full-batch retry.
         decisions.update(await _run(missing))
     return decisions
 
 
 def _wiki_route_page_candidate(page_id: str, page: dict, *, score: float = 0.0) -> dict:
+    """将已存储的维基页面记录转换为路由决策所需的标准化候选页规格字典 —— 路由候选页面组装工。
+
+    参数:
+        page_id: 页面 slug 标识。
+            示例: "concept/apple"
+        page: 页面已有数据字典。
+            长相示例: {"title_kwd": "苹果公司", "summary_with_weight": "跨国科技巨头..."}
+        score: 向量召回或匹配得分，默认为 0.0。
+            示例: 0.885
+
+    返回值:
+        候选页规格字典。
+        长相示例:
+        {
+            "score": 0.885,
+            "page_id": "concept/apple",
+            "title": "苹果公司",
+            "summary": "跨国科技巨头...",
+            "members": ["苹果", "iPhone"],
+            "signals": [],
+            "cooccurrence_count": 0
+        }
+    """
+    # 步骤1: 规范化标题标量
     title = page.get("title_kwd", "")
     if isinstance(title, (list, tuple)):
         title = title[0] if title else ""
+    # 步骤2: 组装标准候选格式并返回
     return {
         "score": float(score or 0.0),
         "page_id": page_id,
@@ -2642,9 +3726,35 @@ def _wiki_expand_route_candidates(
     *,
     include_candidate_neighbors: bool = False,
 ) -> list[dict]:
-    """Merge semantic retrieval with authoritative ownership and graph evidence."""
+    """结合向量检索、已有页面从属、图谱关系与共现分块等多源信号扩充并重排候选路由页面 —— 路由候选多源扩充工。
+
+    参数:
+        entity: 待路由的目标实体字典。
+        dense_candidates: 稠密向量检索初筛出的候选页面列表。
+        existing_pages: 知识库已有全部页面字典。
+        entity_pages: 实体名归一化键映射到页面 ID 集合。
+        chunk_pages: 分块 ID 映射到页面 ID 集合。
+        include_candidate_neighbors: 是否扩充候选页面的出链与邻居节点（布尔值）。
+            示例: False
+
+    返回值:
+        加权综合排序后的 Top-12 候选页面字典列表。
+        长相示例:
+        [
+            {
+                "score": 0.912,
+                "page_id": "concept/apple",
+                "title": "苹果公司",
+                "summary": "跨国科技巨头...",
+                "members": ["苹果", "iPhone"],
+                "signals": ["current_owner", "embedding"],
+                "cooccurrence_count": 3
+            }
+        ]
+    """
     candidates = {candidate["page_id"]: dict(candidate) for candidate in dense_candidates if candidate.get("page_id") in existing_pages}
 
+    # 步骤1: 内部辅助闭包，为候选页追加多源信号标签
     def _add(page_id: str, signal: str, *, cooccurrence_count: int = 0) -> None:
         page = existing_pages.get(page_id)
         if not page:
@@ -2655,10 +3765,12 @@ def _wiki_expand_route_candidates(
         candidate["signals"] = sorted(signals)
         candidate["cooccurrence_count"] = max(int(candidate.get("cooccurrence_count") or 0), cooccurrence_count)
 
+    # 步骤2: 检查实体原有的归属页面，标记为 current_owner
     entity_name = str(entity.get("entity_name") or entity.get("term") or "").strip()
     for page_id in entity_pages.get(_normalize_key(entity_name), set()):
         _add(page_id, "current_owner")
 
+    # 步骤3: 检查实体的语义关系所指向的实体所属页面，标记为 relation
     for relation in entity.get("relations") or []:
         if not isinstance(relation, dict):
             continue
@@ -2666,6 +3778,7 @@ def _wiki_expand_route_candidates(
         for page_id in entity_pages.get(_normalize_key(counterpart), set()):
             _add(page_id, "relation")
 
+    # 步骤4: 统计分块共现次数，标记为 cooccurrence
     cooccurrence: dict[str, int] = {}
     for chunk_id in _as_str_list(entity.get("source_chunk_ids")):
         for page_id in chunk_pages.get(chunk_id, set()):
@@ -2673,6 +3786,7 @@ def _wiki_expand_route_candidates(
     for page_id, count in cooccurrence.items():
         _add(page_id, "cooccurrence", cooccurrence_count=count)
 
+    # 步骤5: 若开启了邻居扩充，添加候选页面的出链邻居
     if include_candidate_neighbors:
         initial_page_ids = list(candidates)
         for page_id in initial_page_ids:
@@ -2684,6 +3798,7 @@ def _wiki_expand_route_candidates(
                 for neighbor_id in entity_pages.get(_normalize_key(neighbor_ref), set()):
                     _add(neighbor_id, "candidate_neighbor")
 
+    # 步骤6: 根据多源信号优先级、共现频次及向量得分排序截断
     priority = {"current_owner": 0, "relation": 1, "cooccurrence": 2, "embedding": 3, "candidate_neighbor": 4}
 
     def _rank(candidate: dict) -> tuple:
@@ -2701,20 +3816,32 @@ async def _wiki_page_router(
     kb_id: str,
     existing_pages: dict[str, dict] | None = None,
 ) -> dict[str, list[dict]]:
-    """Route entities using KNN candidates followed by an LLM decision.
+    """模式 B 核心路由中枢：利用向量 KNN 粗筛召回与大模型语义决断将增量实体路由到已有页面或聚类新建页面 —— 增量实体路由中枢。
 
-    Returns: {page_id: [entity_deltas]}
-    - "_new_{page_id}" → new page to create
-    - existing page_id → entities assigned to that page
+    参数:
+        affected_entities: 本次增量变更中涉及的实体字典列表。
+            长相示例: [{"entity_name": "Vision Pro", "definition_excerpt": "空间计算设备"}]
+        chat_mdl: 大语言模型客户端实例。
+        embd_mdl: 文本向量嵌入模型实例。
+        tenant_id: 租户标识字符串。
+            示例: "tenant_001"
+        kb_id: 知识库标识字符串。
+            示例: "kb_999"
+        existing_pages: 已存在的页面记录字典（可选）。
 
-    ``existing_pages`` is supplied by Mode B from its already-loaded page set.
-    An explicitly empty dict means this is a first build, so page-index
-    candidate retrieval can be skipped and entities can go straight to grouping.
+    返回值:
+        目标页面 ID 映射到分配给该页面的实体增量列表。
+        长相示例:
+        {
+            "concept/apple": [{"entity_name": "Vision Pro", ...}],
+            "_new_entity/quantum-chip": [{"entity_name": "量子芯片", ...}]
+        }
     """
     from common.misc_utils import thread_pool_exec
     from rag.nlp import search
     from common.doc_store.doc_store_base import OrderByExpr
 
+    # 步骤1: 批量向量化全部受影响的实体
     query_texts = [_entity_to_query_text(e) for e in affected_entities]
     embeddings, _ = await thread_pool_exec(embd_mdl.encode, query_texts)
     for entity, vec in zip(affected_entities, embeddings, strict=False):
@@ -2736,15 +3863,14 @@ async def _wiki_page_router(
         for chunk_id in _as_str_list(page.get("source_chunk_ids")):
             chunk_pages.setdefault(chunk_id, set()).add(page_id)
 
+    # 步骤2: 若现有知识库无任何已建页面（首次构建），跳过向量检索，直接作为孤儿实体进入聚类
     if not existing_pages:
-        # On a first build there are no pages that can accept a routed entity.
-        # Querying the page index once per entity only produces orphans, so go
-        # directly to clustering and reuse the embeddings already computed.
         orphans = list(affected_entities)
         _wiki_log_stats("ROUTE", "summary", affected=len(affected_entities), llm_existing=0, llm_new=0, llm_missing=0, new_confirmed_existing=0, final_new=len(orphans))
     else:
         router_sem = asyncio.Semaphore(PAGE_ROUTER_KNN_CONCURRENT)
 
+        # 步骤3: 对各实体并发执行 KNN 稠密向量检索，寻找匹配度高于 0.5 的 Top-5 页面
         async def _search_page(entity: dict, vec) -> tuple[dict, dict]:
             async with router_sem:
                 match_expr = MatchDenseExpr(
@@ -2789,12 +3915,14 @@ async def _wiki_page_router(
                     candidate = _wiki_route_page_candidate(page_id, existing_pages.get(page_id, row), score=score)
                     candidate["signals"] = ["embedding"]
                     candidates.append(candidate)
+            # 融合已有归属与图谱共现信号
             candidates = _wiki_expand_route_candidates(entity, candidates, existing_pages, entity_pages, chunk_pages)
             if not candidates:
                 orphans.append(entity)
                 continue
             route_items.append((entity, candidates))
 
+        # 步骤4: 第一轮大模型路由判定
         try:
             decisions = await _wiki_llm_route_batches(route_items, chat_mdl)
         except Exception:
@@ -2811,6 +3939,7 @@ async def _wiki_page_router(
                 assignments.setdefault(page_id, []).append(entity)
                 continue
             if page_id == "NEW":
+                # 步骤4.1: 对大模型判断为 NEW 的条目，扩充邻居节点后发起第二轮二次确认
                 expanded = _wiki_expand_route_candidates(
                     entity,
                     candidates,
@@ -2818,18 +3947,6 @@ async def _wiki_page_router(
                     entity_pages,
                     chunk_pages,
                     include_candidate_neighbors=True,
-                )
-                original_ids = {candidate["page_id"] for candidate in candidates}
-                added_ids = [candidate["page_id"] for candidate in expanded if candidate["page_id"] not in original_ids]
-                _wiki_log_stats(
-                    "ROUTE",
-                    "new_confirmation_candidates",
-                    entity=str(entity.get("entity_name") or entity.get("term") or ""),
-                    initial_candidate_count=len(candidates),
-                    added_candidate_count=len(added_ids),
-                    added_to_candidates=bool(added_ids),
-                    added_page_ids=added_ids,
-                    confirmation_candidate_count=len(expanded),
                 )
                 second_pass_items.append((item_id, entity, expanded))
                 continue
@@ -2839,6 +3956,7 @@ async def _wiki_page_router(
             else:
                 orphans.append(entity)
 
+        # 步骤4.2: 执行第二轮确认
         if second_pass_items:
             confirmation_items = [(entity, candidates) for _, entity, candidates in second_pass_items]
             confirmations = await _wiki_llm_route_batches(confirmation_items, chat_mdl)
@@ -2864,9 +3982,7 @@ async def _wiki_page_router(
             final_new=len(orphans),
         )
 
-    # Orphans: cluster by similarity, create grouped pages
-    # A deletion that cannot be routed to an existing page must not create a
-    # new page merely so the downstream delete action can remove it again.
+    # 步骤5: 收集未被任何已有页面收录的孤儿实体（过滤掉删除动作），进行聚类并生成新建页面
     orphans = [entity for entity in orphans if entity.get("action") != "delete"]
     if orphans:
         orphan_embs = [embedding_by_entity_id[id(entity)] for entity in orphans]
@@ -2879,14 +3995,8 @@ async def _wiki_page_router(
             )
             cluster = [representative] + [entity for entity in cluster if entity is not representative]
             names = [e.get("entity_name") or e.get("term", "") for e in cluster]
-            # Mode B compiles EVERY entity/concept into a page. On a first build
-            # there are no existing pages, so every affected entity lands here as
-            # an orphan; do NOT gate page creation on a claim count or most pages
-            # (esp. claim-light concepts/entities) would never be created.
             if not names:
                 continue
-            # Mode B pages are semantic groups, not projections of a user-defined
-            # entity type. Keep one neutral page namespace for every cluster.
             base_page_id = _wiki_derive_page_id(names[0], prefix="entity")
             if not base_page_id:
                 continue
@@ -2906,21 +4016,33 @@ def _wiki_cluster_entities(
     embeddings: list,
     target_count: int | None = None,
 ) -> list[list[dict]]:
-    """Deterministic capacity-constrained spherical k-means.
+    """执行带有页面实体容量硬约束的确定性球面 K-Means 聚类算法 —— 容量受限球面KMeans聚类工。
 
-    Absolute cosine thresholds intentionally do not decide the number of pages:
-    their score distributions vary too much between embedding models.
-    ``target_count`` is a soft page-count target and defaults to roughly one
-    page per three entities, bounded to 8..60 for larger sets.
+    参数:
+        entities: 待聚类的实体元数据字典列表。
+            长相示例: [{"entity_name": "实体A"}, {"entity_name": "实体B"}]
+        embeddings: 各实体对应的浮点向量列表。
+        target_count: 期望聚类的目标中心数量（可选）。
+            示例: 4
+
+    返回值:
+        聚类后的实体二维分组列表。
+        长相示例:
+        [
+            [{"entity_name": "实体A"}, {"entity_name": "实体B"}],
+            [{"entity_name": "实体C"}]
+        ]
     """
     if len(entities) <= 1:
         return [entities]
 
+    # 步骤1: 向量矩阵转为 float32 并按行归一化
     matrix = np.asarray([np.asarray(e, dtype=np.float32) for e in embeddings], dtype=np.float32)
     if matrix.ndim != 2 or matrix.shape[0] != len(entities):
         raise ValueError("entity embeddings must be a two-dimensional matrix")
     matrix = _wiki_normalize_rows(matrix)
     n = len(entities)
+    # 步骤2: 计算目标聚类中心数量（默认每个页面约容纳 3 个实体）
     if target_count is None:
         if n <= PAGE_CLUSTER_MIN_PAGES:
             target_count = n
@@ -2932,9 +4054,7 @@ def _wiki_cluster_entities(
     evidence = [len(entity.get("claims") or []) for entity in entities]
     stable_order = sorted(range(n), key=lambda idx: (names[idx].casefold(), names[idx], idx))
 
-    # Deterministic farthest-first initialization. The most grounded entity is
-    # the first center; every later center is the point least represented by
-    # the centers already chosen.
+    # 步骤3: 最远优先（Farthest-First）确定性中心初始化
     first = min(range(n), key=lambda idx: (-evidence[idx], names[idx].casefold(), names[idx], idx))
     center_indices = [first]
     selected = {first}
@@ -2953,12 +4073,11 @@ def _wiki_cluster_entities(
     assignments = [0] * n
     hard_capacity = max(PAGE_CLUSTER_HARD_MAX_SIZE, int(np.ceil(n / target_count)))
 
+    # 步骤4: 迭代优化指派（最多 20 次迭代），严格受限于 hard_capacity 容量
     for _ in range(PAGE_CLUSTER_MAX_ITERATIONS):
         scores = matrix @ centroids.T
         sizes = [0] * target_count
         assignments = [-1] * n
-        # Place entities with a strong preference first, so capacity pressure
-        # moves ambiguous entities rather than a cluster's clearest members.
         ranked_entities = sorted(
             stable_order,
             key=lambda idx: (
@@ -2974,8 +4093,7 @@ def _wiki_cluster_entities(
             assignments[idx] = chosen
             sizes[chosen] += 1
 
-        # Empty clusters are repaired by moving the least well represented
-        # member from a cluster that can spare one.
+        # 步骤4.1: 修复空聚类
         for empty_cid in (cid for cid, size in enumerate(sizes) if size == 0):
             movable = [idx for idx in stable_order if sizes[assignments[idx]] > 1]
             if not movable:
@@ -2985,6 +4103,7 @@ def _wiki_cluster_entities(
             assignments[moved] = empty_cid
             sizes[empty_cid] = 1
 
+        # 步骤4.2: 重新计算并归一化中心向量
         new_centroids = []
         for cid in range(target_count):
             member_indices = [idx for idx, assigned in enumerate(assignments) if assigned == cid]
@@ -2998,6 +4117,7 @@ def _wiki_cluster_entities(
             break
         previous_assignments = list(assignments)
 
+    # 步骤5: 导出聚类结果列表并按首实体名称稳定排序
     clusters = []
     for cid in range(target_count):
         member_indices = [idx for idx in stable_order if assignments[idx] == cid]
@@ -3017,14 +4137,37 @@ async def _wiki_finalize(
     page_ids: list[str] | None = None,
     chunk_state: dict[str, dict] | None = None,
 ) -> None:
-    """Post-REFINE cleanup: dead wikilinks + cross-reference update.
+    """页面提炼后执行全库收尾清理、无效链接剥离与交叉引用互链更新 —— 维基页面全量收尾与拓扑织网工。
 
-    Always scans ALL wiki_page rows (page_ids is ignored — full scan).
-    Three wikilink types:
-    1. Valid page → keep [[]], update related_kb_pages_kwd
-    2. Entity reference (in canonical index) → remove [[]], keep plain text
-    3. Dead link → remove [[]], keep plain text
+    参数:
+        tenant_id: 租户唯一标识符。
+            示例: "tenant_001"
+        kb_id: 知识库唯一标识符。
+            示例: "kb_999"
+        embd_mdl: 文本嵌入模型实例对象。
+        page_ids: 待处理页面 ID 列表（可选；本函数始终执行全库扫描以确保互链拓扑全局闭环）。
+            示例: ["entity/曹操", "concept/官渡之战"]
+        chunk_state: 当前分块版本状态字典（可选）。
+            示例:
+            {
+                "chunk_001": {"doc_id": "doc_1", "version": 1}
+            }
+
+    返回值:
+        无返回值 (None)，直接批量就地更新知识库存储中的维基页面。
     """
+    # 步骤1: 检索全库已编译页面元数据及内容（始终全表扫描保证图谱边对称与拓扑闭环）
+    # 输出示例:
+    # {
+    #     "entity/曹操": {
+    #         "id": "row_1",
+    #         "title_kwd": "曹操",
+    #         "md_with_weight": "曹操参与了[[concept/官渡之战]]与[[刘备]]会盟...",
+    #         "outlinks_kwd": [],
+    #         "related_kb_pages_kwd": [],
+    #         "entity_names_kwd": ["曹操", "曹孟德"]
+    #     }
+    # }
     all_pages = await _search_existing_pages(
         tenant_id,
         kb_id,
@@ -3043,24 +4186,31 @@ async def _wiki_finalize(
 
     valid_ids = set(all_pages.keys())
 
-    # Load canonical entity names for entity reference detection (Mode A)
+    # 步骤2: 加载规范实体名称与别名集合（用于 Mode A 中将非页面的规范实体引用剥离为纯文本）
+    # canonical_names 示例: {"曹操", "曹孟德", "阿瞒", "刘备"}
     canonical_names = set()
     canonical_index = await _load_canonical_entities(tenant_id, kb_id)
     for cname in canonical_index:
         canonical_names.add(cname)
-        # Also add aliases
+        # 将别名也一同并入规范实体名称集合
         for alias in canonical_index[cname].get("aliases", []):
             canonical_names.add(alias)
 
     wikilink_re = re.compile(r"\[\[([^\]]+)\]\]")
     relation_map: dict[str, list[dict]] = {}
-    outlink_map: dict[str, list[str]] = {}  # pid → [valid target slugs]
-    dead_links: dict[str, list[str]] = {}  # pid → [dead links to remove]
+    outlink_map: dict[str, list[str]] = {}  # 页面 ID -> [目标页面 slug 列表]
+    dead_links: dict[str, list[str]] = {}  # 页面 ID -> [待剥离的无效死链列表]
     index = search.index_name(tenant_id)
 
-    # name → page slug map for AUTO-LINKING. Built from every page's plain name
-    # (slug suffix) + title, longest names first so multi-word / multi-char
-    # mentions are matched greedily before shorter substrings.
+    # 步骤3: 构建实体名称/页面标题到页面 ID 的反向映射字典（优先长词匹配，避免短子串抢占）
+    # name_slug 示例:
+    # {
+    #     "治世之能臣": "entity/曹操",
+    #     "曹孟德": "entity/曹操",
+    #     "曹操": "entity/曹操",
+    #     "官渡之战": "concept/官渡之战"
+    # }
+    # ordered_names 示例: ["治世之能臣", "官渡之战", "曹孟德", "曹操"]
     name_slug: dict[str, str] = {}
     for pid in all_pages:
         plain = pid.split("/")[-1] if "/" in pid else pid
@@ -3071,19 +4221,15 @@ async def _wiki_finalize(
             title = title[0] if title else ""
         if isinstance(title, str) and title and title != plain:
             name_slug[title] = pid
-        # Map every entity the page actually contains (incl. ones merged into a
-        # group page by Mode B's plan/grouping) to this page. Otherwise relation
-        # endpoints like "梁大伟" that were merged into another page won't match
-        # and most wiki pages stay unlinked.
+        # 映射页面实际包含的全部实体名称（包括通过模式 B 分组归并的成员实体）
         for en in _as_str_list(all_pages[pid].get("entity_names_kwd")):
             if en and en != plain:
                 name_slug[en] = pid
     ordered_names = sorted(name_slug.keys(), key=lambda n: (-len(n), n))
 
-    # RELATION-BASED LINKING: use the semantic (from, to) edges extracted during
-    # MAP to connect pages. A page-to-page edge is created whenever both
-    # endpoints resolve to compiled wiki pages. This is the primary source of
-    # graph connections — far more reliable than prose [[wikilinks]].
+    # 步骤4: 基于 MAP 阶段提取的语义关系三元组加载页面间边关系（拓扑连接最可靠的语义来源）
+    # map_relations 示例: [{"from": "曹操", "to": "刘备", "type": "rival"}]
+    # relation_edges 示例: {"entity/曹操": {"entity/刘备"}, "entity/刘备": {"entity/曹操"}}
     from api.db.services.document_service import DocumentService
 
     disabled_doc_ids = await thread_pool_exec(DocumentService.get_disabled_doc_ids_by_kb_id, kb_id)
@@ -3093,7 +4239,7 @@ async def _wiki_finalize(
         excluded_doc_ids=disabled_doc_ids,
         chunk_state=chunk_state,
     )
-    relation_edges: dict[str, set[str]] = {}  # pid → {target slug}
+    relation_edges: dict[str, set[str]] = {}  # 页面 ID -> {目标页面 slug 集合}
     if map_relations:
         for rel in map_relations:
             from_pg = name_slug.get(rel["from"])
@@ -3102,20 +4248,19 @@ async def _wiki_finalize(
                 relation_edges.setdefault(from_pg, set()).add(to_pg)
                 relation_edges.setdefault(to_pg, set()).add(from_pg)
 
+    # 步骤5: 逐页处理正文内部维基链接 `[[...]]`，执行有效链接保留、规范实体降级与模糊死链重定向
     for pid, page in all_pages.items():
         content = page.get("md_with_weight", "")
         original = content
 
         for match in wikilink_re.finditer(content):
             link = match.group(1).strip()
-            # Keep an explicit display label when a page contains several
-            # merged entities.  The page slug identifies the destination;
-            # it must not replace the entity name shown in the prose.
+            # 拆分链接目标与显示标签（如 [[entity/曹操|魏武帝]] -> target='entity/曹操', display_text='魏武帝'）
             target, separator, display_text = link.partition("|")
             target = target.strip()
             display_text = display_text.strip() if separator else ""
             if target in valid_ids and target != pid:
-                # Valid wikilink → record for cross-reference + outlink
+                # 步骤5.1: 有效链接 -> 记录至关联关系表和出链字典
                 relation_map.setdefault(pid, []).append(
                     {
                         "entity_name": display_text or (target.split("/")[-1] if "/" in target else target),
@@ -3124,13 +4269,11 @@ async def _wiki_finalize(
                 )
                 outlink_map.setdefault(pid, []).append(target)
             elif target in canonical_names:
-                # Entity reference (Mode A): remove [[]] keep plain text
+                # 步骤5.2: 模式 A 规范实体引用（未独立建页） -> 去除 [[]] 保留纯文本
                 replacement = display_text or target
                 content = content.replace(match.group(0), replacement, 1)
             else:
-                # Dead link — try WeKnora-style fuzzy resolution to a similar
-                # existing page before giving up. If a close slug exists, retarget
-                # the link (cross-link survives); otherwise degrade to plain text.
+                # 步骤5.3: 死链 -> 尝试类似 WeKnora 风格的模糊重定向，重定向失败则退化为纯文本
                 resolved = _wiki_resolve_dead_slug(target, valid_ids, name_slug)
                 if resolved:
                     resolved_link = f"[[{resolved}|{display_text}]]" if display_text else f"[[{resolved}]]"
@@ -3142,12 +4285,9 @@ async def _wiki_finalize(
                     content = content.replace(match.group(0), display_text or target, 1)
                     dead_links.setdefault(pid, []).append(target)
 
-        # AUTO-LINK: guarantee cross-page connections even when the LLM omits
-        # [[...]]. Scan for standalone mentions of other pages' plain names and
-        # wrap the FIRST occurrence with [[full_slug]], recording an outlink.
-        # existing_links covers both the raw [[slug]] form and the rendered
-        # `[text](artifact/{kb_id}/slug)` form (so re-runs stay idempotent even
-        # after links were rendered on a previous run).
+        # 步骤6: 自动扫词链接（Auto-linking），即便大模型遗漏了 `[[...]]` 也能建立跨页出链
+        # 扫描正文中独立提及的其他页面名称，首次出现时包裹为 [[full_slug|name]]
+        # 转换示例: "在赤壁与孙权会盟" -> "在赤壁与[[entity/孙权|孙权]]会盟"
         existing_links = {m.group(1).split("|", 1)[0].strip() for m in wikilink_re.finditer(content)}
         existing_links |= {m.group(1) for m in re.finditer(rf"\]\(artifact/{re.escape(str(kb_id))}/([^)]+)\)", content)}
         for name in ordered_names:
@@ -3159,24 +4299,19 @@ async def _wiki_finalize(
             idx = content.find(name)
             if idx < 0:
                 continue
-            # Skip if the occurrence is already inside a [[...]] link span
+            # 若该提及已经位于某个内部链接内，则跳过
             if _inside_wikilink(content, idx):
                 continue
-            # Preserve the matched prose as the link label.  This matters when
-            # several entities share one page: e.g. the page slug may be
-            # ``entity/五色棒`` while the text mentions
-            # ``治世之能臣，乱世之奸雄``.
+            # 将首次出现的实体文本包裹为维基链接，并保留原始显示文本
             content = content[:idx] + f"[[{target}|{name}]]" + content[idx + len(name) :]
             existing_links.add(target)
             if target not in outlink_map.setdefault(pid, []):
                 outlink_map[pid].append(target)
             relation_map.setdefault(pid, []).append({"entity_name": name, "relation": "see_also"})
 
-        # Merge semantic relation edges (from MAP extraction) into the outlinks.
-        # These connect pages even when prose never mentions the counterpart.
-        # We ALSO inject a "相关页面 / Related" [[wikilink]] section so the
-        # cross-page link is visible in the body and survives the shredded
-        # *_kwd field (outlinks_kwd is analyzed by whitespace-# → reads back []).
+        # 步骤7: 合并 MAP 抽取的实体关系拓扑边，并在正文末尾追加“相关页面”链接块
+        # 追加块示例:
+        # "\n\n## 相关页面\n- [[entity/刘备]]\n- [[entity/孙权]]\n"
         rel_targets = []
         for target in relation_edges.get(pid, ()):
             if target == pid:
@@ -3193,45 +4328,33 @@ async def _wiki_finalize(
                 content = content.rstrip() + "\n\n## 相关页面\n"
             content += "\n".join(f"- [[{t}]]" for t in rel_targets) + "\n"
 
-        # Render internal [[slug]] wikilinks into clickable Markdown links
-        # `[text](artifact/{kb_id}/{slug})` — the format the frontend's wiki
-        # viewer can navigate (the raw [[...]] form renders as plain text and
-        # cannot be deep-linked). Only slugs that resolve to a compiled page
-        # become links; anything else is left as plain text.
+        # 步骤8: 将内部 `[[slug]]` 渲染为前端可点击跳转的 Markdown 超链接 `[text](artifact/{kb_id}/{slug})`
+        # 转换示例: "[[entity/刘备|玄德]]" -> "[玄德](artifact/kb_999/entity/刘备)"
         rendered_content = content
         if rendered_content:
-            # valid_slugs must be the set of LINK TARGETS (outlink values), not
-            # the source page keys. Build it from every outlink_map value plus
-            # every page's own slug so self-references resolve too.
             link_targets = set(outlink_map.keys())
             for _, targets in outlink_map.items():
                 link_targets.update(targets)
             rendered_content = _wiki_render_links(rendered_content, kb_id, link_targets)
 
-        # Update page content if changed (store the RENDERED markdown so the
-        # frontend gets navigable artifact links).
+        # 步骤9: 组装更新载荷并原子写入底层知识库存储
+        # update 字典示例:
+        # {
+        #     "md_with_weight": "# 曹操\n[玄德](artifact/kb_999/entity/刘备)...",
+        #     "related_kb_pages_kwd": ["刘备", "孙权"],
+        #     "outlinks_kwd": ["entity/刘备", "entity/孙权"],
+        #     "outlinks_int": 2
+        # }
         update = {}
         if rendered_content != original:
             update["md_with_weight"] = rendered_content
 
         relations = relation_map.get(pid, [])
         if relations:
-            # NOTE: *_kwd fields are analyzed by whitespace-#. Storing a
-            # json.dumps string makes Infinity shred it so get_fields reads it
-            # back as [] (breaking every consumer of related_kb_pages_kwd).
-            # Mirror the old-mode format: a native list of STRINGS (Infinity
-            # stores it and get_fields/_as_str_list restore it as a list). The
-            # old-mode related_kb_pages is exactly a list of page slugs/names,
-            # so we collapse each {entity_name, relation} entry to its string.
             update["related_kb_pages_kwd"] = [r.get("entity_name") or r.get("slug") or str(r) for r in relations[:20]]
         elif page.get("related_kb_pages_kwd"):
-            # Clear stale related_pages if no relations remain
             update["related_kb_pages_kwd"] = []
 
-        # Always refresh outlinks: unique valid targets (graph + list ordering
-        # depend on outlinks_int). Preserves ordering for a stable canvas.
-        # Store a native list (NOT json.dumps) so the *_kwd field reads back
-        # correctly instead of being shredded into [] by whitespace-#.
         outlinks = outlink_map.get(pid) or []
         update["outlinks_kwd"] = list(outlinks)
         update["outlinks_int"] = len(outlinks)
@@ -3244,20 +4367,29 @@ async def _wiki_finalize(
             kb_id,
         )
 
-    # FINALIZE updates every page without forcing a refresh per write. Make the
-    # complete batch searchable once here, before the caller reloads these rows
-    # to materialize wiki_entity/wiki_relation. Without this barrier, the page
-    # API can expose the new outlinks while the graph is built from the previous
-    # search snapshot (for example, a linked page still gets weight=0/no edges).
+    # 步骤10: 批次更新完毕后强制刷新索引，确保新链接与图谱边立即可被检索
     refresh_idx = getattr(settings.docStoreConn, "refresh_idx", None)
     if callable(refresh_idx):
         await thread_pool_exec(refresh_idx, index)
 
 
 def _wiki_normalize_rows(matrix):
-    """L2-normalize the rows of a 2-D float matrix (safe on zero rows)."""
+    """对二维浮点矩阵的每一行向量执行 L2 范数归一化（模长为0的安全置零） —— 矩阵行向量L2归一化器。
+
+    参数:
+        matrix: 待归一化的二维 NumPy 浮点矩阵。
+            长相示例: np.array([[3.0, 4.0], [0.0, 0.0]], dtype=np.float32)
+
+    返回值:
+        经过行归一化后的 NumPy 浮点矩阵。
+        长相示例: np.array([[0.6, 0.8], [0.0, 0.0]], dtype=np.float32)
+    """
+    # 步骤1: 检查是否为二维矩阵，非二维直接原样返回
     if matrix.ndim != 2:
         return matrix
+    # 步骤2: 计算每行 L2 模长并进行防零除的就地除法计算
+    # 输入: matrix=[[3.0, 4.0]], norms=[[5.0]]
+    # 输出: [[0.6, 0.8]]
     norms = np.linalg.norm(matrix, axis=1, keepdims=True)
     return np.divide(matrix, norms, out=np.zeros_like(matrix), where=norms > 0)
 
@@ -3275,19 +4407,55 @@ async def wiki_compile_incremental(
     chunk_delta: dict[str, set[str]],
     previous_chunk_state: dict[str, dict],
     current_chunk_state: dict[str, dict],
-    incremental: bool = False,  # True = incremental run
+    incremental: bool = False,  # True 表示增量更新模式
     deleted_doc_ids: set[str] | None = None,
     callback: Callable | None = None,
 ) -> dict:
-    """Main entry point for dual-mode wiki compilation.
+    """双模式（Mode A 单实体独立建页 / Mode B 主题聚类路由建页）增量与全量维基知识库编译调度总入口 —— 维基增量编译总调度工。
 
-    Args:
-        mode: ``entity`` for Mode A, or ``topic`` for Mode B.
-        incremental: True=incremental update, False=full build
-        deleted_doc_ids: Documents that were removed.
-        callback: Progress callback.
+    参数:
+        chat_mdl: 大语言模型对话客户端对象。
+        embd_mdl: 文本向量嵌入模型对象。
+        tenant_id: 租户唯一标识符。
+            示例: "tenant_001"
+        kb_id: 知识库唯一标识符。
+            示例: "kb_001"
+        mode: 编译模式字符串（"entity" 为模式 A，"topic" 为模式 B）。
+            示例: "entity"
+        chunk_delta: 分块增删改差异集合字典。
+            长相示例:
+            {
+                "new_chunk_ids": {"chunk_001", "chunk_002"},
+                "changed_chunk_ids": {"chunk_003"},
+                "deleted_chunk_ids": {"chunk_004"}
+            }
+        previous_chunk_state: 上一版本的全量分块状态映射字典。
+            长相示例:
+            {
+                "chunk_003": {"doc_id": "doc_1", "version": 1}
+            }
+        current_chunk_state: 当前最新的全量分块状态映射字典。
+            长相示例:
+            {
+                "chunk_001": {"doc_id": "doc_2", "version": 1},
+                "chunk_003": {"doc_id": "doc_1", "version": 2}
+            }
+        incremental: 是否以增量方式更新（True 为增量模式，False 为全量模式）。
+            示例: True
+        deleted_doc_ids: 待级联删除的文档 ID 集合（可选）。
+            示例: {"doc_999"}
+        callback: 编译进度与状态回调函数（可选）。
+            示例: lambda progress, msg: print(progress, msg)
 
-    Returns summary dict: {pages_created, pages_modified, pages_deleted}
+    返回值:
+        编译统计与异常结果字典。
+        长相示例:
+        {
+            "pages_created": 3,
+            "pages_modified": 1,
+            "pages_deleted": 0,
+            "errors": []
+        }
     """
     from common.misc_utils import thread_pool_exec
     from rag.nlp import search
@@ -3301,14 +4469,15 @@ async def wiki_compile_incremental(
             except Exception:
                 pass
 
+    # 步骤1: 解析分块变更差异集合（计算受影响分块），并分别按版本加载候选 MAP 抽取结果
+    # invalidated_chunk_ids 示例: {"chunk_003", "chunk_004"}
+    # delta_current_chunk_ids 示例: {"chunk_001", "chunk_002", "chunk_003"}
     invalidated_chunk_ids = set(chunk_delta.get("changed_chunk_ids") or set()) | set(chunk_delta.get("deleted_chunk_ids") or set())
     delta_current_chunk_ids = set(chunk_delta.get("new_chunk_ids") or set()) | set(chunk_delta.get("changed_chunk_ids") or set())
     delta_before_results: list[dict] = []
     delta_after_results: list[dict] = []
 
-    # Versioned MAP storage contains historical rows.  Incremental compilation
-    # must select exactly the versions referenced by the candidate current
-    # state, never every historical row in the index.
+    # 版本化 MAP 存储中包含历史版本数据，增量模式下精确匹配候选分块状态所对应的版本记录
     from rag.advanced_rag.knowlege_compile.wiki import _wiki_load_map_extracts_for_state
 
     map_results = await _wiki_load_map_extracts_for_state(tenant_id, kb_id, current_chunk_state)
@@ -3331,13 +4500,7 @@ async def wiki_compile_incremental(
         _progress("No MAP results found. Skipping wiki compilation.")
         return summary
 
-    # ----- Correct incremental flag for interrupted first builds -----
-    # If the caller believes this is incremental but the KB has NO wiki_page
-    # rows, it means a previous full build was cancelled mid-way, leaving only
-    # half-written wiki_map_extract rows.  Incremental logic relies on existing
-    # pages + doc_page_source to route changes; without any compiled page it
-    # would try to diff against nothing and produce empty output.  In that case
-    # fall back to a full build.
+    # 步骤2: 自动修正增量标识 —— 若首次全量编译中途被中断（数据库中无任何 wiki_page），安全回退为全量构建
     if incremental:
         try:
             has_pages = await _wiki_has_any_pages(tenant_id, kb_id)
@@ -3348,13 +4511,10 @@ async def wiki_compile_incremental(
             _progress("No compiled wiki pages found; treating as first build (previous build was interrupted).")
             incremental = False
 
-    # ----- Phase 2: Entity Matching -----
+    # 步骤3: 实体匹配与消歧（Entity Matching）—— 提取轻量级实体元数据与声明索引
     _progress("Entity Matching: deduplicating entities and concepts ...")
 
-    # Lightweight metadata for matching + separate claim index for on-demand
-    # claim loading.  Keeps Entity Matching operating on small metadata only
-    # (mirrors old-mode dedup); full claim text is loaded per-affected-name
-    # after matching, so peak memory stays bounded.
+    # 轻量元数据用于快速匹配，声明全文通过 claim_index 按需索引加载，有效压降内存峰值
     map_results = map_results or []
     raw_entities, claim_index = _extract_raw_entities(map_results)
     before_raw_entities, _before_claim_index = _extract_raw_entities(delta_before_results)
@@ -3362,9 +4522,9 @@ async def wiki_compile_incremental(
     after_raw_entities, _after_claim_index = _extract_raw_entities(delta_after_results)
     after_raw_names = {entry.get("name") for entry in after_raw_entities if entry.get("name")}
 
-    # Preserve MAP topic provenance so each page's writer chooses among topics
-    # extracted from that page's own source documents, rather than from an
-    # unrelated knowledge-base-wide label pool.
+    # 步骤4: 归纳文档主题与关系网络，构建源文档到主题的局部映射关系
+    # doc_topics 示例: {"doc_001": ["三国历史", "东汉末年"]}
+    # raw_relations 示例: [{"from": "曹操", "to": "刘备", "type": "rival"}]
     doc_topics: dict[str, list[str]] = {}
     raw_topic_count = 0
     raw_relations: list[dict] = []
@@ -3399,18 +4559,19 @@ async def wiki_compile_incremental(
         "TOPIC",
         "map_summary",
         document_count=len(doc_topics),
-        raw_count=raw_topic_count,
+        raw_topic_count=raw_topic_count,
         unique_count=len(unique_topics),
         topics=unique_topics,
     )
 
-    # Release the heavy raw MAP payload as early as possible.  All metadata is
-    # now in raw_entities and full claim text in claim_index; keeping
-    # map_results alive would pin the raw MAP structures in memory.
+    # 尽早释放沉重的 MAP 原始字典列表，降低并发时的内存占用
     del map_results
 
     canonical_entities = await _load_canonical_entities(tenant_id, kb_id)
 
+    # 步骤5: 执行实体名称对齐与消歧，生成规范实体映射与关系图谱
+    # canonical_map 示例: {"曹操": {"type": "entity", "aliases": ["曹孟德"], "claim_count": 5}}
+    # name_resolution 示例: {"曹孟德": "曹操", "曹操": "曹操"}
     canonical_map, name_resolution = await _wiki_match_entities(
         raw_entities=raw_entities,
         existing_canonical=canonical_entities,
@@ -3443,9 +4604,7 @@ async def wiki_compile_incremental(
     del raw_relations
     del canonical_resolution
 
-    # ``map_results`` is the complete current snapshot when chunk deltas are
-    # supplied.  Replace provenance accumulated in the canonical cache with
-    # that snapshot so changed/deleted chunk ids do not survive indefinitely.
+    # 步骤6: 用当前快照重新计算各规范实体的源分块证据与文档溯源
     current_evidence: dict[str, dict[str, set[str] | int]] = {}
     for entry in raw_entities:
         cname = name_resolution.get(entry["name"], entry["name"])
@@ -3461,7 +4620,6 @@ async def wiki_compile_incremental(
         centry["source_chunk_ids"] = sorted(evidence["chunks"])
         centry["claim_count"] = evidence["claims"]
 
-    # raw_entities (lightweight) no longer needed after matching.
     del raw_entities
 
     if not canonical_map and not before_raw_names:
@@ -3469,13 +4627,10 @@ async def wiki_compile_incremental(
         return summary
 
     _progress("Entity Matching: %d" % len(name_resolution.keys()))
-    # Persist new/changed canonical entities.
-    # Compute embeddings for ALL new entities in ONE batch call (the embedding
-    # API is invoked per text by the underlying driver — batching 95 entities as
-    # one call is ~95x faster than a per-entity call, each of which only carries
-    # a handful of tokens and spends ~0.3s in round-trip latency).
+
+    # 步骤7: 持久化新增与变更的规范实体，对所有新实体单批次批量计算向量嵌入
     changed_items: list[tuple[str, dict]] = []
-    new_items: list[tuple[str, dict, str]] = []  # (cname, centry, emb_text)
+    new_items: list[tuple[str, dict, str]] = []  # (规范名称, 规范字典, 向量化文本)
     for cname, centry in canonical_map.items():
         existing = canonical_entities.get(cname)
         if existing:
@@ -3486,11 +4641,11 @@ async def wiki_compile_incremental(
             old_aliases = set(existing.get("aliases") or [])
             new_aliases = set(centry.get("aliases") or [])
             if old_docs != new_docs or old_chunks != new_chunks or old_aliases != new_aliases or centry["claim_count"] > existing.get("mention_count_int", 0):
-                # Only persist when data changes; reuse the existing embedding.
                 changed_items.append((cname, centry))
         else:
             new_items.append((cname, centry, _entity_to_query_text(centry)))
 
+    # 并发更新已变更的规范实体
     if changed_items:
         persist_sem = asyncio.Semaphore(CANONICAL_PERSIST_CONCURRENT)
 
@@ -3510,6 +4665,7 @@ async def wiki_compile_incremental(
 
         await asyncio.gather(*(_update_changed(item) for item in changed_items))
 
+    # 批量编码并插入新规范实体文档
     if new_items and embd_mdl:
         batch_texts = [t for _, _, t in new_items]
         batch_embs, _ = await thread_pool_exec(embd_mdl.encode, batch_texts)
@@ -3554,6 +4710,7 @@ async def wiki_compile_incremental(
             kb_id,
         )
 
+    # 步骤8: 清理失效分块中的规范实体记录
     if invalidated_chunk_ids:
         for cname, existing in canonical_entities.items():
             if cname in canonical_map:
@@ -3576,7 +4733,7 @@ async def wiki_compile_incremental(
                     source_chunk_ids=sorted(remaining_chunks),
                 )
 
-    # Clean up deleted canonical entities (from doc deletion)
+    # 清理因文档删除而被移除的规范实体
     if deleted_doc_ids:
         for cname, centry in list(canonical_map.items()):
             centry["source_doc_ids"] = [d for d in centry.get("source_doc_ids", []) if d not in (deleted_doc_ids or set())]
@@ -3584,16 +4741,12 @@ async def wiki_compile_incremental(
                 await _delete_canonical_entity(tenant_id, kb_id, cname)
                 del canonical_map[cname]
 
-    # ----- Phase 3: REDUCE -----
+    # 步骤9: REDUCE 阶段 —— 计算每个实体的细粒度增删改差异
     _progress("REDUCE: computing per-entity changes ...")
 
-    # Use canonical names (from Entity Matching) instead of raw MAP names
     canonical_names: set[str] = set(canonical_map.keys())
 
     if incremental:
-        # Resolve names from both sides of the chunk delta.  Deleted names may
-        # no longer exist in the current canonical map, but their old pages
-        # still need retraction/deletion.
         existing_aliases: dict[str, str] = {}
         for cname, centry in canonical_entities.items():
             existing_aliases[_normalize_key(cname)] = cname
@@ -3605,7 +4758,7 @@ async def wiki_compile_incremental(
     else:
         affected_names = canonical_names
 
-    # Load existing pages
+    # 加载已存在的所有维基页面
     existing_pages = await _search_existing_pages(
         tenant_id,
         kb_id,
@@ -3634,18 +4787,12 @@ async def wiki_compile_incremental(
             if page_id in existing_pages and names:
                 existing_pages[page_id]["entity_names_kwd"] = names
 
-    # Build canonical claims ON-DEMAND only for affected names, then release
-    # the full claim_index.  claim_index is keyed by RAW entity name (from MAP),
-    # so claims must be aggregated through name_resolution onto the canonical
-    # name.  Otherwise a canonical name that differs from every raw name
-    # (e.g. "Apple Computer" → "Apple Inc.") would resolve to no claims and
-    # every affected entity would be a no-op → empty output.
+    # 按需为受影响实体构建规范声明，避免无关实体声明长久驻留内存
     canonical_claims: dict[str, list[dict]] = {}
     for raw_name, claims in claim_index.items():
         cname = name_resolution.get(raw_name, raw_name)
         if cname in affected_names:
             canonical_claims.setdefault(cname, []).extend(claims)
-    # Ensure every affected name has an entry (possibly empty)
     for name in affected_names:
         canonical_claims.setdefault(name, [])
     del claim_index
@@ -3664,9 +4811,7 @@ async def wiki_compile_incremental(
         _progress("REDUCE: no changes detected.")
         return summary
 
-    # ----- Phase 4: Mode-specific dispatch -----
-    # Precompute doc → canonical entity names for doc_page_source tracking,
-    # before canonical_map is released.
+    # 步骤10: 模式分发调度（Phase 4: Mode-specific dispatch）
     doc_to_entities: dict[str, list[str]] = {}
     entity_evidence: dict[str, dict[str, list[str]]] = {}
     for cname, centry in canonical_map.items():
@@ -3681,6 +4826,7 @@ async def wiki_compile_incremental(
     topic_embeddings = await _wiki_prepare_topic_embeddings(doc_topics, embd_mdl, list(topic_pool.values()))
     topic_pool_lock = asyncio.Lock()
     if mode == "topic":
+        # 模式 B: 运行页面路由器聚类与页面提炼
         summary = await _wiki_mode_b_run(
             deltas=deltas,
             existing_pages=existing_pages,
@@ -3698,8 +4844,7 @@ async def wiki_compile_incremental(
             topic_pool_lock=topic_pool_lock,
         )
     else:
-        # Mode A: every entity AND concept becomes a page (no PLAN grouping).
-        # Each canonical entity/concept compiles to its own wiki page.
+        # 模式 A: 每个规范实体与概念独立编译为单个维基页面
         summary = await _wiki_mode_a_run(
             deltas=deltas,
             existing_pages=existing_pages,
@@ -3721,8 +4866,7 @@ async def wiki_compile_incremental(
     del name_resolution
     del existing_pages
 
-    # ----- Phase 5: Update doc_page_source with canonical names -----
-    # (doc_page_source page_ids is already handled in mode_run)
+    # 步骤11: 全库拓扑收尾与交叉互链刷新（Phase 5: FINALIZE）
     _progress("FINALIZE: updating cross-references ...")
     try:
         await _wiki_finalize(tenant_id, kb_id, embd_mdl, chunk_state=current_chunk_state)
@@ -3750,13 +4894,61 @@ async def _wiki_mode_a_run(
     topic_pool: dict[str, str] | None = None,
     topic_pool_lock: asyncio.Lock | None = None,
 ) -> dict:
-    """Mode A: every grounded entity and concept compiles to its own page.
+    """模式 A 执行调度器：每个有据可查的规范实体或概念均独立编译为单个维基页面 —— 模式A单实体独立编译工。
 
-    No PLAN grouping — each canonical entity/concept is a single page.
-    Args:
-        deltas: All entity/concept deltas (entity_type retained in each).
-        canonical_claims: Canonical name → claims, for enriching page evidence.
-        doc_to_entities: doc_id → [canonical names] for doc_page_source.
+    参数:
+        deltas: REDUCE 阶段计算得到的实体差异变动列表。
+            长相示例:
+            [
+                {
+                    "entity_name": "曹操",
+                    "entity_type": "entity",
+                    "action": "modify",
+                    "additions": [{"statement": "曹操统一北方"}],
+                    "retractions": [],
+                    "claims": [{"statement": "曹操字孟德"}],
+                    "source_chunk_ids": ["chunk_001"],
+                    "retained_source_doc_ids": ["doc_001"]
+                }
+            ]
+        existing_pages: 当前知识库已存在的所有维基页面元数据字典。
+            长相示例:
+            {
+                "entity/曹操": {"id": "row_1", "title_kwd": "曹操", "page_version_int": 1}
+            }
+        chat_mdl: 大语言模型对话客户端对象。
+        embd_mdl: 文本向量嵌入模型对象。
+        tenant_id: 租户唯一标识符。
+            示例: "tenant_001"
+        kb_id: 知识库唯一标识符。
+            示例: "kb_001"
+        incremental: 是否为增量更新模式。
+            示例: True
+        callback: 进度回调函数（可选）。
+            示例: lambda progress, msg: print(progress, msg)
+        canonical_claims: 规范实体名称到对应声明列表的映射字典（可选）。
+            长相示例:
+            {
+                "曹操": [{"statement": "曹操统一北方", "source_doc_id": "doc_001"}]
+            }
+        doc_to_entities: 文档 ID 到该文档关联规范实体名称列表的映射字典（可选）。
+            长相示例: {"doc_001": ["曹操", "刘备"]}
+        doc_topics: 文档 ID 到主题列表的映射字典（可选）。
+            长相示例: {"doc_001": ["三国历史"]}
+        topic_embeddings: 主题名称到向量嵌入的映射字典（可选）。
+        topic_pool: 规范主题词全局词池字典（可选）。
+            长相示例: {"三国历史": "三国历史"}
+        topic_pool_lock: 主题池并发锁对象（可选）。
+
+    返回值:
+        页面编译创建、修改、删除及异常计数统计字典。
+        长相示例:
+        {
+            "pages_created": 1,
+            "pages_modified": 2,
+            "pages_deleted": 0,
+            "errors": []
+        }
     """
     summary = {"pages_created": 0, "pages_modified": 0, "pages_deleted": 0, "errors": []}
 
@@ -3767,14 +4959,25 @@ async def _wiki_mode_a_run(
             except Exception:
                 pass
 
-    # Map names to existing page IDs
+    # 步骤1: 建立已有实体名称到页面 ID 的反向映射字典
+    # name_to_page 示例: {"曹操": "entity/曹操", "官渡之战": "concept/官渡之战"}
     name_to_page: dict[str, str] = {}
     for pid, page in existing_pages.items():
         for n in _as_str_list(page.get("entity_names_kwd")):
             name_to_page[n] = pid
 
-    # Build page-level deltas. Each grounded entity/concept becomes one page;
-    # REDUCE has already filtered metadata-only entities without claims.
+    # 步骤2: 将实体级 deltas 汇总转换为页面级差异字典 page_deltas，每个实体/概念对应独立页面
+    # page_deltas["entity/曹操"] 示例:
+    # {
+    #     "page_id": "entity/曹操",
+    #     "page_title": "曹操",
+    #     "existing_page": {"id": "row_1", ...},
+    #     "additions": [...],
+    #     "retractions": [],
+    #     "claims": [...],
+    #     "source_chunks": [{"id": "chunk_001", "text": "曹操统一北方", ...}],
+    #     "source_doc_ids": {"doc_001"}
+    # }
     page_deltas: dict[str, dict] = {}
     for d in deltas:
         name = d.get("entity_name", "")
@@ -3784,7 +4987,7 @@ async def _wiki_mode_a_run(
         if isinstance(entity_type, list):
             entity_type = entity_type[0] if entity_type else "entity"
         entity_type = str(entity_type or "entity").strip()
-        # Derive page_id with type-appropriate prefix (concept/ vs entity/)
+        # 根据实体类型选择对应前缀（concept/ 或 entity/）
         prefix = "concept" if entity_type == "concept" else "entity"
         page_id = name_to_page.get(name) or _wiki_derive_page_id(name, prefix=prefix)
 
@@ -3806,12 +5009,11 @@ async def _wiki_mode_a_run(
         entry["claims"].extend(delta_claims)
         entry["source_doc_ids"].update(d.get("retained_source_doc_ids", []))
 
-        # Entity/concept and relation extraction rows carry source chunks even
-        # when no dedicated claim exists.
+        # 收集实体自身绑定的源分块 ID
         for cid in d.get("source_chunk_ids", []):
             entry["source_chunks"].append({"id": cid, "text": ""})
 
-        # Collect source chunks from both complete claims and REDUCE additions.
+        # 收集来自各声明及其关联的源分块证据
         for claim in delta_claims:
             for cid in _wiki_claim_chunk_ids(claim):
                 entry["source_chunks"].append(
@@ -3827,9 +5029,7 @@ async def _wiki_mode_a_run(
         elif entry.get("action") != "delete":
             entry["action"] = d.get("action")
 
-    # Enrich pages with related claims that share source_chunk_ids.
-    # Build a chunk_id → first-claim-text index from canonical_claims
-    # (claims loaded on-demand after matching).
+    # 步骤3: 按需注入共享 source_chunk_ids 的相关声明，丰富提炼依据
     if canonical_claims:
         chunk_claims: dict[str, list[str]] = {}
         for _cname, claims in canonical_claims.items():
@@ -3844,16 +5044,9 @@ async def _wiki_mode_a_run(
             for cid in page_chunk_ids:
                 texts = chunk_claims.get(cid)
                 if texts:
-                    # Append one source-chunk entry per chunk id
                     entry["source_chunks"].append({"id": cid, "text": texts[0]})
 
-    # Concept depth check: thin CONCEPTS don't create pages (avoids dictionary
-    # entries). Pages without grounded claims have already been filtered by
-    # REDUCE above.
-    # ONLY on the very first full build (non-incremental), when concept claims
-    # are complete.  During incremental builds the deltas carry only the
-    # changed claims, so a threshold check would wrongly reject every new
-    # concept — new concepts in incremental mode are created regardless.
+    # 步骤4: 概念深度判定（仅在首次全新全量构建时执行，增量模式跳过避免误删概念）
     if not incremental and not existing_pages:
         concept_pages = [entry for entry in page_deltas.values() if entry.get("page_id", "").startswith("concept/")]
         if concept_pages:
@@ -3864,7 +5057,7 @@ async def _wiki_mode_a_run(
                 ]
             )
             deep_ids = {p["page_id"] for p in deep_concepts}
-            # Keep all entity pages + only deep concepts
+            # 仅保留全部实体页面以及达到深度要求的深层概念页面
             page_deltas = {pid: entry for pid, entry in page_deltas.items() if not pid.startswith("concept/") or pid in deep_ids}
         if not page_deltas:
             _progress("No pages to compile. Skipping.")
@@ -3873,12 +5066,9 @@ async def _wiki_mode_a_run(
     all_page_ids = list(existing_pages.keys())
     doc_updates: dict[str, list[str]] = {}
     topic_selection_stats = {"selected": 0, "new": 0, "new_added": 0}
-    # Do not use a 20-slot semaphore around the whole page worker.  The worker
-    # also performs source loading, embedding, and persistence after the LLM
-    # returns; limiting that whole region would artificially starve the LLM
-    # pool.  LLMCallPool is the only limit for actual chat calls.
     sem = asyncio.Semaphore(max(1, len(page_deltas)))
 
+    # 步骤5: 逐页并发提炼工作协程（生成、修改、重构或删除页面）
     async def _refine_one(pid: str, entry: dict) -> None:
         async with sem:
             try:
@@ -3958,6 +5148,8 @@ async def _wiki_mode_a_run(
         await asyncio.gather(*tasks)
     _wiki_log_stats("TOPIC", "selection_summary", mode="A", **topic_selection_stats)
 
+    # 步骤6: 批量持久化更新文档-页面溯源表（doc_page_source）
+    # doc_updates 示例: {"doc_001": ["entity/曹操", "entity/刘备"]}
     for did, pids in doc_updates.items():
         try:
             existing_dps = (await _wiki_load_doc_page_source(tenant_id, kb_id, did)) or {}
@@ -3965,7 +5157,6 @@ async def _wiki_mode_a_run(
             for pid in pids:
                 if pid not in existing_pids:
                     existing_pids.append(pid)
-            # Collect entity names for this doc from precomputed doc_to_entities
             doc_entity_names = (doc_to_entities or {}).get(did, []) or existing_dps.get("entity_names")
             await _wiki_update_doc_page_source(
                 tenant_id,
@@ -3984,12 +5175,35 @@ async def _wiki_mode_a_run(
 
 
 def _wiki_claims_for_entity(page: dict, entity_name: str) -> list[dict]:
-    """Return claims owned by one page member without guessing from prose."""
+    """从多实体聚合页面中精确过滤提取归属于指定实体成员的私有声明列表 —— 页面成员声明过滤器。
+
+    参数:
+        page: 维基页面元数据字典。
+            长相示例:
+            {
+                "entity_names_kwd": ["曹操", "曹孟德"],
+                "claims": '[{"entity_name": "曹操", "statement": "统一北方"}]'
+            }
+        entity_name: 目标实体成员名称。
+            示例: "曹操"
+
+    返回值:
+        过滤后归属于该实体的声明字典列表。
+        长相示例:
+        [
+            {"entity_name": "曹操", "statement": "统一北方"}
+        ]
+    """
+    # 步骤1: 反序列化解析页面存储的 claims 列表
     claims = _wiki_parse_claims(page.get("claims"))
     member_names = _as_str_list(page.get("entity_names_kwd"))
+    # 步骤2: 若页面仅包含单实体且完全匹配，直接返回全量声明无需过滤
     if len(member_names) == 1 and _normalize_key(member_names[0]) == _normalize_key(entity_name):
         return claims
 
+    # 步骤3: 多实体共存页面，按照实体的归一化键精确匹配归属声明
+    # 输入示例: entity_name="曹操", claims=[{"entity_name": "曹操", ...}, {"entity_name": "荀彧", ...}]
+    # 输出示例: [{"entity_name": "曹操", ...}]
     normalized_name = _normalize_key(entity_name)
     return [claim for claim in claims if _normalize_key(claim.get("entity_name") or claim.get("subject") or claim.get("term")) == normalized_name]
 
@@ -3998,13 +5212,40 @@ def _wiki_reconcile_page_moves(
     assignments: dict[str, list[dict]],
     existing_pages: dict[str, dict],
 ) -> dict[str, list[dict]]:
-    """Route deletions to their owner and remove moved members from old pages."""
+    """在实体跨页面迁移或删除时，将删除动作定向路由至原宿主页面并在旧页面中登记回撤 —— 跨页实体迁移与旧页注销核对工。
+
+    参数:
+        assignments: 路由器输出的页面指派映射字典（包含新页面与存量页面）。
+            长相示例:
+            {
+                "_new_entity/曹操": [{"entity_name": "曹操", "action": "create"}],
+                "entity/三国群英": [{"entity_name": "曹操", "action": "delete"}]
+            }
+        existing_pages: 当前知识库已存在的所有维基页面元数据字典。
+            长相示例:
+            {
+                "entity/三国群英": {"entity_names_kwd": ["曹操", "刘备"]}
+            }
+
+    返回值:
+        对齐迁移和回撤注销后的各页面实体变动列表字典。
+        长相示例:
+        {
+            "_new_entity/曹操": [{"entity_name": "曹操", "action": "create"}],
+            "entity/三国群英": [
+                {"entity_name": "曹操", "action": "delete", "retractions": [...]}
+            ]
+        }
+    """
+    # 步骤1: 扫描全量现有页面，建立每个实体成员到其历史所属页面列表的反向映射
+    # previous_pages 示例: {"曹操": [("entity/三国群英", "曹操")]}
     previous_pages: dict[str, list[tuple[str, str]]] = {}
     for page_id, page in existing_pages.items():
         for name in _as_str_list(page.get("entity_names_kwd")):
             previous_pages.setdefault(_normalize_key(name), []).append((page_id, name))
 
     result: dict[str, list[dict]] = {}
+    # 步骤2: 遍历路由指派结果，针对删除动作定向分派至各个旧宿主页面
     for target_id, entities in assignments.items():
         target_key = target_id[5:] if target_id.startswith("_new_") else target_id
         for entity in entities:
@@ -4012,8 +5253,7 @@ def _wiki_reconcile_page_moves(
             old_memberships = previous_pages.get(_normalize_key(name), [])
             action = entity.get("action")
 
-            # A deletion has no semantic destination: it belongs only to every
-            # page that currently records this entity as a member.
+            # 步骤2.1: 实体被删除时，在它曾所属的每一个旧页面生成移除指令并追加回撤声明
             if action == "delete":
                 for old_page_id, stored_name in old_memberships:
                     removal = dict(entity)
@@ -4023,6 +5263,7 @@ def _wiki_reconcile_page_moves(
                     result.setdefault(old_page_id, []).append(removal)
                 continue
 
+            # 步骤2.2: 实体迁移至新页面，保留新目标指派，同时在所有不同的旧宿主页面生成剔除指令
             result.setdefault(target_id, []).append(entity)
             for old_page_id, stored_name in old_memberships:
                 if old_page_id == target_key:
@@ -4057,8 +5298,63 @@ async def _wiki_mode_b_run(
     topic_pool: dict[str, str] | None = None,
     topic_pool_lock: asyncio.Lock | None = None,
 ) -> dict:
-    """Mode B: Page Router + per-page REFINE."""
+    """模式 B 执行调度器：利用 Page Router 路由器将变动实体指派到最适配的主题/实体页面，并按页面提炼编译 —— 模式B路由器与聚类编译工。
 
+    参数:
+        deltas: REDUCE 阶段计算得到的各实体变动差异字典列表。
+            长相示例:
+            [
+                {
+                    "entity_name": "赤壁之战",
+                    "entity_type": "concept",
+                    "claims": [{"statement": "发生于208年"}],
+                    "additions": [],
+                    "retractions": [],
+                    "source_chunk_ids": ["c1"],
+                    "retained_source_doc_ids": ["d1"],
+                    "action": "create"
+                }
+            ]
+        existing_pages: 当前知识库已存在的所有维基页面元数据字典。
+            长相示例:
+            {
+                "concept/三国三大战役": {
+                    "id": "p1",
+                    "title_kwd": "三国三大战役",
+                    "entity_names_kwd": ["官渡之战", "夷陵之战"]
+                }
+            }
+        chat_mdl: 大语言模型对话客户端对象。
+        embd_mdl: 文本向量嵌入模型对象。
+        tenant_id: 租户唯一标识符。
+            示例: "tenant_001"
+        kb_id: 知识库唯一标识符。
+            示例: "kb_001"
+        callback: 进度回调函数（可选）。
+            示例: lambda progress, msg: print(progress, msg)
+        doc_to_entities: 文档 ID 到关联实体名称列表的映射字典（可选）。
+            长相示例: {"d1": ["赤壁之战"]}
+        entity_evidence: 实体溯源分块和文档证据字典（可选）。
+            长相示例: {"赤壁之战": {"source_doc_ids": ["d1"], "source_chunk_ids": ["c1"]}}
+        entity_relations: 实体间语义关联关系字典（可选）。
+            长相示例: {"赤壁之战": [{"entity": "曹操", "type": "involved"}]}
+        doc_topics: 文档主题映射字典（可选）。
+            长相示例: {"d1": ["三国历史"]}
+        topic_embeddings: 主题向量嵌入字典（可选）。
+        topic_pool: 规范主题词全局词池字典（可选）。
+            长相示例: {"三国历史": "三国历史"}
+        topic_pool_lock: 主题词池并发锁对象（可选）。
+
+    返回值:
+        页面编译创建、修改、删除及异常计数统计字典。
+        长相示例:
+        {
+            "pages_created": 1,
+            "pages_modified": 1,
+            "pages_deleted": 0,
+            "errors": []
+        }
+    """
     summary = {"pages_created": 0, "pages_modified": 0, "pages_deleted": 0, "errors": []}
 
     def _progress(msg: str):
@@ -4068,7 +5364,21 @@ async def _wiki_mode_b_run(
             except Exception:
                 pass
 
-    # Convert deltas to entity dicts that Page Router can process
+    # 步骤1: 将 deltas 转换为路由器标准输入格式的受影响实体字典列表
+    # affected_entities 示例:
+    # [
+    #     {
+    #         "entity_name": "赤壁之战",
+    #         "entity_type": "concept",
+    #         "aliases": [],
+    #         "claims": [...],
+    #         "retractions": [],
+    #         "source_chunk_ids": ["c1"],
+    #         "source_doc_ids": ["d1"],
+    #         "relations": [...],
+    #         "action": "create"
+    #     }
+    # ]
     affected_entities = [
         {
             "entity_name": d.get("entity_name", ""),
@@ -4089,7 +5399,7 @@ async def _wiki_mode_b_run(
         _progress("No affected entities. Skipping.")
         return summary
 
-    # Run Page Router
+    # 步骤2: 运行页面智能路由器 Page Router 进行页面指派归并
     _progress(f"Page Router: routing {len(affected_entities)} entities ...")
     assignments = await _wiki_page_router(
         affected_entities=affected_entities,
@@ -4100,7 +5410,9 @@ async def _wiki_mode_b_run(
         existing_pages=existing_pages,
     )
 
+    # 步骤3: 协调处理跨页实体迁移与旧页面成员注销及回撤登记
     assignments = _wiki_reconcile_page_moves(assignments, existing_pages)
+    # 步骤4: 检测并切分内聚度降低或容量超标的不稳定页面
     assignments = await _wiki_split_unstable_page_assignments(
         assignments=assignments,
         existing_pages=existing_pages,
@@ -4113,10 +5425,9 @@ async def _wiki_mode_b_run(
         _progress("Page Router: no assignments. Skipping.")
         return summary
 
-    # Load available pages for wikilinks
     all_page_ids = list(existing_pages.keys())
 
-    # Collect source chunks per assignment for the REFINE prompt
+    # 步骤5: 收集汇总每个页面指派分组对应的源分块内容（page_source_chunks）
     page_source_chunks: dict[str, list[dict]] = {}
     for pid, entities in assignments.items():
         page_key = pid[5:] if pid.startswith("_new_") else pid
@@ -4136,14 +5447,12 @@ async def _wiki_mode_b_run(
         if chunks:
             page_source_chunks[page_key] = chunks
 
-    doc_updates: dict[str, list[str]] = {}  # doc_id → [page_ids]
-    doc_removals: dict[str, list[str]] = {}  # doc_id → [page_ids]
+    doc_updates: dict[str, list[str]] = {}  # 文档 ID -> [待追加关联的页面 ID 列表]
+    doc_removals: dict[str, list[str]] = {}  # 文档 ID -> [待剥离关联的页面 ID 列表]
     topic_selection_stats = {"selected": 0, "new": 0, "new_added": 0}
-    # The shared LLMCallPool limits chat calls.  This semaphore must not cap
-    # the complete worker because embedding and page persistence happen after
-    # the chat call and should not consume an LLM concurrency slot.
     sem = asyncio.Semaphore(max(1, len(assignments)))
 
+    # 步骤6: 逐页并发提炼工作协程（新建、修改、重构或删除页面，并更新 plan_group）
     async def _refine_one(page_id: str, entities: list) -> None:
         async with sem:
             try:
@@ -4151,17 +5460,10 @@ async def _wiki_mode_b_run(
                 page_key = page_id[5:] if is_new else page_id
                 page_key = str(page_key or "").strip()
                 if not page_key:
-                    # Blank assignment (e.g. a mangled slug from the router) —
-                    # nothing to generate for an empty page id.
                     return
                 existing = existing_pages.get(page_key) if not is_new else None
 
-                # Determine page_type for Mode B. The slug prefix is the source
-                # of truth: a page whose slug starts with "concept/" is a concept
-                # page (the router derives it via _wiki_derive_page_id). Inferring
-                # from `entities[].entity_type` is unreliable (many entities carry
-                # a concrete type like "person"/"org", or none at all), which
-                # previously mislabelled concept pages as entity.
+                # 依据 slug 前缀精确判定页面类型（concept/ 或 entity/）
                 if existing:
                     page_type = existing.get("page_type_kwd", "entity")
                     if isinstance(page_type, (list, tuple)):
@@ -4211,6 +5513,7 @@ async def _wiki_mode_b_run(
                             }
                         )
 
+                # 步骤6.1: 若成员全部清空，则执行删除页面操作并级联清理计划分组
                 if action == "delete":
                     deleted_page = await _wiki_refine_page(
                         mode="delete",
@@ -4237,6 +5540,7 @@ async def _wiki_mode_b_run(
                         summary["pages_deleted"] += 1
                     return
 
+                # 步骤6.2: 判定提炼模式（新建 generate、增量 modify 或大跨度重写 re-synthesize）
                 refine_mode = "generate" if is_new else "modify"
                 if existing and _wiki_should_re_synthesize(
                     existing,
@@ -4277,6 +5581,7 @@ async def _wiki_mode_b_run(
                         summary["pages_created"] += 1
                     else:
                         summary["pages_modified"] += 1
+                    # 步骤6.3: 更新持久化计划分组映射
                     await _wiki_update_plan_group(
                         tenant_id,
                         kb_id,
@@ -4285,7 +5590,7 @@ async def _wiki_mode_b_run(
                         page_version=result.get("page_version_int", 1),
                     )
 
-                    # Collect doc_page_source updates (deferred)
+                    # 收集文档-页面溯源更新
                     for ent in entities:
                         for c in ent.get("claims", []):
                             did = c.get("source_doc_id")
@@ -4308,7 +5613,7 @@ async def _wiki_mode_b_run(
         await asyncio.gather(*tasks)
     _wiki_log_stats("TOPIC", "selection_summary", mode="B", **topic_selection_stats)
 
-    # Apply doc_page_source updates serially (no race), preserving metadata
+    # 步骤7: 串行持久化应用文档-页面溯源变更（doc_page_source）
     for did in set(doc_updates) | set(doc_removals):
         try:
             existing_dps = (await _wiki_load_doc_page_source(tenant_id, kb_id, did)) or {}
@@ -4335,21 +5640,46 @@ async def _wiki_mode_b_run(
 
 
 def _wiki_parse_claims(raw_claims) -> list[dict]:
+    """将原始声明数据安全反序列化为规整的字典列表 —— 维基声明反序列化解析器。
+
+    参数:
+        raw_claims: 原始声明数据（支持 JSON 字符串、字典列表或元组）。
+            长相示例: '[{"statement": "曹操生于谯县"}]' 或 [{"statement": "曹操生于谯县"}]
+
+    返回值:
+        过滤解析后的字典列表。
+        长相示例: [{"statement": "曹操生于谯县"}]
+    """
+    # 步骤1: 若为 JSON 字符串，尝试反序列化
     if isinstance(raw_claims, str):
         try:
             raw_claims = json.loads(raw_claims) if raw_claims else []
         except (json.JSONDecodeError, TypeError):
             raw_claims = []
+    # 步骤2: 筛选列表/元组中的字典元素并返回
     return [claim for claim in raw_claims or [] if isinstance(claim, dict)] if isinstance(raw_claims, (list, tuple)) else []
 
 
 def _wiki_embedding_cohesion(matrix: np.ndarray) -> float:
+    """计算向量矩阵相对于其质心向量的平均余弦相似度以衡量聚类内聚紧密度 —— 向量聚类内聚度测算工。
+
+    参数:
+        matrix: 二维 NumPy 浮点向量矩阵。
+            长相示例: np.array([[0.6, 0.8], [0.8, 0.6]], dtype=np.float32)
+
+    返回值:
+        聚类的平均余弦内聚度浮点值（单行或空矩阵直接返回 1.0）。
+        长相示例: 0.96
+    """
+    # 步骤1: 维度检查，非二维或行数小于等于1直接返回 1.0
     if matrix.ndim != 2 or matrix.shape[0] <= 1:
         return 1.0
+    # 步骤2: 计算矩阵几何中心质心向量并执行 L2 归一化
     centroid = np.mean(matrix, axis=0)
     norm = np.linalg.norm(centroid)
     if norm <= 0:
         return 0.0
+    # 步骤3: 计算矩阵所有行向量与单位质心向量的点积均值（平均余弦得分）
     return float(np.mean(matrix @ (centroid / norm)))
 
 
@@ -4361,10 +5691,32 @@ async def _wiki_split_unstable_page_assignments(
     embd_mdl,
     kb_id: str = "",
 ) -> dict[str, list[dict]]:
-    """Let the LLM reconsider affected pages whose embedding cohesion degrades."""
+    """检测页面接纳新成员后是否发生内聚度退化或超出容量硬上限，必要时促请大模型重新聚类拆分 —— 不稳定聚合页面切分工。
+
+    参数:
+        assignments: 路由器输出的各页面实体指派映射字典。
+            长相示例:
+            {
+                "entity/曹操传": [{"entity_name": "曹操"}, {"entity_name": "刘备"}]
+            }
+        existing_pages: 已存在的维基页面元数据字典。
+        chat_mdl: 大语言模型对话客户端对象。
+        embd_mdl: 文本向量嵌入模型对象。
+        kb_id: 知识库唯一标识符。
+            示例: "kb_001"
+
+    返回值:
+        切分并追加新拆分页面后的各页面实体指派映射字典。
+        长相示例:
+        {
+            "entity/曹操传": [{"entity_name": "曹操"}],
+            "_new_entity/刘备": [{"entity_name": "刘备"}]
+        }
+    """
     if not assignments:
         return assignments
 
+    # 步骤1: 收集成员数量大于1的存量聚合页面候选，并汇总所有成员实体元数据
     candidates: dict[str, dict] = {}
     all_members: list[dict] = []
     for page_id, incoming in assignments.items():
@@ -4402,6 +5754,7 @@ async def _wiki_split_unstable_page_assignments(
             "vector_slice": slice(start, len(all_members)),
         }
 
+    # 步骤2: 批量编码全量候选成员实体文本并归一化为嵌入矩阵
     if all_members:
         vectors, _ = await thread_pool_exec(embd_mdl.encode, [_entity_to_query_text(member) for member in all_members])
         matrix = _wiki_normalize_rows(np.asarray(vectors, dtype=np.float32))
@@ -4410,6 +5763,7 @@ async def _wiki_split_unstable_page_assignments(
 
     group_semaphore = asyncio.Semaphore(WIKI_GROUP_LLM_MAX_CONCURRENT)
 
+    # 步骤3: 判定是否超过硬容量约束或内聚度明显退化，若是则唤起 LLM 重新聚类分组
     async def _reconsider(record: dict) -> list[list[dict]] | None:
         member_matrix = matrix[record["vector_slice"]]
         old_name_set = set(record["old_names"])
@@ -4426,6 +5780,7 @@ async def _wiki_split_unstable_page_assignments(
     for record, clusters in zip(candidates.values(), reconsidered, strict=True):
         record["clusters"] = clusters
 
+    # 步骤4: 处理切分结果，保留与页面标题最契合的主聚类，其余子聚类分裂为带 _new_ 前缀的新独立页面
     result: dict[str, list[dict]] = {}
     used_page_ids = set(existing_pages) | {key[5:] for key in assignments if key.startswith("_new_")}
     for page_id, incoming in assignments.items():
@@ -4450,6 +5805,7 @@ async def _wiki_split_unstable_page_assignments(
             retained_cluster[0]["retractions"] = retained_cluster[0].get("retractions", []) + moved_claims + removed_retractions
         result[page_id] = retained_cluster
 
+        # 分离出新的子聚类页面
         for idx, cluster in enumerate(clusters):
             if idx == retained_idx:
                 continue
@@ -4481,11 +5837,28 @@ async def _wiki_update_plan_group(
     entity_names: list[str],
     page_version: int,
 ) -> None:
-    """Update or create plan_group row (Mode B)."""
+    """在知识库底层文档存储中更新或创建模式 B 计划分组映射记录 —— 计划分组元数据持久化工。
+
+    参数:
+        tenant_id: 租户唯一标识符。
+            示例: "tenant_001"
+        kb_id: 知识库唯一标识符。
+            示例: "kb_001"
+        page_id: 目标页面唯一标识符。
+            示例: "entity/曹操"
+        entity_names: 该页面包含的所有实体成员名称列表。
+            长相示例: ["曹操", "曹孟德"]
+        page_version: 页面版本号整数。
+            示例: 2
+
+    返回值:
+        无返回值 (None)。
+    """
     from rag.nlp import search
     from common.misc_utils import thread_pool_exec
     from common.doc_store.doc_store_base import OrderByExpr
 
+    # 步骤1: 组装计划分组文档载荷与匹配条件
     index = search.index_name(tenant_id)
     condition = {
         "compile_kwd": [WIKI_PLAN_GROUP_COMPILE_KWD],
@@ -4501,6 +5874,7 @@ async def _wiki_update_plan_group(
         "compile_kwd": WIKI_PLAN_GROUP_COMPILE_KWD,
     }
 
+    # 步骤2: 查询该页面计划分组记录是否存在，若存在执行 update，否则执行 insert
     existing = await thread_pool_exec(
         settings.docStoreConn.search,
         ["page_id"],
@@ -4531,6 +5905,20 @@ async def _wiki_update_plan_group(
 
 
 async def _wiki_delete_plan_group(tenant_id: str, kb_id: str, page_id: str) -> None:
+    """从知识库文档存储中删除指定页面的模式 B 计划分组记录 —— 计划分组记录删除工。
+
+    参数:
+        tenant_id: 租户唯一标识符。
+            示例: "tenant_001"
+        kb_id: 知识库唯一标识符。
+            示例: "kb_001"
+        page_id: 待删除的页面标识符。
+            示例: "entity/曹操"
+
+    返回值:
+        无返回值 (None)。
+    """
+    # 步骤1: 调用底层存储接口执行条件删除
     await thread_pool_exec(
         settings.docStoreConn.delete,
         {"compile_kwd": [WIKI_PLAN_GROUP_COMPILE_KWD], "page_id": [page_id]},
@@ -4540,7 +5928,22 @@ async def _wiki_delete_plan_group(tenant_id: str, kb_id: str, page_id: str) -> N
 
 
 async def _wiki_load_plan_group_members(tenant_id: str, kb_id: str) -> dict[str, list[str]]:
-    """Load the authoritative Mode B page membership map."""
+    """从知识库文档存储全量分页加载模式 B 计划分组映射记录，获取所有页面的权威实体成员 —— 计划分组权威成员加载工。
+
+    参数:
+        tenant_id: 租户唯一标识符。
+            示例: "tenant_001"
+        kb_id: 知识库唯一标识符。
+            示例: "kb_001"
+
+    返回值:
+        页面 ID 到实体成员名称列表的完整映射字典。
+        长相示例:
+        {
+            "entity/三国群雄": ["刘备", "孙权", "曹操"]
+        }
+    """
+    # 步骤1: 初始化分页检索参数并循环加载所有记录
     index = search.index_name(tenant_id)
     fields = ["page_id", "entity_names"]
     result: dict[str, list[str]] = {}
@@ -4560,6 +5963,7 @@ async def _wiki_load_plan_group_members(tenant_id: str, kb_id: str) -> dict[str,
             [kb_id],
         )
         rows = settings.docStoreConn.get_fields(res, fields) or {}
+        # 步骤2: 解析每一行记录中的 entity_names JSON 字符串并去重排序放入字典
         for row in rows.values():
             page_id = row.get("page_id", "")
             if isinstance(page_id, (list, tuple)):

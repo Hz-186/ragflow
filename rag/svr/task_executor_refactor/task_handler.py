@@ -551,10 +551,25 @@ class TaskHandler:
         embedding_model: LLMBundle,
         vector_size: int,
     ) -> None:
+        """执行标准切片流程的安全包装入口 —— 切片任务护航员。
+
+        传入参数：
+            embedding_model (LLMBundle): 向量模型运行时封装对象，包装了模型配置、租户与调用客户端，例如：
+                <LLMBundle tenant_id="tenant_001", llm_type="EMBEDDING", llm_name="BAAI/bge-large-zh-v1.5">
+            vector_size (int): 向量维度大小（如 1024、1536、768），例如：
+                1024
+
+        返回值：
+            None: 无返回值（内部驱动全套切片流程并在出错时熔断计数器）
+        """
         ctx = self._task_context
         try:
+            # 委派给具体实现函数执行完整的标准切片处理流程
             await self._run_standard_chunking_impl(embedding_model, vector_size)
         except Exception:
+            # 发生任何未捕获异常时，在 Redis 中将整篇文档的切片计数器熔断标记为中止
+            # 避免整篇文档的其他并发切片子任务在此任务崩溃后仍然徒劳执行耗时的全局后处理（如 RAPTOR）
+            # 传入参数形如: ctx.doc_id = "doc_a1b2c3d4e5"
             abort_doc_chunking_counter(ctx.doc_id)
             raise
 
@@ -563,38 +578,71 @@ class TaskHandler:
         embedding_model: LLMBundle,
         vector_size: int,
     ) -> None:
-        """Run standard chunking pipeline."""
-        ctx = self._task_context
-        task_id = ctx.id
-        task_tenant_id = ctx.tenant_id
-        task_dataset_id = ctx.kb_id
-        task_doc_id = ctx.doc_id
-        task_start_ts = timer()
+        """执行单任务标准切片、向量化与入库主流水线 —— 文档切片主干流水线。
 
+        传入参数：
+            embedding_model (LLMBundle): 向量模型运行时封装对象，包装了模型配置、租户与调用客户端，例如：
+                <LLMBundle tenant_id="tenant_001", llm_type="EMBEDDING", llm_name="BAAI/bge-large-zh-v1.5">
+            vector_size (int): 向量维度大小（如 1024、1536、768），例如：
+                1024
+
+        返回值：
+            None: 无返回值（切片持久化写入搜索引擎，任务状态与统计指标记录进上下文）
+        """
+        # —— 0. 从上下文提取当前切片任务的核心标识与参数 ——
+        ctx = self._task_context
+        task_id = ctx.id                  # 任务唯一 ID，例如: "task_9f8e7d6c5b"
+        task_tenant_id = ctx.tenant_id    # 租户 ID，例如: "tenant_001"
+        task_dataset_id = ctx.kb_id       # 知识库 ID，例如: "kb_alpha_01"
+        task_doc_id = ctx.doc_id          # 所属文档 ID，例如: "doc_a1b2c3d4e5"
+        task_start_ts = timer()           # 任务启动计时起点，例如: 1725541234.56
+
+        # 切片等待计时补偿回调：当任务排队等待被限流器唤醒时，补偿等待时长以确保计时准确
         def on_chunking_start(wait_time):
             nonlocal task_start_ts
             task_start_ts += wait_time
 
+        # 优先使用解析器局部配置指定的模型 ID，若未指定则回退到任务全局模型 ID
+        # 结果例如: "chatglm3-6b" 或 "qwen-plus"
         doc_task_llm_id = ctx.parser_config.get("llm_id") or ctx.llm_id
         ctx.raw_task["llm_id"] = doc_task_llm_id
 
-        # Build chunks
+        # —— 1. 从对象存储拉取文件二进制并执行分块解析 ——
         start_ts = timer()
         chunk_service = ChunkService(ctx=ctx)
 
-        # Get storage binary
+        # 获取文档在 MinIO/S3 上的存储桶与文件对象名
+        # 产出结构例如: bucket="ragflow", name="tenant_001/doc_a1b2c3d4e5.pdf"
         bucket, name = File2DocumentService.get_storage_address(doc_id=ctx.doc_id)
         binary = await self._get_storage_binary(bucket, name)
         if binary is None:
             raise FileNotFoundError(f"Can not find file <{ctx.name}> from minio. Could you try it again.")
 
+        # 调用切片服务完成解析、切块与局部文本丰富（如关键词抽取、问答生成等）
+        # 产出的 chunks 是切片字典列表，形态例如：
+        # chunks = [
+        #     {
+        #         "id": "chunk_001",
+        #         "doc_id": "doc_a1b2c3d4e5",
+        #         "docnm_kwd": "产品手册.pdf",
+        #         "title_tks": "产品 介绍 手册",
+        #         "content_with_weight": "第一章 系统概述：本系统用于构建企业级知识库...",
+        #         "page_num_int": [1],
+        #         "position_int": [[1, 100, 200, 50, 80]],
+        #         "important_kwd": ["系统概述", "知识库", "企业级"]
+        #     }
+        # ]
         chunks = await chunk_service.build_chunks(binary, on_chunking_start)
         ctx.recording_context.record("chunks", chunks)
+        # 提取切片 ID 列表以供追踪对比，形态例如: ["chunk_001", "chunk_002"]
         chunk_ids = [c.get("id") for c in chunks if isinstance(c, dict) and "id" in c]
         ctx.recording_context.record("chunk_ids_count", len(chunk_ids))
 
         logging.info("Build document {}: {:.2f}s".format(ctx.name, timer() - start_ts))
 
+        # —— 2. 空切片特判与处理 ——
+        # 若当前页码范围为空白页或无有效正文（chunks 为空），仍必须向分布式栅栏汇报（传入 0 切片与 0 token）
+        # 扣减 Redis 中的待办任务计数器，避免其他并发任务或整篇文档因缺少本次扣减而永远等待
         if not chunks:
             ctx.progress_cb(msg=f"No chunk built from {ctx.name}")
             if not await self._run_document_post_chunking_if_last(
@@ -612,10 +660,14 @@ class TaskHandler:
 
         ctx.progress_cb(msg="Generate {} chunks".format(len(chunks)))
 
-        # Embed chunks
+        # —— 3. 向量化嵌入计算 ——
         start_ts = timer()
         embedding_service = EmbeddingService(ctx=ctx)
         try:
+            # 批量计算文本向量，并将向量结果就地写入 chunks 列表中各元素的字段中
+            # 输入: 上述 chunks 切片字典列表
+            # 返回元组: (总 token 数, 向量维度)，例如: (1850, 1024)
+            # chunks 内部就地增补字段例如: chunk["q_1024_vec"] = [0.012, -0.045, 0.089, ...]
             token_count, vector_size = await embedding_service.embed_chunks(chunks, embedding_model, ctx.parser_config)
         except TaskCanceledException:
             raise
@@ -631,21 +683,27 @@ class TaskHandler:
         logging.info(progress_message)
         ctx.progress_cb(msg=progress_message)
 
+        # —— 4. 可选：异步抽取目录大纲（TOC） ——
+        # 当使用 Naive 基础切块器且启用了目录大纲提取时，在后台线程并发生成目录大纲
         toc_thread = None
         if ctx.parser_id.lower() == "naive" and ctx.parser_config.get("toc_extraction", False):
             toc_thread = asyncio.create_task(asyncio.to_thread(self._build_toc, ctx, chunks, ctx.progress_cb))
 
-        # Insert chunks
+        # —— 5. 切片写入底层全文与向量检索存储（Elasticsearch / Infinity） ——
+        # 统计去重后的实际切片总数，例如: 15
         chunk_count = len(set([chunk["id"] for chunk in chunks]))
         start_ts = timer()
 
         chunk_service = ChunkService(ctx=ctx)
 
+        # 写入前检查当前任务是否已被用户取消
         if ctx.has_canceled_func(task_id):
             abort_doc_chunking_counter(task_doc_id)
             ctx.progress_cb(-1, msg="Task has been canceled.")
             return
 
+        # 批量向底层索引存储插入切片，返回布尔值：True 成功 / False 失败
+        # 输入 chunks 为携带向量与分词信息的切片字典列表
         insert_result = await chunk_service.insert_chunks(task_id, task_tenant_id, task_dataset_id, chunks)
 
         if not insert_result:
@@ -654,28 +712,45 @@ class TaskHandler:
             return
         ctx.recording_context.record("insertion_result", "success")
 
-        # Post-processing
+        # —— 6. 切片入库后的局部增强（表格解析元数据与目录大纲存盘） ——
         post_processor = PostProcessor(ctx=ctx)
+        # 将表格解析产出的特定结构元数据写回数据表
         await post_processor.process_table_parser_metadata(task_doc_id, chunks)
 
         ctx.progress_cb(msg="Indexing done ({:.2f}s).".format(timer() - start_ts))
 
+        # 等待并发的大纲目录抽取线程完成，并将生成的 TOC 虚拟切片存入检索存储
+        # toc_chunk 形如:
+        # {
+        #     "id": "toc_a1b2c3",
+        #     "doc_id": "doc_a1b2c3d4e5",
+        #     "content_with_weight": "1. 概述... \n 2. 架构...",
+        #     "source_type": "toc"
+        # }
         toc_chunk = await self._process_toc_thread(toc_thread)
         if toc_chunk:
             ctx.recording_context.record("toc_chunk", [toc_chunk])
             await post_processor.insert_toc_chunk(toc_chunk, chunk_service)
 
+        # 再次检查当前任务是否已被用户取消
         if ctx.has_canceled_func(task_id):
             abort_doc_chunking_counter(task_doc_id)
             ctx.progress_cb(-1, msg="Task has been canceled.")
             return
 
-        # Update document stats
+        # —— 7. 累加更新文档全局统计指标 ——
         if ctx.write_interceptor:
             ctx.write_interceptor.intercept("DocumentService.increment_chunk_num")
         else:
+            # 原子累加 MySQL 中 document 表的 chunk_num（切片总数）与 token_num（消耗 token 总数）
+            # 传入参数: doc_id="doc_a1b2c3d4e5", kb_id="kb_alpha_01", token_count=1850, chunk_count=15
             DocumentService.increment_chunk_num(task_doc_id, task_dataset_id, token_count, chunk_count, 0)
 
+        # —— 8. 分布式栅栏判定：若是该文档最后一个完成的切片任务，则触发全局后处理 ——
+        # 1. 内部原子递减 Redis 计数器: credit_doc_chunking_task(task_doc_id, task_id)
+        # 2. 若剩余任务数 > 0: 说明还有其他分片在跑，当前任务直接返回 True 正常结束
+        # 3. 若剩余任务数 == 0: 说明当前任务是最后一个完成的分片，触发 RAPTOR 摘要树聚合与文档结构编译
+        # 4. 若任务被取消，返回 False，终止流程
         if not await self._run_document_post_chunking_if_last(
             embedding_model,
             vector_size,
@@ -685,6 +760,7 @@ class TaskHandler:
         ):
             return
 
+        # —— 9. 当前分片任务圆满完成，记录耗时与状态 ——
         task_time_cost = timer() - task_start_ts
         ctx.recording_context.record("task_status", "completed")
         ctx.progress_cb(prog=1.0, msg="Task done ({:.2f}s)".format(task_time_cost))
@@ -699,13 +775,30 @@ class TaskHandler:
         chunks_len: int,
         token_count: int,
     ) -> bool:
-        """Thin delegator. The pipeline lives in
-        ``rag.svr.task_executor_refactor.chunk_post_processor``.
+        """文档切片收尾后处理委托门禁 —— 终局守门代理人。
+
+        传入参数：
+            embedding_model (LLMBundle): 向量模型运行时封装，例如：
+                <LLMBundle tenant_id="tenant_001", llm_type="EMBEDDING", llm_name="BAAI/bge-large-zh-v1.5">
+            vector_size (int): 向量维度大小（如 1024、1536、768），例如：
+                1024
+            task_start_ts (float): 任务开始时间戳（秒），例如：
+                1725541234.56
+            chunks_len (int): 当前任务产出的切片数量，例如：
+                15
+            token_count (int): 当前任务消耗的总 token 数，例如：
+                1850
+
+        返回值：
+            bool: 任务是否可正常结束推进，例如：
+                True   # 可以推进到本任务的最终完成状态（无论是否是最后一个任务）
+                False  # 任务已取消或发生中止，不应标记完成
         """
         from rag.svr.task_executor_refactor.chunk_post_processor import (
             run_document_post_chunking_if_last,
         )
 
+        # 转发至 chunk_post_processor 模块中的核心门禁函数执行计数扣减、全局后处理与状态收尾
         return await run_document_post_chunking_if_last(
             self,
             embedding_model,

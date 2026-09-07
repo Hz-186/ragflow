@@ -312,7 +312,6 @@ def _collect_evidence_ids(entities: list[dict], relations: list[dict], relevant_
 
 async def graph_explore(tools, query: str, keywords: str = "", doc_scope: list[str] | None = None) -> dict:
     """在已编译的知识图谱中漫游实体与关系以回答问题 —— 知识图谱多跳探索器。
-
     执行流程：
     1. 以 query 为语义输入稠密向量匹配前 _KG_SEEDS 个种子实体；
     2. 沿实体关联的关系边向外执行 _KG_HOPS 跳 BFS 扩展，收集关系与二阶邻居实体构建局部子图；

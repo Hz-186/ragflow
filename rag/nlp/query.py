@@ -1,19 +1,3 @@
-#
-#  Copyright 2024 The InfiniFlow Authors. All Rights Reserved.
-#
-#  Licensed under the Apache License, Version 2.0 (the "License");
-#  you may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
-#
-
 import logging
 import json
 import re
@@ -74,7 +58,6 @@ class FulltextQueryer(QueryBase):
             min_match = 0.6                      # 最低命中率：至少多少比例的词条要匹配上。
                                                  # search.py 首查传 0.3（近纯向量搜索时传 0），
                                                  # 空结果重试时传 0.1
-
         返回值的样子（二元组）：
             (
                 MatchTextExpr(
@@ -109,6 +92,27 @@ class FulltextQueryer(QueryBase):
         otxt = txt
         txt = self.rmWWW(txt)  # 去掉疑问语气词（什么/怎么/what/how 等），保留实义内容
 
+
+
+# """ 用户搜索 "machine learning"
+#     machine (权重 1.0), learning (权重 1.0)
+#
+#     machine 的同义词查出 apparatus、device → 打上权重 0.25
+#     learning 的同义词查出 study、acquisition → 打上权重 0.25
+#
+#         (machine^1.0000 "apparatus"^0.2500 "device"^0.2500)
+#         (learning^1.0000 "study"^0.2500 "acquisition"^0.2500)
+#
+#         "machine learning"^2.0000
+#
+#
+#     所以就是：
+#     [
+#         (machine^1.0000 "apparatus"^0.2500 "device"^0.2500)
+#         (learning^1.0000 "study"^0.2500 "acquisition"^0.2500)
+#         "machine learning"^2.0000
+#     ]
+# """
         if not self.is_chinese(txt):
             # ===== 英文（非中文）路线 =====
             txt = self.rmWWW(txt)
@@ -369,3 +373,26 @@ class FulltextQueryer(QueryBase):
                 keywords.append(f"{tk}^{w}")  # 带上自己的权重
 
         return MatchTextExpr(self.query_fields, " ".join(keywords), 100, {"minimum_should_match": min(3, round(len(keywords) / 10)), "original_query": " ".join(origin_keywords)})
+
+
+
+# {
+#   "query": {
+#     "bool": {
+#       "must": [
+#         {
+#           "query_string": {
+#             "query": "(machine^1.0000 \"apparatus\"^0.2500 \"device\"^0.2500) (learning^1.0000 \"study\"^0.2500 \"acquisition\"^0.2500) \"machine learning\"^2.0000",
+#             "fields": [
+#               "title_tks^2.0",
+#               "content_ltks"
+#             ],
+#             "type": "best_fields",
+#             "default_operator": "OR",
+#             "minimum_should_match": "0%"
+#           }
+#         }
+#       ]
+#     }
+#   }
+# }

@@ -1,19 +1,3 @@
-#
-#  Copyright 2025 The InfiniFlow Authors. All Rights Reserved.
-#
-#  Licensed under the Apache License, Version 2.0 (the "License");
-#  you may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
-#
-
 """``parser_config.delimiter`` 分隔符字段的统一解析器 —— 「自定义规则」的语法定义处。
 
 中文速览
@@ -29,61 +13,6 @@
 _build_cks 就进入「每段一切、各自独立成切片、忽略 chunk_token_num」的模式。
 历史上六个解析器各写各的分隔符解析、行为互相矛盾，现在统一收口到本模块的
 parse_delimiter_field + compile_delimiter_pattern。
-
-Canonical parser for the ``parser_config.delimiter`` field.
-
-Background
-----------
-The single string field ``parser_config.delimiter`` is consumed by several
-parser implementations depending only on the file extension. Before this
-module existed, six implementations diverged on:
-
-  * whether bare (non-backtick) characters are honored
-  * dedupe behavior
-  * sort order
-  * CRLF / CR normalization
-  * whether ``re.I`` is applied
-  * the ``re.escape`` round-trip dance in ``txt_parser``
-
-This module owns the canonical parsing rule. All six implementations now
-call :func:`parse_delimiter_field` and :func:`compile_delimiter_pattern`.
-
-Parsing rule
-------------
-A "delimiter field" is a string with the following grammar::
-
-    delimiter_field := token*
-    token           := backtick_wrapped | bare_char
-    backtick_wrapped := "`" bare_char+ "`"
-    bare_char        := any single Unicode character except "`"
-
-Semantics:
-
-  1. Any character(s) between matching backticks is one multi-character
-     delimiter.
-  2. Any character outside backticks is its own single-character
-     delimiter.
-  3. The two are combined, deduplicated, and sorted longest-first so
-     ``##`` matches before ``#``.
-  4. ``\\r\\n`` and standalone ``\\r`` are normalized to ``\\n`` at the
-     top of :func:`parse_delimiter_field` so Windows-line-ending
-     documents produce identical splits to Unix-line-ending ones.
-  5. No ``re.I`` is used. Delimiter matching is case-sensitive.
-
-Returns
--------
-:func:`parse_delimiter_field` returns a ``list[str]`` of raw delimiter
-strings (sorted longest-first, deduplicated, CRLF-normalized).
-:func:`compile_delimiter_pattern` takes that list and returns a regex
-alternation pattern with ``re.escape`` applied, ready for
-``re.split(r"(%s)" % pattern, ...)``.
-
-Frontend parity
----------------
-The web UI preview in ``web/src/utils/delimiter-preview.ts``
-(``parseDelimitersForDisplay``) follows the same parsing rule
-(normalization, dedupe, longest-first order) and applies whitespace
-glyph substitution only for display.
 """
 
 from __future__ import annotations
@@ -172,9 +101,9 @@ def parse_delimiter_field(s: str) -> list[str]:
     )
     return result
 
-"""
-就是方便后期的正则匹配，所以把所有的分隔符写成一起了，可以直接使用正则匹配
-"""
+# """
+# 就是方便后期的正则匹配，所以把所有的分隔符写成一起了，可以直接使用正则匹配
+# """
 def compile_delimiter_pattern(delimiters: list[str]) -> str:
     """把分隔符列表编译成「或」正则 —— 正则组装器。
 
