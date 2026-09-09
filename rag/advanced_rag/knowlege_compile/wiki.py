@@ -7,6 +7,44 @@
 4. 增量断点：分块抽取结果以 compile_kwd="wiki_map_extract" 记录持久化缓存，支持内容未改动时跳过重新抽取。
 
 公开入口函数：wiki_map_from_chunks。
+
+┌─ 本文件怎么读（导览）──────────────────────────────────────────────┐
+│                                                                   │
+│ 全文件用同一条「爱因斯坦」示例数据讲故事（与 structure.py 同一套    │
+│ 角色，方便两个文件对照阅读）：                                     │
+│                                                                   │
+│   知识库里有一篇文档 doc_01，切成两个分块：                        │
+│     chunk_01: "爱因斯坦于1905年提出了狭义相对论，                 │
+│                这一理论彻底改变了物理学的时间观。"                 │
+│     chunk_02: "光电效应论文为他赢得了1921年诺贝尔物理学奖。"       │
+│                                                                   │
+│   MAP 阶段把这两个分块交给大模型，换回五类知识（一次调用的返回     │
+│   长相见 _wiki_extract_one_batch 函数旁的大段 JSON 注释）：        │
+│     entities  → 爱因斯坦 / 狭义相对论 / 诺贝尔物理学奖             │
+│     concepts  → 光电效应（附定义摘录）                             │
+│     claims    → "爱因斯坦于1905年提出了狭义相对论"（带主语+置信度）│
+│     relations → 爱因斯坦 --propose--> 狭义相对论                   │
+│     topics    → ["现代物理学", "诺贝尔奖"]                         │
+│                                                                   │
+│   每条知识都带着「出处是哪个分块」的回执（chunk_ids）；并且每个    │
+│   分块的抽取结果会存进 ES 当断点缓存 —— 下次编译时内容没变的分块   │
+│   直接抄旧账，不再花钱调大模型（这就是"增量"的地基）。             │
+│                                                                   │
+│ 文件结构自上而下分六段：                                           │
+│   ① 常量与提示词模板（WIKI_MAP_SYSTEM / WIKI_MAP_USER_TEMPLATE，  │
+│      模板填充后的完整长相见模板定义之后的注释块）                  │
+│   ② 辅助小工具（提示词拼装 / C1 假标签防御 / 结果合并）            │
+│   ③ 断点与状态机（ES 读写 / 版本缓存 / 代际快照三步切换）          │
+│   ④ 批次执行与公共入口（_wiki_extract_one_batch 单批流水、        │
+│      wiki_map_from_chunks 全流程 —— 端到端走查见该函数下方的       │
+│      模块级注释块，含首次构建、增量重跑、原样重跑三个场景）        │
+│   ⑤ REDUCE 残骸（全量归约阶段已删除，只剩读侧函数，主链无生产者，  │
+│      见 REDUCE 段头注释的现状说明）                                │
+│   ⑥ PLAN / REFINE 库函数（wiki_plan_from_reduction /              │
+│      wiki_refine_from_plan —— 只被 runner.py 的 synthesis 旁路     │
+│      调用；wiki 主链的建页逻辑在 wiki_incremental.py，不在这里）   │
+│                                                                   │
+└───────────────────────────────────────────────────────────────────┘
 """
 
 import asyncio
@@ -32,6 +70,9 @@ from ._common import (
 
 
 # 全局管道版本号 —— 升级该常量将自动使旧版全部缓存失效
+# 人话：指纹 = xxh64(正文 + "|" + 版本号)。把 "v1" 改成 "v2"，
+# 哪怕分块正文一个字没动，指纹也全变 → 所有旧断点缓存全部作废 → 全量重抽。
+# 适合在「抽取提示词大改版，旧抽取结果不可信」时使用。
 _WIKI_PIPELINE_REV = "v1"
 
 
@@ -39,12 +80,20 @@ def _chunk_hash(content: str) -> str:
     """计算分块内容与全局管线版本号混合后的确定性 xxHash64 哈希指纹 —— 分块哈希指纹计算工。
 
     参数:
-        content: 分块正文文本内容，示例："量子力学是研究微观粒子运动规律的物理学分支..."
+        content: 分块正文文本内容，示例："爱因斯坦于1905年提出了狭义相对论，这一理论彻底改变了物理学的时间观。"
 
     返回值:
         16 位十六进制哈希字符串，示例："3f2a1b4c5d6e7f80"
+        （同样内容永远算出同一指纹；内容改一个字，指纹就完全变样 ——
+          这是全模块"内容变没变"判断的地基）
+
+    人话：把「分块正文 + 管线版本号」拼成一锅，搅出来的 16 位指纹。
+    指纹相同 = 内容没变，旧抽取结果还能用；指纹不同 = 内容动过了，得重新调大模型。
     """
+    # 拼接待哈希正文：正文 + "|" + 管线版本号
+    # 爱因斯坦示例: body = "爱因斯坦于1905年提出了狭义相对论，这一理论彻底改变了物理学的时间观。|v1"
     body = (content or "") + "|" + _WIKI_PIPELINE_REV
+    # xxh64 搅拌 → 16 位十六进制指纹，示例: "3f2a1b4c5d6e7f80"
     return _xxhash.xxh64(body.encode("utf-8", "surrogatepass")).hexdigest()
 
 
@@ -56,13 +105,15 @@ from .structure import (
 
 # ── 常量定义 ─────────────────────────────────────────────────────────────
 
+# MAP 抽取结果行的 compile_kwd 标记（ES 行的"货架标签"）：
+# 每个分块抽取完就存一行 compile_kwd="wiki_map_extract" 的断点缓存（详见 _wiki_build_resume_doc）。
 WIKI_MAP_COMPILE_KWD = "wiki_map_extract"
+# 状态快照行的标记：每个分块一行，记录"上次成功编译时该分块的指纹"（详见 _wiki_commit_active_map_state）
 WIKI_MAP_STATE_COMPILE_KWD = "wiki_map_state"
+# 状态快照的"代际指针"行标记：全库仅一行，指明当前哪一代快照算数
 WIKI_MAP_STATE_META_COMPILE_KWD = "wiki_map_state_meta"
 DEFAULT_WIKI_MAP_WORKERS = 20
 DEFAULT_WIKI_MAP_TIMEOUT = 600
-
-
 async def _wiki_disabled_doc_ids(kb_id: str) -> set[str]:
     """从数据库中检索指定知识库下已被禁用的文档 ID 集合 —— 禁用文档过滤器。
 
@@ -76,6 +127,8 @@ async def _wiki_disabled_doc_ids(kb_id: str) -> set[str]:
 
     disabled = await thread_pool_exec(DocumentService.get_disabled_doc_ids_by_kb_id, kb_id)
     return _wiki_doc_ids(disabled)
+
+
 
 
 def _wiki_doc_ids(value) -> set[str]:
@@ -105,29 +158,50 @@ def _wiki_compare_chunk_states(previous: dict[str, dict], current: dict[str, dic
     """比对前后两次成功 Wiki 编译的分块状态字典，计算新增、变更、删除及未变动的分块增量 —— 分块增量差异比对工。
 
     参数:
-        previous: 上一次构建时的分块状态字典，结构示例：{"c1": {"doc_id": "d1", "hash": "h1"}}
-        current: 当前最新的分块状态字典，结构示例：{"c1": {"doc_id": "d1", "hash": "h1_new"}, "c2": {"doc_id": "d1", "hash": "h2"}}
+        previous: 上一次构建时的分块状态字典，结构示例：
+            {
+                "chunk_01": {"doc_id": "doc_01", "hash": "aaa1"},
+                "chunk_02": {"doc_id": "doc_01", "hash": "bbb2"}
+            }
+        current: 当前最新的分块状态字典，结构示例（chunk_02 被编辑过、新增 chunk_03）：
+            {
+                "chunk_01": {"doc_id": "doc_01", "hash": "aaa1"},          # 指纹没变 → unchanged
+                "chunk_02": {"doc_id": "doc_01", "hash": "fff6"},          # 指纹变了 → changed
+                "chunk_03": {"doc_id": "doc_02", "hash": "ccc3"}           # 上次没有 → new
+            }
 
     返回值:
-        包含四个集合的差异字典，结构示例：
+        包含四个集合的差异字典，结构示例（承接上面的输入）：
             {
-                "new_chunk_ids": {"c2"},
-                "changed_chunk_ids": {"c1"},
-                "deleted_chunk_ids": set(),
-                "unchanged_chunk_ids": set()
+                "new_chunk_ids": {"chunk_03"},          # 上次没有、这次有 → 全新分块
+                "changed_chunk_ids": {"chunk_02"},      # 两次都有但指纹不同 → 内容被编辑过
+                "deleted_chunk_ids": set(),             # 上次有、这次没有 → 分块被删除
+                "unchanged_chunk_ids": {"chunk_01"}     # 指纹相同 → 内容一字未动
             }
+
+    人话：这就是 wiki 增量的"查账"。上次编译完给每个分块留了指纹底账（previous），
+    这次重新扫一遍所有分块的指纹（current），对一遍账：
+    新面孔→new，改过的→changed，消失的→deleted，没动的→unchanged。
+    只有 new + changed 需要重新调大模型抽取，unchanged 直接抄旧账，deleted 触发下游清理。
     """
-    previous_ids = set(previous)
-    current_ids = set(current)
-    common_ids = previous_ids & current_ids
+    previous_ids = set(previous)     # 上次的分块 ID 集合，示例: {"chunk_01", "chunk_02"}
+    current_ids = set(current)       # 这次的分块 ID 集合，示例: {"chunk_01", "chunk_02", "chunk_03"}
+    common_ids = previous_ids & current_ids  # 两次都有的，示例: {"chunk_01", "chunk_02"}
     return {
+        # 这次有、上次没有 → 新增，示例: {"chunk_03"}
         "new_chunk_ids": current_ids - previous_ids,
+        # 两次都有但指纹对不上 → 内容被改过，示例: {"chunk_02"}
         "changed_chunk_ids": {chunk_id for chunk_id in common_ids if previous[chunk_id].get("hash") != current[chunk_id].get("hash")},
+        # 上次有、这次没有 → 已删除，示例: set()
         "deleted_chunk_ids": previous_ids - current_ids,
+        # 指纹完全一致 → 未变动，示例: {"chunk_01"}
         "unchanged_chunk_ids": {chunk_id for chunk_id in common_ids if previous[chunk_id].get("hash") == current[chunk_id].get("hash")},
     }
 
 
+# 系统提示词人话翻译："你是知识抽取引擎。从给定文档片段抽取结构化知识，
+# 只返回严格符合 schema 的合法 JSON，JSON 对象之外不许有任何文字；
+# 某类别没有条目就填 []；生成数据保持分块原文的语言（中文文档抽中文实体）。"
 WIKI_MAP_SYSTEM = (
     "You are a knowledge extraction engine. Extract structured knowledge from the "
     "provided document section. Return ONLY valid JSON matching the schema exactly. "
@@ -136,6 +210,12 @@ WIKI_MAP_SYSTEM = (
 )
 
 
+# 默认实体 schema 体（会嵌进用户提示词的 {entity_type_rules} 占位符处）。
+# 要求每个实体带四个字段，爱因斯坦示例：
+#   "name": "爱因斯坦"                       ← 正文里出现过的规范名
+#   "type": "person"                          ← 枚举之一
+#   "aliases": ["Albert Einstein"]            ← 别名列表
+#   "source_chunk_id": "C1"                   ← 出处分块标签（脚手架标签，非真实 ID）
 _DEFAULT_ENTITY_SCHEMA_BODY = (
     '      "name": "string — entity canonical name as it appears in text",\n'
     '      "type": "string — one of: person|org|product|regulation|location|system|equipment|other",\n'
@@ -143,6 +223,8 @@ _DEFAULT_ENTITY_SCHEMA_BODY = (
     '      "source_chunk_id": "string — exact value from the chunk_id list above"'
 )
 
+# 默认关系 schema 体。每条关系连接两个实体/概念名，爱因斯坦示例：
+#   {"from": "爱因斯坦", "to": "狭义相对论", "type": "propose", "source_chunk_id": "C1"}
 _DEFAULT_RELATION_SCHEMA_BODY = (
     '      "from": "string — source entity/concept name",\n'
     '      "to": "string — target entity/concept name",\n'
@@ -241,6 +323,55 @@ Rules:
 - Return ONLY the JSON object, no markdown fences, no commentary.
 {custom_rules}"""
 
+# ── 模板填充后的完整长相（爱因斯坦示例走一遍）──────────────────────────
+#
+# 输入：doc_01 的两个分块（chunk_01 / chunk_02）打包成一个批次，
+# 经 _wiki_build_user_prompt 填充占位符后，发给大模型的用户提示词长这样：
+#
+# ## Document context
+# Document id: doc_01
+# Batch contains 2 packed chunk(s). Each chunk is introduced by a
+# ``[CHUNK_ID <id>]`` line. The chunk_id values to choose from are:
+# - C1
+# - C2
+#
+# ## Packed chunks
+# [CHUNK_ID C1]
+# 爱因斯坦于1905年提出了狭义相对论，这一理论彻底改变了物理学的时间观。
+#
+# [CHUNK_ID C2]
+# 光电效应论文为他赢得了1921年诺贝尔物理学奖。
+#
+# ---
+#
+# Extract all knowledge from every chunk and return a single JSON object with this
+# exact schema:
+#
+# {
+#   "entities": [
+#     {
+#       "name": "string - person|org|product|regulation|location|system|equipment|other",
+#       ...
+#     }
+#   ],
+#   ...（五类 schema，占位符 {entity_type_rules} 等已替换成具体枚举）
+# }
+#
+# Rules:
+# - ``source_chunk_id`` MUST be one of the chunk_id values listed above (they
+#   look like ``C1``, ``C2``, …); do NOT invent new ids. ...
+# - The ``[CHUNK_ID …]`` header lines AND the ``C1``/``C2``/… chunk tags are
+#   prompt scaffolding — they are NOT part of the document content. ...
+#   （这两条规则 + 下方 BAD 示例，是防"模型把 C1 当成实体名抽出来"的
+#     三层防御中的提示词层，详见 _wiki_scrub_known_ids / _wiki_item_has_identifier_name）
+# ...
+#
+# 注意两个关键设计：
+# 1. 模型看到的是脚手架标签 C1/C2（不是真实的 chunk_01/chunk_02）——
+#    抽取结果里带的是 C1/C2，之后由 _wiki_resolve_chunk_ids 翻译回真实 ID；
+# 2. {custom_rules} 占位符是知识库管理员自定义的抽取规则（如"只抽上市公司"），
+#    没配置时为空串。
+
 
 # ── 辅助工具 ─────────────────────────────────────────────────────────────
 
@@ -259,6 +390,8 @@ def _wiki_empty_extract() -> dict:
                 "relations": [],
                 "topics": []
             }
+    （所有批次的抽取结果、缓存命中结果最终都往这个骨架里填——统一形状，后面
+      合并/归约才不用做类型判断）
     """
     return {
         "entities": [],
@@ -273,31 +406,46 @@ def _wiki_render_schema_body(fields, language: str, default_body: str, *, indent
     """根据自定义配置字段列表渲染实体或关系的 JSON Schema 格式说明文本 —— 提取模式体渲染工。
 
     参数:
-        fields: 字段配置列表，结构示例：[{"name": "title", "type": "str", "description": "文章标题"}]
+        fields: 字段配置列表，结构示例：
+            [
+                {"name": "title", "type": "str", "description": "文章标题"},
+                {"name": "tags", "type": "list"}
+            ]
         language: 本地化语言代码，示例："zh"
-        default_body: 默认 Schema 格式文本，示例：_DEFAULT_ENTITY_SCHEMA_BODY
+        default_body: 默认 Schema 格式文本（fields 为空时原样返回），示例：_DEFAULT_ENTITY_SCHEMA_BODY
         indent: 缩进空格数量，默认 6。
 
     返回值:
-        渲染好的多行 Schema 格式字符串，结构示例：'      "name": "string",\n      "source_chunk_id": "string"'
+        渲染好的多行 Schema 格式字符串，结构示例：
+            '      "title": "string — 文章标题",\n      "tags": ["string"],\n      "source_chunk_id": "string — exact value from the chunk_id list above"'
+        （type 按配置翻译成占位样子：str→"string"、list→["string"]、int→0、float→0.0、bool→false）
+
+    人话：管理员在模板里自定义了"实体要带哪些字段"，这个函数把字段清单翻译成
+    塞进提示词的 JSON 模样，让大模型照着这个格式输出。
     """
+    # 没有自定义字段 → 直接用内置默认 schema 体
     if not fields:
         return default_body
 
     pad = " " * indent
     lines: list[str] = []
     seen: set[str] = set()
+    # 逐个字段翻译成 JSON 占位行：
+    #   {"name": "title", "type": "str",  "description": "文章标题"} → '      "title": "string — 文章标题",'
+    #   {"name": "tags",  "type": "list"}                            → '      "tags": ["string"],'
     for f in fields:
         if not isinstance(f, dict):
             continue
         name = f.get("name") or ""
         name = name.strip() if isinstance(name, str) else ""
+        # 字段名为空 / 重复 / 已由内置逻辑负责（source_chunk_id）的跳过
         if not name or name in seen or name == "source_chunk_id":
             continue
         seen.add(name)
 
         ftype = f.get("type", "str")
         desc = _struct_localize(f.get("description", ""), language)
+        # 字段类型 → JSON 占位符。字符串类型时把描述嵌进去给模型看
         if ftype == "list":
             placeholder = '["string"]'
         elif ftype == "int":
@@ -308,6 +456,7 @@ def _wiki_render_schema_body(fields, language: str, default_body: str, *, indent
             placeholder = "false"
         else:
             if desc:
+                # 描述里的换行和花括号会破坏 JSON 展示，替换成安全的空格/圆括号
                 safe = desc.replace("\n", " ").replace("{", "(").replace("}", ")").strip()
                 placeholder = f'"string — {safe}"'
             else:
@@ -317,6 +466,7 @@ def _wiki_render_schema_body(fields, language: str, default_body: str, *, indent
     if not lines:
         return default_body
 
+    # 溯源字段永远排在最后 —— 它是模型输出和真实分块对账的钥匙
     lines.append(f'{pad}"source_chunk_id": "string — exact value from the chunk_id list above"')
     return ",\n".join(lines)
 
@@ -496,20 +646,26 @@ def _wiki_build_user_prompt(
     参数:
         parser_config: 编译配置字典，结构示例：{"entity": {...}}
         language: 本地化语言代码，示例："zh"
-        doc_id: 来源文档 ID，示例："doc_101"
-        chunk_count: 当前批次包含的分块总数，示例：4
+        doc_id: 来源文档 ID，示例："doc_01"
+        chunk_count: 当前批次包含的分块总数，示例：2
         chunk_id_list: 供模型选用的分块 ID 列表文本，示例："- C1\n- C2"
-        packed_chunks: 包含分块正文的组合文本，示例："[CHUNK_ID C1]\n段落A..."
+        packed_chunks: 包含分块正文的组合文本，示例："[CHUNK_ID C1]\n爱因斯坦于1905年提出了狭义相对论..."
 
     返回值:
-        组装完成供大模型推理的完整用户提示词字符串。
-        长相示例:
-        "## Document context\nDocument id: doc_101\nBatch contains 2 packed chunk(s)...\n{\n  \"entities\": [...]\n}\nRules:\n- source_chunk_id MUST be one of...\n[CHUNK_ID C1]\n段落正文..."
+        组装完成供大模型推理的完整用户提示词字符串（填充后的完整长相见
+        WIKI_MAP_USER_TEMPLATE 定义之后的「模板填充后的完整长相」注释块）。
     """
-    ent_fields = _wiki_template_fields(parser_config, "entity")
-    rel_fields = _wiki_template_fields(parser_config, "relation")
+    # 从模板配置的四个小节里取字段定义，分别渲染提示词里对应的占位内容
+    ent_fields = _wiki_template_fields(parser_config, "entity")      # 示例: [{"type": "person", "description": "人类", "rule": "排除虚构人物"}]
+    rel_fields = _wiki_template_fields(parser_config, "relation")    # 示例: [{"type": "propose", "description": "提出理论"}]
     concept_fields = _wiki_template_fields(parser_config, "concept")
     claim_fields = _wiki_template_fields(parser_config, "claim")
+    # 四类占位文本逐个渲染：
+    # entity_type_rules 示例: "type: person\n  - description: 人类\n  - rule: 排除虚构人物\ntype: org\n  - ..."
+    # relation_type_rules 示例: "type: propose\n  - description: 提出理论"
+    # concept_term 示例: "光电效应|波粒二象性"（竖线枚举）
+    # concept_definition_excerpt 示例: "光电效应:金属表面受光照射释放电子的现象"
+    # claim_statement / claim_subject 示例: "事实陈述" / "论断所描述的实体"
     entity_type_rules = _wiki_type_rules(ent_fields)
     relation_type_rules = _wiki_type_rules(rel_fields)
     concept_term = _wiki_pipe_join(concept_fields, "term")
@@ -518,6 +674,7 @@ def _wiki_build_user_prompt(
     claim_subject = _wiki_named_field_description(claim_fields, "subject")
     custom_rules = _wiki_template_custom_rules(parser_config)
 
+    # 新版配置（entity/relation 顶层小节）没配时，回退读旧版位置 output.entities.fields
     if isinstance(parser_config, dict):
         output = _struct_get(parser_config, "output", default={}) or {}
         entities_cfg = _struct_get(output, "entities", default={}) or {}
@@ -537,6 +694,7 @@ def _wiki_build_user_prompt(
                 _DEFAULT_RELATION_SCHEMA_BODY,
             )
 
+    # 全都没配 → 使用内置默认枚举，保证提示词占位符永远不为空
     if not entity_type_rules:
         entity_type_rules = "person|org|product|regulation|location|system|equipment|other"
     if not relation_type_rules:
@@ -552,6 +710,7 @@ def _wiki_build_user_prompt(
     if not custom_rules:
         custom_rules = _wiki_build_custom_rules(parser_config, language)
 
+    # 最后一步：把所有渲染结果灌进模板占位符，产出最终用户提示词
     return WIKI_MAP_USER_TEMPLATE.format(
         doc_id=doc_id,
         chunk_count=chunk_count,
@@ -588,18 +747,31 @@ def _wiki_scrub_known_ids(text: str, ids_to_remove) -> str:
     """从输入正文中剔除已知分块 ID、文档 ID 及十六进制哈希标记以防大模型误将其提取为实体 —— 提示词文本去噪清洗工。
 
     参数:
-        text: 待清洗的原始段落文本，示例："[c1a2b3d4] 量子计算机..."
-        ids_to_remove: 待剔除的显式 ID 集合或列表，结构示例：["c1a2b3d4", "doc_01"]
+        text: 待清洗的原始段落文本，示例：
+            "chunk_01 爱因斯坦于1905年提出了狭义相对论"（正文里混进了内部 ID）
+        ids_to_remove: 待剔除的显式 ID 集合或列表，结构示例：["chunk_01", "chunk_02", "doc_01"]
 
     返回值:
-        清洗后的文本字符串，示例："量子计算机..."
+        清洗后的文本字符串，示例："爱因斯坦于1905年提出了狭义相对论"
+
+    背景（为什么要清洗）：提示词里给模型看的是 "[CHUNK_ID C1]" 标签 + 正文。
+    有些文档的正文里本身就嵌着数据库 ID / 哈希串，模型看到了容易"顺手"把它们
+    当成实体抽出来（例如抽出 {"name": "a3f1b2c4d5e6f7a8", "type": "product"}）。
+    这里是防御的第一层（清洗层）：发提示词前就把已知 ID 和十六进制串从正文里抹掉。
+    其余两层：提示词规则层（WIKI_MAP_USER_TEMPLATE 里的 BAD 示例）+ 结果侧过滤层
+    （_wiki_resolve_chunk_ids 调 _wiki_item_has_identifier_name →
+    _wiki_looks_like_identifier 正则，逐条剔除名字像标签/哈希的假实体条目）。
     """
     if not text:
         return text
     out = text
+    # 第一刀：把已知的显式 ID（分块 ID、文档 ID）从正文里整串抹掉
+    # 示例: "chunk_01 爱因斯坦..." → " 爱因斯坦..."
     for h in ids_to_remove or ():
         if h and isinstance(h, str) and h in out:
             out = out.replace(h, "")
+    # 第二刀：抹掉正文中恰好是 16 位 / 32 位十六进制的 token（像 xxh64 指纹或 MD5）
+    # 示例: "参见 a3f1b2c4d5e6f7a8 号记录" → "参见  号记录"
     out = _HEX16_TOKEN_RE.sub("", out)
     out = _HEX32_TOKEN_RE.sub("", out)
     return out
@@ -667,10 +839,16 @@ def _wiki_looks_like_identifier(s) -> bool:
     """判断字符串是否呈现分块标签（如 C1）、散列哈希值或 UUID 等系统标识符特征 —— 标识符检测工。
 
     参数:
-        s: 待检测的名称字符串，示例："C1" 或 "量子力学"
+        s: 待检测的名称字符串，示例："C1" 或 "爱因斯坦"
 
     返回值:
         若属于机器标识符则返回 True，人类可读名称返回 False，示例：False
+
+    爱因斯坦走一遍：
+        "C1"          → True  （脚手架标签，不是实体名）
+        "c0001"       → True  （标签的另一种写法）
+        "a3f1b2c4..." → True  （16 位哈希）
+        "爱因斯坦"     → False （真人名，放行）
     """
     if not isinstance(s, str):
         return False
@@ -686,6 +864,12 @@ def _wiki_item_has_identifier_name(key: str, item: dict) -> bool:
 
     返回值:
         若条目名称为非法标识符返回 True，否则返回 False，示例：True
+
+    各类别检查的"名称位"不同（对应模型输出的 schema 字段）：
+        entities  → 查 item["name"]         例: {"name": "C1"}                → 命中
+        concepts  → 查 item["term"]         例: {"term": "爱因斯坦"}           → 放行
+        claims    → 查 item["subject"]      例: {"subject": "爱因斯坦"}        → 放行
+        relations → 查 item["from"] 和 ["to"] 例: {"from": "C1", "to": "爱因斯坦"} → 命中（一端是标签就整条丢弃）
     """
     if key == "entities":
         return _wiki_looks_like_identifier(item.get("name", ""))
@@ -705,43 +889,72 @@ def _wiki_resolve_chunk_ids(
     """将批次模型输出中的脚手架分块标签映射回真实的分块 ID，并按分块组织局部知识 —— 来源分块归属划分工。
 
     参数:
-        extract: 当前批次解包后的提取结果，结构示例：{"entities": [{"name": "A", "source_chunk_id": "C1"}]}
-        label_to_id: 标签到真实分块 ID 的映射字典，结构示例：{"C1": "chunk_uuid_01"}
+        extract: 当前批次解包后的提取结果，结构示例：
+            {
+                "entities": [{"name": "爱因斯坦", "source_chunk_id": "C1"}],
+                "concepts": [{"term": "光电效应", "source_chunk_id": "C2"}],
+                "claims": [{"statement": "爱因斯坦提出了狭义相对论", "subject": "爱因斯坦", "source_chunk_id": "C1"}],
+                "relations": [{"from": "爱因斯坦", "to": "狭义相对论", "type": "propose", "source_chunk_id": "C1"}],
+                "topics": ["现代物理学"]
+            }
+        label_to_id: 标签到真实分块 ID 的映射字典，结构示例：{"C1": "chunk_01", "C2": "chunk_02"}
 
     返回值:
         二元组 (合并后的总提取字典, 分块 ID 到对应局部提取结果的映射字典)，结构示例：
             (
-                {"entities": [{"name": "A", "chunk_ids": ["chunk_uuid_01"]}]},
-                {"chunk_uuid_01": {"entities": [{"name": "A", "chunk_ids": ["chunk_uuid_01"]}]}}
+                {
+                    "entities": [{"name": "爱因斯坦", "chunk_ids": ["chunk_01"]}],
+                    "concepts": [{"term": "光电效应", "chunk_ids": ["chunk_02"]}],
+                    "claims": [{"statement": "...", "subject": "爱因斯坦", "chunk_ids": ["chunk_01"]}],
+                    "relations": [{"from": "爱因斯坦", "to": "狭义相对论", "type": "propose", "chunk_ids": ["chunk_01"]}],
+                    "topics": ["现代物理学"]
+                },
+                {
+                    "chunk_01": {"entities": [{"name": "爱因斯坦", "chunk_ids": ["chunk_01"]}], "concepts": [], "claims": [...], "relations": [...], "topics": ["现代物理学"]},
+                    "chunk_02": {"entities": [], "concepts": [{"term": "光电效应", "chunk_ids": ["chunk_02"]}], "claims": [], "relations": [], "topics": ["现代物理学"]}
+                }
             )
+
+    人话：模型交卷时写的是"C1 出的题"，这个函数负责把 C1 翻译回真实学号 chunk_01。
+    翻不出来（模型编造了 C9 这种不存在的标签）的条目直接丢弃；
+    翻出来但名字本身像标签/哈希（如 name="C1"）的条目也丢弃（结果侧过滤层，见 _wiki_scrub_known_ids 的三层防御说明）。
+    per_chunk 这份"每分块各自的答案"随后会被存进 ES 当断点缓存。
     """
+    # 先给批次里每个真实分块发一个空答案本
+    # 示例: per_chunk = {"chunk_01": 空五元, "chunk_02": 空五元}
     per_chunk: dict[str, dict] = {real_id: _wiki_empty_extract() for real_id in label_to_id.values()}
     merged = _wiki_empty_extract()
     merged["topics"] = list(extract.get("topics") or [])
-    # 步骤一：为每个分块复制主题列表
-    # 数据长相示例: per_chunk["chunk_uuid_01"]["topics"] = ["三国历史", "群雄割据"]
+    # 步骤一：为每个分块复制主题列表（主题不区分出处，所有分块人手一份）
+    # 数据长相示例: per_chunk["chunk_01"]["topics"] = ["现代物理学"]
     for chunk_extract in per_chunk.values():
         chunk_extract["topics"] = list(merged["topics"])
 
     dropped = 0
     dropped_identifier = 0
-    # 步骤二：遍历四类知识条目，校验真实分块并剔除脚手架误报
-    # 输入条目示例: {"name": "曹操", "source_chunk_id": "C1"}
-    # 映射产出示例: {"name": "曹操", "chunk_ids": ["chunk_uuid_01"]}
+    # 步骤二：遍历四类知识条目，做两个检查后翻译归属
+    # 输入条目示例: {"name": "爱因斯坦", "source_chunk_id": "C1"}
+    #   检查1: label_to_id 里查得到 C1 吗？（查不到 = 模型编造标签 → 丢弃）
+    #   检查2: 条目名字像标签/哈希吗？（name="C1" → 丢弃，三层防御的结果侧过滤层）
+    # 翻译产出示例: {"name": "爱因斯坦", "chunk_ids": ["chunk_01"]}
+    #   （source_chunk_id 字段被替换成 chunk_ids 列表，指向真实分块）
     for key in _EXTRACT_LIST_KEYS:
         for item in extract.get(key) or []:
             label = item.get("source_chunk_id")
             real = label_to_id.get(label) if isinstance(label, str) else None
             if real is None:
+                # 模型说这条知识出自 "C9"，但批次里根本没有 C9 → 丢弃整条
                 dropped += 1
                 continue
             if _wiki_item_has_identifier_name(key, item):
+                # 条目名本身是 C1 / 哈希这类标识符 → 是假实体，丢弃
                 dropped_identifier += 1
                 continue
+            # 翻译：剥掉 source_chunk_id，换上真实分块 ID 列表
             new_item = {k: v for k, v in item.items() if k != "source_chunk_id"}
             new_item["chunk_ids"] = [real]
-            merged[key].append(new_item)
-            per_chunk[real][key].append(new_item)
+            merged[key].append(new_item)          # 记进总账
+            per_chunk[real][key].append(new_item) # 同时记进该分块自己的答案本
 
     if dropped:
         logging.debug(f"wiki_map: dropped {dropped} item(s) with unrecognized source_chunk_id")
@@ -786,25 +999,40 @@ def _wiki_build_resume_doc(
     """构建用于存储单个分块映射抽取结果的搜索引擎不可检索断点行 —— 断点缓存行构建工。
 
     参数:
-        chunk_id: 来源分块 ID，示例："chunk_101"
+        chunk_id: 来源分块 ID，示例："chunk_01"
         doc_id: 文档 ID，示例："doc_01"
-        per_chunk_extract: 该分块对应的提取结果字典，结构示例：{"entities": [...], "concepts": [...]}
+        per_chunk_extract: 该分块对应的提取结果字典，结构示例：
+            {
+                "entities": [{"name": "爱因斯坦", "chunk_ids": ["chunk_01"]}],
+                "concepts": [],
+                "claims": [{"statement": "爱因斯坦提出了狭义相对论", "subject": "爱因斯坦", "chunk_ids": ["chunk_01"]}],
+                "relations": [{"from": "爱因斯坦", "to": "狭义相对论", "type": "propose", "chunk_ids": ["chunk_01"]}],
+                "topics": ["现代物理学"]
+            }
         chunk_hash: 分块当前内容的哈希指纹，示例："3f2a1b4c5d6e7f80"
 
     返回值:
         可直接写入搜索引擎的行字典，结构示例：
             {
-                "id": "xxh64_hash",
+                "id": "xxh64_hash",                        ← 主键 = xxh64("wiki_map_extract:doc_01:chunk_01:指纹")
                 "doc_id": "doc_01",
-                "compile_kwd": "wiki_map_extract",
-                "source_chunk_ids": ["chunk_101"],
-                "chunk_hash_kwd": "3f2a1b4c5d6e7f80",
-                "content_with_weight": "{\"entities\": [...]}",
-                "available_int": 0
+                "compile_kwd": "wiki_map_extract",         ← 货架标签：MAP 抽取断点
+                "source_chunk_ids": ["chunk_01"],
+                "chunk_hash_kwd": "3f2a1b4c5d6e7f80",      ← 内容指纹（缓存命中判断的钥匙）
+                "content_with_weight": "{\"entities\": [...]}",  ← 五元知识序列化成 JSON 字符串
+                "available_int": 0                         ← 不可检索：内部断点，不参与问答打分
             }
+
+    人话：这就是"存旧账"。每个分块抽取完，把答案和这时的内容指纹一起打包成
+    一行塞进 ES。下次编译时同一分块的指纹对上了，直接把这行里的答案抄走，
+    不用再花钱调大模型。available_int=0 让这行永远不出现在检索结果里——
+    它是账本，不是知识。
     """
     content_with_weight = json.dumps(per_chunk_extract, ensure_ascii=False)
     doc_id_str = str(doc_id)
+    # 主键由「货架标签 + 文档 + 分块 + 指纹」共同决定：
+    # 同一分块内容改一次 → 指纹变 → 主键变 → 新旧两版断点在 ES 里并存（版本化），
+    # 哪天内容改回去了，旧指纹那行还在，直接命中。
     return {
         "id": _stable_row_id(WIKI_MAP_COMPILE_KWD, doc_id_str, chunk_id, chunk_hash),
         "doc_id": doc_id_str,
@@ -828,21 +1056,29 @@ async def _wiki_load_map_versions(
         doc_ids: 待检索的文档 ID 或集合，示例："doc_01" 或 {"doc_01", "doc_02"}
         tenant_id: 租户 ID，示例："tenant_01"
         kb_id: 知识库 ID，示例："kb_001"
-        requested_versions: 可选的期望加载版本字典（分块 ID 到哈希的映射），结构示例：{"chunk_101": "3f2a1b4c5d6e7f80"}
+        requested_versions: 可选的期望加载版本字典（分块 ID 到哈希的映射），结构示例：
+            {"chunk_01": "3f2a1b4c5d6e7f80"}  ← 只想要"当前长这个样子"的那版
 
     返回值:
-        嵌套字典形式的历史版本结果（分块 ID -> 分块哈希 -> 提取结果字典），结构示例：
+        嵌套字典形式的版本结果（分块 ID -> 分块哈希 -> 提取结果字典），结构示例：
             {
-                "chunk_101": {
-                    "3f2a1b4c5d6e7f80": {
-                        "entities": [{"name": "量子计算机"}],
-                        "concepts": [],
-                        "claims": [],
-                        "relations": [],
-                        "topics": ["物理学"]
+                "chunk_01": {
+                    "3f2a1b4c5d6e7f80": {              ← 指纹精确匹配的那一版
+                        "entities": [{"name": "爱因斯坦", "chunk_ids": ["chunk_01"]}],
+                        "concepts": [], "claims": [], "relations": [],
+                        "topics": ["现代物理学"]
                     }
                 }
             }
+
+    人话：去 ES 的"旧账柜"（compile_kwd="wiki_map_extract" 的行）里翻账。
+    同一个分块可能存着好几版账（每次内容改动的指纹不同、主键不同，各存一行），
+    但注意：传了 requested_versions 时，过滤在**函数内部**就做掉了——指纹
+    直接写进 ES 检索条件（只翻这些指纹的账页），返回后还有三道后置过滤再兜底。
+    所以传 {"chunk_01": "3f2a..."} 只会拿回指纹恰好是 3f2a 的那一版；
+    chunk_01 历史上的旧指纹行（如 "aaa1..."）根本进不了返回值。
+    （"返回所有历史版本、由调用方自己挑"是错误理解——只有不传
+      requested_versions 即 None 时，才会把该分块所有历史版本都捞回来。）
     """
     from common import settings
     from common.doc_store.doc_store_base import OrderByExpr
@@ -856,19 +1092,24 @@ async def _wiki_load_map_versions(
     requested_chunk_ids = set(requested_versions or {})
     requested_hashes = {chunk_hash for chunk_hash in (requested_versions or {}).values() if chunk_hash}
     normalized_doc_ids = {str(doc_id) for doc_id in ({doc_ids} if isinstance(doc_ids, str) else doc_ids) if doc_id}
+    # 检索条件（爱因斯坦示例）:
+    # {"compile_kwd": ["wiki_map_extract"],           ← 只翻 MAP 断点柜
+    #  "doc_id": ["doc_01"],                          ← 只翻这篇文档
+    #  "source_chunk_ids": ["chunk_01", "chunk_02"],  ← 只要这两个分块的账（可选）
+    #  "chunk_hash_kwd": ["3f2a..."]}                 ← 只要这两个指纹的账（可选）
     condition = {"compile_kwd": [WIKI_MAP_COMPILE_KWD], "doc_id": sorted(normalized_doc_ids)}
     if requested_chunk_ids:
         condition["source_chunk_ids"] = sorted(requested_chunk_ids)
     if requested_hashes:
         condition["chunk_hash_kwd"] = sorted(requested_hashes)
 
-    # 步骤一：分页循环检索匹配的断点缓存行
+    # 步骤一：分页循环检索匹配的断点缓存行（一页 1000 行，翻完为止）
     # 检索记录长相示例:
     # {
     #     "row_1": {
     #         "source_chunk_ids": ["chunk_01"],
-    #         "chunk_hash_kwd": "hash_01",
-    #         "content_with_weight": "{\"entities\": [{\"name\": \"曹操\"}]}"
+    #         "chunk_hash_kwd": "3f2a1b4c5d6e7f80",
+    #         "content_with_weight": "{\"entities\": [{\"name\": \"爱因斯坦\"}]}"
     #     }
     # }
     while True:
@@ -892,12 +1133,13 @@ async def _wiki_load_map_versions(
 
         # 步骤二：解析反序列化提取结果并挂载到多级版本字典
         # 挂载产出结构示例:
-        # versions["chunk_01"]["hash_01"] = {"entities": [{"name": "曹操"}]}
+        # versions["chunk_01"]["3f2a1b4c5d6e7f80"] = {"entities": [{"name": "爱因斯坦"}], ...}
         for row in field_map.values():
             chunk_ids = _wiki_doc_ids(row.get("source_chunk_ids"))
             chunk_hash = row.get("chunk_hash_kwd")
             if not isinstance(chunk_hash, str) or not chunk_hash:
                 continue
+            # 三道过滤：指纹在要的清单里、分块在要的清单里、指纹恰好是"该分块当前指纹"
             if requested_hashes and chunk_hash not in requested_hashes:
                 continue
             try:
@@ -909,6 +1151,8 @@ async def _wiki_load_map_versions(
             for chunk_id in chunk_ids:
                 if requested_chunk_ids and chunk_id not in requested_chunk_ids:
                     continue
+                # 这一道是关键：只收"该分块指纹恰好等于指定指纹"的版本
+                # （requested_versions = {"chunk_01": "3f2a..."} → 只收 3f2a 这版，旧版 aaa1 不收）
                 if requested_versions is not None and requested_versions.get(chunk_id) != chunk_hash:
                     continue
                 versions.setdefault(chunk_id, {}).setdefault(chunk_hash, extract)
@@ -972,16 +1216,25 @@ async def _wiki_scan_current_chunk_state(
     参数:
         tenant_id: 租户 ID，示例："tenant_01"
         kb_id: 知识库 ID，示例："kb_001"
-        doc_ids: 待扫描的文档 ID 集合，结构示例：{"doc_01", "doc_02"}
+        doc_ids: 待扫描的文档 ID 集合，结构示例：{"doc_01"}
 
     返回值:
         分块当前状态字典（分块 ID -> 元信息字典），结构示例：
             {
-                "chunk_101": {
+                "chunk_01": {
                     "doc_id": "doc_01",
-                    "hash": "3f2a1b4c5d6e7f80"
+                    "hash": "3f2a1b4c5d6e7f80"   ← xxh64("爱因斯坦于1905年提出了狭义相对论...|v1")
+                },
+                "chunk_02": {
+                    "doc_id": "doc_01",
+                    "hash": "9b8c7d6e5f4a3b2c"
                 }
             }
+
+    人话：重新盘点现在的库存——把文档当前的每个分块正文重新算一遍指纹。
+    它是 _wiki_compare_chunk_states 的"current"那半边；注意检索条件里
+    available_int=1 且排除带 compile_kwd 的行，只数"真切片"，
+    不把 wiki 自己写的断点/页面行也当成切片来算指纹。
     """
     if not doc_ids:
         return {}
@@ -991,9 +1244,11 @@ async def _wiki_scan_current_chunk_state(
 
     index = _rag_search.index_name(tenant_id)
     state: dict[str, dict] = {}
-    # 步骤一：分页循环检索指定文档的有效分块并提取内容哈希
+    # 步骤一：逐文档分页扫描有效分块（available_int=1 且无 compile_kwd = 真切片，非 wiki 内部行）
+    # 检索条件示例:
+    # {"doc_id": ["doc_01"], "available_int": 1, "must_not": {"exists": "compile_kwd"}}
     # 状态映射生成长相示例:
-    # state["chunk_101"] = {
+    # state["chunk_01"] = {
     #     "doc_id": "doc_01",
     #     "hash": "3f2a1b4c5d6e7f80"
     # }
@@ -1043,23 +1298,34 @@ async def _wiki_load_active_map_state(
     返回值:
         已生效分块状态映射字典（分块 ID -> 元信息字典），结构示例：
             {
-                "chunk_101": {
+                "chunk_01": {
                     "doc_id": "doc_01",
-                    "hash": "3f2a1b4c5d6e7f80"
+                    "hash": "3f2a1b4c5d6e7f80"   ← 上次编译成功时 chunk_01 的指纹
+                },
+                "chunk_02": {
+                    "doc_id": "doc_01",
+                    "hash": "9b8c7d6e5f4a3b2c"
                 }
             }
+
+    人话：取"上次编译成功时的底账"。它是 _wiki_compare_chunk_states 的
+    "previous"那半边。先问代际指针行"现在哪一代算数"（_wiki_load_active_map_generation），
+    再按 type_kwd=该代际 捞出那一整代快照行。没有提交过 → 返回空 dict
+    → 上游比对时所有分块都算 new → 全量构建。
     """
     from common import settings
     from common.doc_store.doc_store_base import OrderByExpr
     from rag.nlp import search as _rag_search
 
     index = _rag_search.index_name(tenant_id)
+    # 先读代际指针：上次提交时生成的 uuid（如 "f3a2b1c4..."）；没有则无底账可读
     generation = await _wiki_load_active_map_generation(tenant_id, kb_id)
     if not generation:
         return {}
 
     state: dict[str, dict] = {}
     offset = 0
+    # 按 compile_kwd="wiki_map_state" + type_kwd=当前代际 分页捞快照行
     while True:
         res = await thread_pool_exec(
             settings.docStoreConn.search,
@@ -1144,11 +1410,11 @@ async def _wiki_load_map_extracts_for_state(
                 {
                     "doc_id": "doc_01",
                     "_map_version": {"chunk_id": "chunk_1", "hash": "h_01"},
-                    "entities": [{"name": "量子力学"}],
+                    "entities": [{"name": "爱因斯坦"}],
                     "concepts": [],
                     "claims": [],
                     "relations": [],
-                    "topics": ["物理学"]
+                    "topics": ["现代物理学"]
                 }
             ]
     """
@@ -1193,32 +1459,50 @@ async def _wiki_commit_active_map_state(
     参数:
         tenant_id: 租户 ID，示例："tenant_01"
         kb_id: 知识库 ID，示例："kb_001"
-        state: 待提交的分块状态字典，结构示例：{"chunk_1": {"doc_id": "doc_01", "hash": "h_01"}}
+        state: 待提交的分块状态字典，结构示例：
+            {
+                "chunk_01": {"doc_id": "doc_01", "hash": "3f2a1b4c5d6e7f80"},
+                "chunk_02": {"doc_id": "doc_01", "hash": "9b8c7d6e5f4a3b2c"}
+            }
 
     返回值:
         无返回值（None）。
+
+    人话（三步换代，像图书管理换书架）：
+      本次编译全部成功后，才把"当前所有分块的指纹"作为新一代入账。
+      1. 先生成一个新代际号（uuid），把新快照行整批插进 ES（此时还"不算数"）；
+      2. 再原子改写唯一的 meta 指针行，让它指向新代际号 —— 这一步落地，
+         新一代正式"上岗"（旧代际行还在，但没人认了）；
+      3. 最后清理上一代的旧行，腾出空间。
+    为什么要这么绕：如果直接改旧行，编译中途挂掉会留下"半新半旧"的底账，
+    下次增量比对就会算错。先插新代、再切指针，指针切换是原子的——
+    要么旧账算数（编译失败，下次从旧账增量重试），要么新账算数（编译成功）。
     """
     from common import settings
     from rag.nlp import search as _rag_search
 
     index = _rag_search.index_name(tenant_id)
     try:
+        # 先读出当前算数的旧代际号（如 "aaa111..."），一会儿要拿它清理旧行
         previous_generation = await _wiki_load_active_map_generation(tenant_id, kb_id)
     except Exception:
         logging.exception("wiki_map: failed to read the previous active-state generation")
         raise
 
+    # 新代际号 = 全新 uuid（如 "f3a2b1c4d5e6..."），与旧代永不相同
     generation = uuid.uuid4().hex
     rows = []
-    # 步骤一：封装新一代代际分块快照行
+    # 步骤一：封装新一代代际分块快照行（每个分块一行，全部打上 type_kwd=新代际号）
     # 快照文档长相示例:
     # {
-    #     "id": "gen1_doc01_chunk1",
+    #     "id": "xxh64(\"wiki_map_state:f3a2b1c4...:doc_01:chunk_01\")",
     #     "doc_id": "doc_01",
-    #     "compile_kwd": WIKI_MAP_STATE_COMPILE_KWD,
-    #     "type_kwd": "gen_uuid",
-    #     "source_chunk_ids": ["chunk_1"],
-    #     "chunk_hash_kwd": "3f2a1b4c5d6e7f80"
+    #     "compile_kwd": WIKI_MAP_STATE_COMPILE_KWD,      ← "wiki_map_state"
+    #     "type_kwd": "f3a2b1c4d5e6...",                  ← 新代际号（行的分组标签）
+    #     "source_chunk_ids": ["chunk_01"],
+    #     "chunk_hash_kwd": "3f2a1b4c5d6e7f80",           ← 该分块本次编译时的指纹
+    #     "content_with_weight": "{}",                    ← 正文无意义，字段纯占位
+    #     "available_int": 0
     # }
     for chunk_id, item in state.items():
         doc_id = str(item.get("doc_id") or "")
@@ -1237,19 +1521,22 @@ async def _wiki_commit_active_map_state(
                 "available_int": 0,
             }
         )
+    # 主键重新按「代际号 + 文档 + 分块」铸造：两代快照同一分块也各行其道、互不覆盖
     for row in rows:
         row["id"] = _stable_row_id(WIKI_MAP_STATE_COMPILE_KWD, generation, row["doc_id"], row["source_chunk_ids"][0])
     if rows:
+        # 新代快照整批插入（此刻尚未生效——指针还指着旧代）
         await thread_pool_exec(settings.docStoreConn.insert, rows, index, kb_id)
 
     # 步骤二：原子切换写入元数据标记行，使新一代快照生效
-    # 标记文档长相示例:
+    # 标记文档长相示例（全库仅此一行，覆盖写）:
     # {
-    #     "id": "meta_kb001",
-    #     "compile_kwd": WIKI_MAP_STATE_META_COMPILE_KWD,
-    #     "type_kwd": "gen_uuid",
+    #     "id": "xxh64(\"wiki_map_state_meta:kb_001\")",
+    #     "compile_kwd": WIKI_MAP_STATE_META_COMPILE_KWD,   ← "wiki_map_state_meta"
+    #     "type_kwd": "f3a2b1c4d5e6...",                    ← 指针指向新代际号
     #     "chunk_hash_kwd": "committed"
     # }
+    # 这一行落地的瞬间，_wiki_load_active_map_state 读到的就是新一代了。
     marker = {
         "id": _stable_row_id(WIKI_MAP_STATE_META_COMPILE_KWD, kb_id),
         "doc_id": "",
@@ -1262,7 +1549,8 @@ async def _wiki_commit_active_map_state(
     }
     await thread_pool_exec(settings.docStoreConn.insert, [marker], index, kb_id)
 
-    # 步骤三：清理上一代已失效的历史状态行
+    # 步骤三：清理上一代已失效的历史状态行（失败不致命，只打警告——旧行多留一版无害）
+    # 删除条件: {"compile_kwd": ["wiki_map_state"], "type_kwd": ["aaa111..."]}（旧代际号）
     if previous_generation and previous_generation != generation:
         try:
             await thread_pool_exec(
@@ -1293,34 +1581,56 @@ async def _wiki_extract_one_batch(
     """对单个打包的分块批次执行大语言模型知识提取推理调用 —— 单批次知识提取工。
 
     参数:
-        packed: 当前批次包含的分块结构列表，结构示例：[{"label": "C1", "chunk_id": "c1", "text": "正文..."}]
-        doc_id: 来源文档 ID，示例："doc_101"
+        packed: 当前批次包含的分块结构列表，结构示例：
+            [
+                {"label": "C1", "chunk_id": "chunk_01", "text": "爱因斯坦于1905年提出了狭义相对论，这一理论彻底改变了物理学的时间观。"},
+                {"label": "C2", "chunk_id": "chunk_02", "text": "光电效应论文为他赢得了1921年诺贝尔物理学奖。"}
+            ]
+        doc_id: 来源文档 ID，示例："doc_01"
         chat_mdl: 大语言模型 Bundle，示例：LLMBundle(model_type="chat")
         language: 本地化语言代码，示例："zh"
         llm_timeout: 超时秒数，示例：600
         parser_config: 编译模板配置字典（可选），结构示例：{"entity": {...}}
 
     返回值:
-        解析出的五元知识字典，发生异常/超时返回 None，结构示例：
+        解析出的五元知识字典，发生异常/超时返回 None。爱因斯坦批次的返回长相：
             {
-                "entities": [{"name": "实体名", "type": "other"}],
-                "concepts": [],
-                "claims": [],
-                "relations": [],
-                "topics": []
+                "entities": [
+                    {"name": "爱因斯坦", "type": "person", "aliases": ["Albert Einstein"], "source_chunk_id": "C1"},
+                    {"name": "狭义相对论", "type": "theory", "aliases": [], "source_chunk_id": "C1"},
+                    {"name": "诺贝尔物理学奖", "type": "award", "aliases": [], "source_chunk_id": "C2"}
+                ],
+                "concepts": [
+                    {"term": "光电效应", "definition_excerpt": "光照射金属表面释放电子的现象", "source_chunk_id": "C2"}
+                ],
+                "claims": [
+                    {"statement": "爱因斯坦于1905年提出了狭义相对论", "subject": "爱因斯坦", "confidence": "explicit", "source_chunk_id": "C1"},
+                    {"statement": "光电效应论文为爱因斯坦赢得了1921年诺贝尔物理学奖", "subject": "爱因斯坦", "confidence": "explicit", "source_chunk_id": "C2"}
+                ],
+                "relations": [
+                    {"from": "爱因斯坦", "to": "狭义相对论", "type": "propose", "source_chunk_id": "C1"},
+                    {"from": "爱因斯坦", "to": "诺贝尔物理学奖", "type": "win", "source_chunk_id": "C2"}
+                ],
+                "topics": ["现代物理学", "诺贝尔奖"]
             }
+        （此刻 source_chunk_id 还是脚手架标签 C1/C2；下一步 _wiki_resolve_chunk_ids
+          才把它们翻译回 chunk_01/chunk_02）
     """
+    # 组装批次正文："[CHUNK_ID C1]\n爱因斯坦...\n\n[CHUNK_ID C2]\n光电效应..."
     body, labels = _wiki_format_batch_prompt(packed)
+    # 组装用户提示词（完整长相见 WIKI_MAP_USER_TEMPLATE 之后的注释块）
     user_prompt = _wiki_build_user_prompt(
         parser_config=parser_config,
         language=language,
         doc_id=doc_id,
         chunk_count=len(packed),
-        chunk_id_list="\n".join(f"- {label}" for label in labels),
+        chunk_id_list="\n".join(f"- {label}" for label in labels),  # "- C1\n- C2"
         packed_chunks=body,
     )
     request_conf = _knowledge_compile_gen_conf(chat_mdl, {"temperature": 0.1})
     try:
+        # 真正的大模型调用：系统提示词 + 用户提示词 → 要求返回纯 JSON
+        # 返回的大段 JSON 长相见上方 docstring（五元结构）
         res = await asyncio.wait_for(
             gen_json(
                 WIKI_MAP_SYSTEM,
@@ -1337,6 +1647,7 @@ async def _wiki_extract_one_batch(
         logging.exception("wiki_map: batch extraction failed (%d chunks)", len(packed))
         return None
     _ = language
+    # 解包清洗：补全缺失的五类键、剔除非字典条目/非字符串主题 → 标准五元结构
     return _wiki_unwrap_extract(res)
 
 
@@ -1376,20 +1687,22 @@ async def _wiki_process_batch(
         当前批次解析并归属划分后的五元知识抽取字典。
         长相示例:
         {
-            "entities": [{"name": "曹操", "chunk_ids": ["chunk_01"]}],
+            "entities": [{"name": "爱因斯坦", "chunk_ids": ["chunk_01"]}],
             "concepts": [],
             "claims": [],
             "relations": [],
-            "topics": ["三国历史"]
+            "topics": ["现代物理学"]
         }
     """
     if not packed:
         return _wiki_empty_extract()
 
+    # 标签→真实 ID 的翻译字典，示例: {"C1": "chunk_01", "C2": "chunk_02"}
     label_to_id = {entry["label"]: entry["chunk_id"] for entry in packed}
 
     async def _run() -> dict:
         """执行单批次抽取、分块ID对齐、断点持久化与进度通知的内部工作协程。"""
+        # 第1步：调大模型抽五元知识（返回长相见 _wiki_extract_one_batch 的 docstring）
         raw_extract = await _wiki_extract_one_batch(
             packed,
             doc_id,
@@ -1400,8 +1713,13 @@ async def _wiki_process_batch(
         )
         if raw_extract is None:
             # 大模型调用失败或超时：不写入断点哈希，使下一次重试重新提取本批分块，避免固化空结果
+            # （返回空五元但不落 ES —— 下次同一批还得重抽，宁可重花钱也不留假账）
             return _wiki_empty_extract()
+        # 第2步：C1/C2 翻译回 chunk_01/chunk_02，同时产出"每分块各自的答案"
+        # 示例: merged = {"entities": [{"name": "爱因斯坦", "chunk_ids": ["chunk_01"]}], ...}
+        #        per_chunk = {"chunk_01": {...只有 C1 出的知识...}, "chunk_02": {...只有 C2 出的...}}
         merged, per_chunk = _wiki_resolve_chunk_ids(raw_extract, label_to_id)
+        # 第3步：把每分块的答案存进 ES 断点柜（compile_kwd="wiki_map_extract"，available_int=0）
         await _wiki_persist_extracts(
             per_chunk,
             doc_id,
@@ -1451,21 +1769,25 @@ async def wiki_map_from_chunks(
 
     将文档分块打包成批次，通过并发调用大语言模型抽取实体、概念、论断、关系与主题，
     并将每个分块的抽取结果持久化到存储层作为不可检索断点，以便后续增量复用。
+    （端到端走查见本函数末尾的「爱因斯坦走一遍」大注释块）
 
     参数:
         chunks: 分块字典列表，每项至少包含 id 与文本字段，长相示例：
             [
                 {
-                    "id": "c1a2b3",
-                    "text": "量子计算利用量子叠加原理实现超高速并行计算。",
-                    "content_with_weight": "量子计算利用量子叠加原理..."
+                    "id": "chunk_01",
+                    "content_with_weight": "爱因斯坦于1905年提出了狭义相对论，这一理论彻底改变了物理学的时间观。"
+                },
+                {
+                    "id": "chunk_02",
+                    "content_with_weight": "光电效应论文为他赢得了1921年诺贝尔物理学奖。"
                 }
             ]
         chat_mdl: 用于对话抽取的大语言模型 Bundle 对象（通过 gen_json 调用）。
         embd_mdl: 向量模型 Bundle（在此阶段仅为接口对称占位，不直接调用）。
-        doc_id: 来源文档唯一标识字符串，示例："doc_401"。
-        tenant_id: 租户 ID，示例："tenant_001"。
-        kb_id: 知识库 ID，示例："kb_901"。
+        doc_id: 来源文档唯一标识字符串，示例："doc_01"。
+        tenant_id: 租户 ID，示例："tenant_01"。
+        kb_id: 知识库 ID，示例："kb_001"。
         language: 抽取目标语言代码，默认 "en"，示例："zh"。
         max_workers: 最大并发批次数，默认 DEFAULT_WIKI_MAP_WORKERS (20)。
         llm_timeout: 单批次大模型抽取超时时间（秒），默认 DEFAULT_WIKI_MAP_TIMEOUT (600)。
@@ -1475,37 +1797,38 @@ async def wiki_map_from_chunks(
                 "entity": {"fields": [{"name": "product", "type": "str"}]},
                 "guideline": {"rules_for_entities": "抽取所有实体"}
             }
-        batch_size_cap: 每批打包分块数量硬上限，示例：10。
+        batch_size_cap: 每批打包分块数量硬上限，示例：8。
         window_fraction: 滑动窗口比例（浮点数），示例：0.5。
-        target_chunk_ids: 可选的仅处理分块 ID 集合（用于增量处理），长相示例：{"c1a2b3", "c4d5e6"}。
+        target_chunk_ids: 可选的仅处理分块 ID 集合（增量时=新切片∪改过的切片），长相示例：{"chunk_02"}。
 
     返回值:
         合并后的五元知识抽取字典，附加 _meta 元信息字段，长相示例：
             {
                 "entities": [
-                    {"name": "量子计算", "type": "technology", "chunk_ids": ["c1a2b3"]}
+                    {"name": "爱因斯坦", "type": "person", "aliases": ["Albert Einstein"], "chunk_ids": ["chunk_01"]},
+                    {"name": "狭义相对论", "type": "theory", "chunk_ids": ["chunk_01"]}
                 ],
                 "concepts": [
-                    {"term": "量子叠加", "definition_excerpt": "微观粒子的多状态共存", "chunk_ids": ["c1a2b3"]}
+                    {"term": "光电效应", "definition_excerpt": "光照射金属表面释放电子的现象", "chunk_ids": ["chunk_02"]}
                 ],
                 "claims": [
-                    {"statement": "量子计算可实现超高速计算", "subject": "量子计算", "confidence": "explicit", "chunk_ids": ["c1a2b3"]}
+                    {"statement": "爱因斯坦于1905年提出了狭义相对论", "subject": "爱因斯坦", "confidence": "explicit", "chunk_ids": ["chunk_01"]}
                 ],
                 "relations": [
-                    {"from": "量子计算", "to": "量子叠加", "type": "uses", "chunk_ids": ["c1a2b3"]}
+                    {"from": "爱因斯坦", "to": "狭义相对论", "type": "propose", "chunk_ids": ["chunk_01"]}
                 ],
-                "topics": ["量子科技"],
+                "topics": ["现代物理学", "诺贝尔奖"],
                 "_meta": {
-                    "doc_id": "doc_401",
-                    "requested": 1,
-                    "cache_hits": 0,
-                    "extracted": 1
+                    "doc_id": "doc_01",
+                    "requested": 2,       # 本次要处理的分块数
+                    "cache_hits": 1,      # 抄旧账的分块数（没调大模型）
+                    "extracted": 1        # 真正调了大模型的分块数
                 }
             }
     """
     _ = embd_mdl  # noqa: F841 — 保持与下游 REDUCE/REFINE 阶段接口对称性
     # 输入为空时快速返回空结果并附带元信息
-    # 输出示例: {"entities": [], ..., "_meta": {"doc_id": "doc_401", "requested": 0, ...}}
+    # 输出示例: {"entities": [], ..., "_meta": {"doc_id": "doc_01", "requested": 0, ...}}
     if not chunks:
         out = _wiki_empty_extract()
         out["_meta"] = {
@@ -1517,7 +1840,7 @@ async def wiki_map_from_chunks(
         return out
 
     # 步骤一：提取有效分块并计算内容哈希指纹
-    # 输出示例: current_chunk_hashes = {"c1a2b3": "8f3d1a2b4c5e6f70"}
+    # 输出示例: current_chunk_hashes = {"chunk_01": "3f2a1b4c5d6e7f80", "chunk_02": "9b8c7d6e5f4a3b2c"}
     current_chunk_hashes: dict[str, str] = {}
     for chunk in chunks:
         cid = chunk.get("id") or chunk.get("chunk_id")
@@ -1525,31 +1848,47 @@ async def wiki_map_from_chunks(
             continue
         text = _wiki_pick_chunk_text(chunk) or ""
         current_chunk_hashes[cid] = _chunk_hash(text)
+        # 指纹不是用来“去重”的，是用来“验内容变没变”的
 
     requested_ids = set(current_chunk_hashes)
     if target_chunk_ids is not None:
-        requested_ids &= set(target_chunk_ids)
+        requested_ids &= set(target_chunk_ids)  # “新切片 + 内容变了的切片”
+
+    # 比如这次只编辑过 chunk_02，上游算出
+    # target_chunk_ids = {"chunk_02"}，那么：
+    # requested_ids = {"chunk_01", "chunk_02"} & {"chunk_02"} = {"chunk_02"}
 
     # 步骤二：加载历史断点版本缓存，区分出缓存命中分块与待重新抽取分块
-    # 输入示例: requested_versions = {"c1a2b3": "8f3d1a2b4c5e6f70"}
+    # 输入示例（承接上面增量场景，请求集只有 chunk_02）:
+    # requested_versions = {"chunk_02": "fff6..."}   ← 只带请求集里那几个分块的当前指纹
     requested_versions = {chunk_id: current_chunk_hashes[chunk_id] for chunk_id in requested_ids}
-    historical_versions = await _wiki_load_map_versions(doc_id, tenant_id, kb_id, requested_versions)
+    historical_versions = await _wiki_load_map_versions(doc_id, tenant_id, kb_id, requested_versions) # 去 ES 查历史存档
+
+    # historical_versions 长相示例（增量场景：只编辑过 chunk_02）:
+    # {}   ← 请求的是 chunk_02 的新指纹 "fff6..."，断点柜里只有它旧指纹 "9b8c..."
+    #        的行——旧指纹在 _wiki_load_map_versions 的检索条件层就被排除了，
+    #        一行都捞不回来，所以 chunk_02 这个键根本不在返回值里
+    # （对比：假若这次请求集含没改过的 chunk_01，它的当前指纹 "3f2a..." 与断点柜
+    #   对得上号，返回值里就会有 "chunk_01": {"3f2a...": {旧抽取结果}} 这一项——
+    #   这正是"缓存命中"的来源。）
+    # （注意：不是"返回所有历史版本再自己挑"——过滤在 _wiki_load_map_versions 内部完成）
+
     cache_hits: list[dict] = []
     cache_hit_ids: set[str] = set()
     for chunk_id in requested_ids:
-        extract = historical_versions.get(chunk_id, {}).get(current_chunk_hashes[chunk_id])
-        if extract is not None:
+        extract = historical_versions.get(chunk_id, {}).get(current_chunk_hashes[chunk_id])  # 该分块的账里，有没有一份存档的指纹恰好等于它现在内容的指纹？
+        if extract is not None:  # 说明内容从上次抽完到现在一个字没变 → 旧抽取结果仍然有效 → 缓存命中，抄旧答案，不调 LLM。
             cache_hit_ids.add(chunk_id)
             cache_hits.append(extract)
 
     # 计算差集得到真正需要发给大模型抽取的分块 ID
-    # 示例: extract_ids = {"c4d5e6"}
+    # 示例（承接上面增量场景）: extract_ids = {"chunk_02"}
     extract_ids = requested_ids - cache_hit_ids
     # 跳过本次增量范围外及已命中缓存的分块
     resume_set = set(current_chunk_hashes) - extract_ids
 
     # 步骤三：防御性清洗，收集所有已知分块 ID 与文档 ID，避免大模型误将 ID 当作实体
-    # 示例: all_known_ids = ["c1a2b3", "c4d5e6", "doc_401"]
+    # 示例: all_known_ids = ["chunk_01", "chunk_02", "doc_01"]
     all_known_ids: list[str] = []
     for chunk in chunks:
         cid = chunk.get("id") or chunk.get("chunk_id")
@@ -1559,7 +1898,7 @@ async def wiki_map_from_chunks(
         all_known_ids.append(str(doc_id))
 
     # 步骤四：按照 Token 预算将分块打包成批次
-    # 输出示例: packed_batches = [[{"label": "C1", "chunk_id": "c4d5e6", "text": "..."}]]
+    # 输出示例: packed_batches = [[{"label": "C1", "chunk_id": "chunk_02", "text": "..."}]]
     prompt_overhead = num_tokens_from_string(WIKI_MAP_SYSTEM + WIKI_MAP_USER_TEMPLATE)
     packed_batches, _info = _build_chunk_batches(
         chunks,
@@ -1583,7 +1922,7 @@ async def wiki_map_from_chunks(
         return cached_merged
 
     # 内部批次处理闭包：包装单批次大模型抽取与持久化调用
-    # 输入: batch = [{"label": "C1", "chunk_id": "c4d5e6", "text": "..."}], bi = 0, total = 1
+    # 输入: batch = [{"label": "C1", "chunk_id": "chunk_02", "text": "..."}], bi = 0, total = 1
     # 输出: {"entities": [...], "concepts": [...], ...}
     async def _process_one(batch: list[dict], bi: int, total: int) -> dict:
         return await _wiki_process_batch(
@@ -1634,7 +1973,111 @@ async def wiki_map_from_chunks(
     return merged
 
 
+# ── 爱因斯坦走一遍：wiki_map_from_chunks 端到端数据走查 ──────────────────
+#
+# 场景一：首次构建（doc_01 从没编过 wiki）
+# 输入:
+#   chunks = [
+#       {"id": "chunk_01", "content_with_weight": "爱因斯坦于1905年提出了狭义相对论，这一理论彻底改变了物理学的时间观。"},
+#       {"id": "chunk_02", "content_with_weight": "光电效应论文为他赢得了1921年诺贝尔物理学奖。"}
+#   ]
+#   target_chunk_ids = {"chunk_01", "chunk_02"}   ← 首次全量：所有切片都是 new
+#
+# 第1步 算指纹（步骤一）:
+#   current_chunk_hashes = {
+#       "chunk_01": "3f2a1b4c5d6e7f80",   ← xxh64("爱因斯坦于1905年...时间观。|v1")
+#       "chunk_02": "9b8c7d6e5f4a3b2c"
+#   }
+#   requested_ids = {"chunk_01", "chunk_02"}（target 全包含）
+#
+# 第2步 查旧账（步骤二）:
+#   ES 里没有任何 compile_kwd="wiki_map_extract" 行 → historical_versions = {}
+#   cache_hits = []，cache_hit_ids = {}
+#   extract_ids = {"chunk_01", "chunk_02"} ← 两个都要花钱调大模型
+#
+# 第3步 打包批次（步骤四）:
+#   两个分块正文都不长，token 预算内打包成一个批次:
+#   packed_batches = [[
+#       {"label": "C1", "chunk_id": "chunk_01", "text": "爱因斯坦于1905年提出了狭义相对论，..."},
+#       {"label": "C2", "chunk_id": "chunk_02", "text": "光电效应论文为他赢得了1921年诺贝尔物理学奖。"}
+#   ]]
+#
+# 第4步 调大模型（_run_chunked_pipeline 并发跑批次 → _wiki_extract_one_batch）:
+#   模型返回的大段 JSON（长相见 _wiki_extract_one_batch docstring）:
+#   {"entities": [{"name": "爱因斯坦", ..., "source_chunk_id": "C1"}, ...],
+#    "concepts": [{"term": "光电效应", ..., "source_chunk_id": "C2"}],
+#    "claims": [...], "relations": [...], "topics": ["现代物理学", "诺贝尔奖"]}
+#
+# 第5步 翻译归属 + 存旧账（_wiki_resolve_chunk_ids + _wiki_persist_extracts）:
+#   C1→chunk_01, C2→chunk_02；per_chunk 拆成两份答案
+#   ES 新增两行断点（available_int=0 不可检索）:
+#   {id: xxh64("wiki_map_extract:doc_01:chunk_01:3f2a..."), chunk_hash_kwd: "3f2a...", content_with_weight: "{...只有 chunk_01 的知识...}"}
+#   {id: xxh64("wiki_map_extract:doc_01:chunk_02:9b8c..."), chunk_hash_kwd: "9b8c...", content_with_weight: "{...只有 chunk_02 的知识...}"}
+#
+# 第6步 合并返回:
+#   merged = 五元知识（每条带 chunk_ids: ["chunk_01"] 或 ["chunk_02"]）
+#            + _meta = {"doc_id": "doc_01", "requested": 2, "cache_hits": 0, "extracted": 2}
+#   这份 merged 不落盘；调用方（dataset_wiki_generator 的 _map_worker）拿到后
+#   直接丢弃（裸 await 不接返回值）——真正的知识已经在第5步存进了 ES 断点柜。
+#   下游编译引擎 wiki_compile_incremental 不吃 merged，而是自己回头从 ES
+#   断点柜按状态快照重新加载（_wiki_load_map_extracts_for_state）。
+#   （merged 的意义 = 给调用方一份"本次抽到了什么"的即时视图 + _meta 流水账，
+#     ES 断点柜才是知识真正的传递通道。）
+#
+# 场景二：增量重跑（用户只编辑了 chunk_02 的正文）
+# 输入: target_chunk_ids = {"chunk_02"}   ← 上游 _wiki_compare_chunk_states 算出只有它 changed
+#
+# 第1步 算指纹:
+#   chunk_02 改过 → 新指纹 "fff6..."（与断点柜里的旧指纹 "9b8c..." 不同）
+#
+# 第2步 查旧账:
+#   requested_versions = {"chunk_02": "fff6..."} 传进 _wiki_load_map_versions，
+#   指纹直接进了 ES 检索条件——断点柜里只有旧指纹 "9b8c..." 的行，对不上号，
+#   一行都捞不回来 → historical_versions = {}（chunk_02 键都不存在）
+#   cache_hit_ids = {}，extract_ids = {"chunk_02"} ← 只有它要调大模型
+#   （注意不是"拿回旧版本再挑"——旧指纹行在检索条件层就被排除了）
+#
+# 第3~5步: 只打包 chunk_02 一个分块 → 调大模型 → 存新断点
+#   （ES 里 chunk_02 现在有两行断点：旧指纹版 + 新指纹版，版本化并存；
+#     哪天内容改回原样，旧指纹那行直接命中）
+#
+# 第6步:
+#   _meta = {"requested": 1, "cache_hits": 0, "extracted": 1}
+#   注意：返回值只含 chunk_02 的知识——chunk_01 的知识由调用方另行从
+#   断点柜按状态快照加载（_wiki_load_map_extracts_for_state），两者汇合后才是全量。
+#
+# 场景三：啥都没改（用户原样再点一次"构建 Wiki"）
+# 上游先比对状态快照：所有分块都 unchanged → target_chunk_ids = 空集
+# （target_chunk_ids 永远会被传入，"没变化"的表现就是空集而不是 None）
+# 第2步 查旧账: requested_ids = {"chunk_01", "chunk_02"} & set() = 空集
+#   → 命中循环一次都不跑 → extract_ids 也为空 → packed_batches 为空
+#   → 直接返回缓存合并结果（cached_merged 本身也是空的），零次大模型调用
+#   _meta = {"requested": 0, "cache_hits": 0, "extracted": 0}
+# （实际运行中到不了这一步——上游 dataset_wiki_generator 发现
+#   has_chunk_delta=False 时直接走"Wiki is up to date"捷径，根本不调本函数；
+#   本场景描述的是"假如调了"的内部行为。真正出现全量缓存命中的场景是：
+#   上次构建中途失败、快照没提交，这次 target 仍是全量分块——那时
+#   requested=2, cache_hits=2, extracted=0，全部抄旧账零调用。）
+#
+# 人话总结整个函数：它是"先查账、再补账"的账房先生——
+#   每个分块的内容指纹对得上旧账就直接抄（免费），对不上的才打包发给大模型重抽（花钱），
+#   抽完立刻把新账存进 ES。_meta 里三个数字（requested/cache_hits/extracted）
+#   就是本次"要处理几个 / 抄了几个 / 重抽了几个"的流水记录。
+
+
 # ── REDUCE 阶段（知识库范围全局归约去重） ────────────────────────────────
+#
+# ⚠️ 现状说明（2026-09 死代码清理后的格局）：
+# 全量 REDUCE 阶段（wiki_reduce_from_extracts 族函数）已整体删除。
+# 主链（dataset_wiki_generator → wiki_compile_incremental）不再有 REDUCE 步骤——
+# 去重职责由 wiki_incremental.py 的实体匹配阶段（_wiki_match_entities）接棒：
+#   老 REDUCE:   MAP 全量结果 → 全库一次性归约去重 → 落 wiki_reduce_result 行
+#   新增量链:    MAP 结果（带断点缓存）→ 实体匹配消歧 → canonical 实体表
+# 本文件保留下来的只有三个"读侧残骸"（_wiki_load_reduce_resume /
+# _wiki_load_reduce_result / _wiki_load_reduce_input_hash），它们唯一的
+# 消费者是下方 PLAN 阶段的 synthesis 旁路——而主链早已不写 wiki_reduce_result
+# 行，所以这些函数永远读到空（返回 None / 空串），是事实上的只读不写的空转。
+# 读代码时把这一段当作"历史遗迹导览"即可，不要按它的注释去理解主链行为。
 
 WIKI_REDUCE_COMPILE_KWD = "wiki_reduce_result"
 
@@ -1715,7 +2158,7 @@ async def _wiki_load_reduce_resume(
         二元组 (缓存的归约知识字典, 存储的输入哈希指纹) 或 None，结构示例：
             (
                 {
-                    "entities": [{"name": "量子力学"}],
+                    "entities": [{"name": "爱因斯坦"}],
                     "concepts": []
                 },
                 "7c8d9e0f1a2b3c4d"
@@ -1770,6 +2213,27 @@ async def _wiki_load_reduce_resume(
 
 # ---------------------------------------------------------------------------
 # PLAN 阶段（知识库全局作用域）
+# ---------------------------------------------------------------------------
+#
+# ⚠️ 先读这段再往下看：PLAN/REFINE 是「synthesis 旁路」，不是 wiki 主链。
+#
+# wiki 主链（用户点"构建 Wiki"按钮那条路）的建页逻辑在 wiki_incremental.py：
+#   MAP（本文件上文）→ 实体匹配 → REDUCE 增量 → mode_a/mode_b 建页 → FINALIZE
+#   主链不经过本段任何函数。
+#
+# 本段的 wiki_plan_from_reduction 只有一个调用方：runner.py 的 synthesis 旁路
+# （两道门：parser_config.synthesis.enabled 开启，且 synthesis.example 非空，
+# 缺一即整个跳过）。它做的是另一件事——
+# 不做增量、直接把 REDUCE 结果（见上方残骸说明：现在永远为空）规划成
+# 一份"建页大纲"（哪些实体进哪页、slug 叫什么、CREATE 还是 UPDATE），
+# 交给 wiki_refine_from_plan 起草页面。
+#
+# 爱因斯坦数据在 PLAN 里的流转（供理解函数内部用）：
+#   规划输入实体: [{"name": "爱因斯坦", "type": "person", "mention_count": 5}]
+#   KNN 核对:     库里已有页 "entity/albert-einstein" 相似度 0.96 ≥ 0.95 → UPDATE
+#   规划输出:     {"pages": [{"action": "UPDATE", "slug": "entity/albert-einstein",
+#                 "title": "爱因斯坦", "entity_names": ["爱因斯坦"], "priority": 1}], ...}
+# REFINE 拿这份大纲，把 [[entity/albert-einstein]] 这类内链写进成文页面。
 # ---------------------------------------------------------------------------
 
 WIKI_PLAN_COMPILE_KWD = "wiki_compilation_plan"
@@ -2438,6 +2902,26 @@ async def _wiki_planning_call(
         {"temperature": 0.1, "max_tokens": output_tokens},
     )
     # 步骤四：调用大语言模型执行规划大纲推理
+    # 返回的大段 JSON 长相示例（爱因斯坦走一遍）:
+    # {
+    #     "pages": [
+    #         {
+    #             "action": "CREATE",                      ← 新建页（UPDATE=并入已有页）
+    #             "slug": "entity/albert-einstein",         ← 页面地址，"<类型>/<小写英文名>"
+    #             "title": "爱因斯坦",
+    #             "page_type": "entity",                    ← entity|concept|topic，须与 slug 前缀一致
+    #             "topic": "现代物理学",                      ← 每页必填的主题归类
+    #             "entity_names": ["爱因斯坦"],              ← 本页收纳的实体（一个实体只许进一页）
+    #             "related_kb_pages": ["concept/special-relativity"],
+    #             "priority": 1                             ← 1 最高，REFINE 阶段按它排产
+    #         },
+    #         {"action": "UPDATE", "slug": "concept/special-relativity", "title": "狭义相对论", ...}
+    #     ],
+    #     "estimated_page_count": 2,
+    #     "compilation_notes": ""
+    # }
+    # （非法条目会在步骤五被剔除：slug 格式不对 / 标题缺失 / page_type 与 slug 前缀
+    #   不一致 / UPDATE 却不在核对清单里，都会被丢掉）
     try:
         res = await asyncio.wait_for(
             gen_json(
@@ -2942,6 +3426,25 @@ async def wiki_plan_from_reduction(
 # ---------------------------------------------------------------------------
 # REFINE 阶段（知识库全局作用域）
 # ---------------------------------------------------------------------------
+#
+# ⚠️ 同上：REFINE 也是 synthesis 旁路的一部分（wiki_refine_from_plan 仅被
+# runner.py 调用）。主链的页面撰写在 wiki_incremental.py 的 _wiki_refine_page。
+#
+# 本段做的事：拿 PLAN 产出的建页大纲，为每个页面
+#   组装证据论断（_wiki_assemble_evidence）
+#   → 拉原文语境（_wiki_build_source_context，"[CHUNK chunk_01] 爱因斯坦于..." 拼接）
+#   → 调大模型写页面（_wiki_write_page_simple，产出 "# 爱因斯坦\n## 生平\n..."）
+#   → UPDATE 页面与新稿智能合并（_wiki_merge_page_content，防缩减校验）
+#   → 内链规范化 [[slug]] → [显示名](artifact/kb/slug)（_wiki_transform_links）
+#   → 落 wiki_page_draft 草稿行（_wiki_persist_draft）
+# 爱因斯坦页面走完一遍的产物长相：
+#   {
+#     "slug": "entity/albert-einstein", "title": "爱因斯坦",
+#     "content_md": "# 爱因斯坦\n\n[狭义相对论](artifact/kb_001/concept/special-relativity) 是他提出的...",
+#     "outlinks": ["concept/special-relativity"],
+#     "source_chunk_ids": ["chunk_01", "chunk_02"], "source_doc_ids": ["doc_01"]
+#   }
+# ---------------------------------------------------------------------------
 
 WIKI_DRAFT_COMPILE_KWD = "wiki_page_draft"
 DEFAULT_WIKI_REFINE_WORKERS = 4
@@ -3406,7 +3909,7 @@ async def _wiki_build_source_context(
         evidence: 证据条目列表，长相示例：[{"chunk_ids": ["c1a2", "c3b4"]}]。
         tenant_id: 租户 ID，示例："tenant_001"。
         kb_id: 知识库 ID，示例："kb_901"。
-        budget: 语境字符上限预算（字符数），默认 32768。
+        budget: 语境字符上限预算（字符数），默认 WIKI_REFINE_SOURCE_BUDGET_CHARS (60000)。
 
     返回值:
         包含 [CHUNK id] 标签的合并正文字符串，长相示例：
@@ -3845,7 +4348,7 @@ async def _wiki_merge_page_content(
         new_md: 本次根据新证据新起草的 Markdown 正文，长相示例："# 深度学习\n新版补充内容..."。
         slug: 页面 Slug 标识，示例："concept/deep-learning"。
         chat_mdl: 对话模型 Bundle 对象。
-        shrink_threshold: 合并后长度相比输入较大值的最低允许缩减比例，默认 0.85。
+        shrink_threshold: 合并后长度相比输入较大值的最低允许缩减比例，默认 WIKI_MERGE_BODY_SHRINK_THRESHOLD (0.7)。
         llm_timeout: 合并超时时间（秒），默认 600。
 
     返回值:
@@ -4127,8 +4630,8 @@ async def wiki_refine_from_plan(
         kb_id: 知识库 ID，示例："kb_901"。
         max_workers: 最大并发撰写任务数，默认 4。
         llm_timeout: 单个页面起草/合并大模型调用超时时间（秒），默认 300。
-        source_budget_chars: 每个页面参考来源分块的最大字符预算，默认 32768。
-        merge_shrink_threshold: 合并后长度相比输入较大值的最低允许缩减比例，默认 0.85。
+        source_budget_chars: 每个页面参考来源分块的最大字符预算，默认 WIKI_REFINE_SOURCE_BUDGET_CHARS (60000)。
+        merge_shrink_threshold: 合并后长度相比输入较大值的最低允许缩减比例，默认 WIKI_MERGE_BODY_SHRINK_THRESHOLD (0.7)。
         force_rerun: 是否强制忽略已有草稿缓存全量重新生成，默认 False。
         callback: 进度回调函数，签名 (progress: float, msg: str) -> None。
         instruction: 页面模板附加定制写作说明（可选）。
