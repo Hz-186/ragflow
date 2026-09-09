@@ -14,24 +14,35 @@
 #  limitations under the License.
 #
 
-"""KB-wide wiki / artifact compilation.
+"""知识库级 Wiki（维基）编译任务的编排模块 —— Wiki 总装车间。
 
-The public entry point is :func:`run_wiki_incremental`, dispatched from
-``task_handler`` for ``task_type == "wiki"``. It runs MAP per (doc,
-template) — each MAP call resumes from its own ``wiki_map_extract`` ES
-rows — then feeds the delta into the incremental engine
-``rag.advanced_rag.knowlege_compile.wiki_incremental``. Pages land in ES
-as searchable ``wiki_page`` rows, and ``wiki_entity`` / ``wiki_relation``
-rows feed the dataset Artifact tab's canvas graph.
+公开入口是 :func:`run_wiki_incremental`，由 ``task_handler`` 在任务类型为
+``"wiki"`` 时分发调用。它按（文档, 模板）逐个跑 MAP 抽取 —— 每次 MAP 调用
+都能从自己的 ``wiki_map_extract`` ES 行断点续跑 —— 然后把增量差异喂给增量
+编译引擎 ``rag.advanced_rag.knowlege_compile.wiki_incremental``。页面以可检索
+的 ``wiki_page`` 行落进 ES，``wiki_entity`` / ``wiki_relation`` 行则供数据集
+Artifact 页签的画布图渲染。
 
-Design notes:
+设计要点：
 
-* ``load_chunks_for_doc`` is injected rather than imported to keep the
-  module decoupled from ``TaskHandler``'s streaming chunk loader.
-* The eligibility loop resolves each doc's
-  ``parser_config.compilation_template_group_id`` to a template list
-  via the shared parser-config helper and
-  ``CompilationTemplateGroupService.resolve_template_ids``.
+* ``load_chunks_for_doc``（分块加载器）由外部注入而不是本模块自己 import，
+  为的是让本模块与 ``TaskHandler`` 的流式分块加载器解耦。
+* 合格文档筛选会把每个文档的 ``parser_config.compilation_template_group_id``
+  经共享的 parser-config 辅助函数和
+  ``CompilationTemplateGroupService.resolve_template_ids`` 解析成模板列表。
+
+零基础语法小抄（本文件高频出现的 Python 异步写法）：
+
+* ``async def`` 定义的函数叫协程函数，调用它只是造出一个协程对象、
+  不会执行任何代码；必须 ``await`` 它（或登记给事件循环）才真正运行。
+* ``await x`` 的意思是「等 x 完成，等待期间把 CPU 让给别的协程」。
+* ``async for ... in x``：逐批消费「异步生成器」（一边产数据一边 await
+  的迭代器），本文件用它分批读取文档分块。
+* ``asyncio.create_task(协程)``：把协程登记到事件循环后台运行，登记完
+  立刻继续往下走，不等它。
+* ``asyncio.gather(*任务列表)``：等一批后台任务全部结束（点名收齐）。
+* ``thread_pool_exec(同步函数, 参数...)``：把同步阻塞的函数（数据库 /
+  ES 调用）丢进线程池执行并 await 结果，避免它卡死整个事件循环。
 """
 
 from __future__ import annotations
@@ -61,31 +72,29 @@ from rag.advanced_rag.knowlege_compile.wiki import (
 from rag.svr.task_executor_refactor.task_context import TaskContext
 
 
-# ----- tunables ------------------------------------------------------
-# Artifact-MAP tuning: how many chunks to feed per ``wiki_map_from_chunks``
-# invocation. The function does its own per-call resume-set load + ES
-# persist, so smaller batches mean more (small) ES round-trips but a flat
-# memory footprint. 64 keeps the resume-set re-reads cheap while leaving
-# room for the function's internal split_chunks packing to do real work.
+# ----- 可调参数 ------------------------------------------------------
+# Artifact-MAP 调参：每次 ``wiki_map_from_chunks`` 调用喂多少个分块。
+# 该函数自己会做「断点集合加载 + ES 持久化」，所以批次越小、ES 往返越多
+# （但每次都很小）、内存占用越平稳。64 让断点集合重读保持廉价，同时给
+# 函数内部的 split_chunks 打包逻辑留出发挥空间。
 WIKI_MAP_BATCH_CHUNKS = 64
 
-# The pool limits actual MAP LLM calls rather than the surrounding batch
-# tasks. This lets the next waiting batch start as soon as a model call
-# finishes, without waiting for the previous batch's ES persistence work.
+# 限流池限制的是真实的 MAP 大模型调用数，而不是外层批次任务数。这样
+# 上一个批次的模型调用一结束，下一个排队的批次就能立刻开始，不用等
+# 前一批把 ES 持久化的活干完。
 WIKI_MAP_LLM_POOL_SIZE = 20
 
-# Global MAP admission limit: active calls plus calls waiting in the pool.
+# 全局 MAP 准入上限：正在执行的调用 + 池里排队的调用加起来最多这么多。
 WIKI_MAP_MAX_PENDING = 25
 
-# Keep only a small number of outer batches buffered. With 20 workers this
-# bounds the in-memory MAP work to roughly 25 batches (20 active + 5 waiting).
+# 外层批次只缓冲少量几个。配合 20 个 worker，内存中的 MAP 工作量大约
+# 被限制在 25 个批次（20 个执行中 + 5 个等待中）。
 WIKI_MAP_QUEUE_SIZE = 5
 
-# Per-node cap on ``source_chunk_ids`` carried by the canvas graph blob.
-# Pages can accumulate hundreds of source chunks; the graph response is
-# meant for fast canvas rendering, not full provenance audit, so we trim
-# each node's list. The full per-page list is still available on the
-# ``wiki_page`` row the UI deep-links into.
+# 每个节点携带的 ``source_chunk_ids`` 上限（落在 wiki_entity 画布行上）。
+# 页面可能积累数百个来源分块；图响应是给画布快速渲染用的，不是完整的
+# 溯源审计，所以每个节点的列表要截断。完整的每页列表仍在 UI 深链接
+# 指向的 ``wiki_page`` 行上。
 WIKI_GRAPH_MAX_CHUNK_IDS_PER_NODE = 64
 
 WIKI_MAP_COMPILE_KWD = "wiki_map_extract"
@@ -103,19 +112,31 @@ WIKI_DERIVED_COMPILE_KWDS = (
     "wiki_entity",
     "wiki_relation",
     "wiki_page_graph",
-    # Canonical entity rows carry a source_doc_ids array; on doc deletion they
-    # must be shrunk (or dropped) too, otherwise the canonical index keeps
-    # referencing removed docs and later incremental merges re-import them.
+    # 规范实体行（wiki_canonical_entity）携带 source_doc_ids 数组；删除文档时
+    # 它们也必须跟着收缩（或删除），否则规范实体索引会一直引用已删除的
+    # 文档，后续增量合并又会把这些文档重新导进来。
     "wiki_canonical_entity",
 )
 
 
-# ----- helpers -------------------------------------------------------
+# ----- 辅助函数 -------------------------------------------------------
 
 
 def _parser_config_compilation_template_ids(parser_config, tenant_id: str) -> list[str]:
-    """Resolve a doc's ``parser_config`` to compile-template ids by
-    looking up configured groups. Returns ``[]`` if no group resolves."""
+    """把文档的 parser_config 解析成编译模板 ID 列表 —— 模板组展开工。
+
+    参数:
+        parser_config: 文档解析配置字典，长这样：
+            {
+                "chunk_token_num": 512,
+                "compilation_template_group_id": ["tpl_grp_001", "tpl_grp_002"]
+            }
+        tenant_id: 租户 ID，示例："tenant_01"
+
+    返回值:
+        模板 ID 列表（按组内顺序、跨组去重），长这样：["tpl_wiki_01", "tpl_kg_02"]；
+        一个模板组都没配置（或组查不到）时返回 []。
+    """
     from rag.svr.task_executor_refactor.chunk_post_processor import (
         _parser_config_compilation_template_group_ids,
     )
@@ -135,8 +156,21 @@ def _parser_config_compilation_template_ids(parser_config, tenant_id: str) -> li
 
 
 def _normalize_compilation_template_group_ids(raw) -> list[str]:
+    """把各种长相不一的模板组 ID 配置统一清洗成「字符串列表」—— 组 ID 清洗工。
+
+    参数:
+        raw: 原始配置值，可能是这几种长相之一：
+            "tpl_grp_001"                          # 单个字符串
+            ["tpl_grp_001", "tpl_grp_002"]         # 列表
+            ["tpl_grp_001", 123, "  "]             # 混入非字符串/空白项，会被过滤
+
+    返回值:
+        清洗后的组 ID 列表（去空白、去重、保持出现顺序），长这样：
+            ["tpl_grp_001", "tpl_grp_002"]
+        输入既不是字符串也不是列表时返回 []。
+    """
     if isinstance(raw, str):
-        raw = [raw]
+        raw = [raw]  # 单个字符串也当成一个元素的列表处理
     if not isinstance(raw, list):
         return []
     ids: list[str] = []
@@ -152,9 +186,32 @@ def _normalize_compilation_template_group_ids(raw) -> list[str]:
 
 
 def _extract_pipeline_compiler_group_ids(dsl) -> list[str]:
+    """从摄取流水线（画布）DSL 里挖出 Compiler 组件配置的模板组 ID —— 流水线模板组挖矿工。
+
+    参数:
+        dsl: 流水线的 DSL（画布 JSON），可能是 dict（已解析）或 str（JSON 字符串），
+            长这样：
+            {
+                "components": {
+                    "comp_01": {
+                        "obj": {
+                            "component_name": "Compiler",
+                            "params": {
+                                "compilation_template_group_ids": ["tpl_grp_001"]
+                            }
+                        }
+                    },
+                    "comp_02": {"obj": {"component_name": "Chunker"}}
+                }
+            }
+
+    返回值:
+        Compiler 组件上配置的模板组 ID 列表（去重、保序），长这样：["tpl_grp_001"]；
+        DSL 无 Compiler 组件或解析失败时返回 []。
+    """
     if isinstance(dsl, str):
         try:
-            dsl = json.loads(dsl)
+            dsl = json.loads(dsl)  # 字符串形态先解析成 dict
         except Exception:
             return []
     if not isinstance(dsl, dict):
@@ -170,8 +227,11 @@ def _extract_pipeline_compiler_group_ids(dsl) -> list[str]:
             continue
         obj = component.get("obj") if isinstance(component.get("obj"), dict) else {}
         component_name = obj.get("component_name") or component.get("component_name") or component.get("name")
+        # 只认 Compiler 组件：组件名不区分大小写地等于 "compiler" 才算
         if not isinstance(component_name, str) or component_name.lower() != "compiler":
             continue
+        # 新老版本字段位置不同：组 ID 可能藏在 obj.params、obj 本身、
+        # component.params、component 本身四处之一，逐个候选位置翻找
         candidates = [
             obj.get("params") if isinstance(obj.get("params"), dict) else {},
             obj,
@@ -179,6 +239,7 @@ def _extract_pipeline_compiler_group_ids(dsl) -> list[str]:
             component,
         ]
         for candidate in candidates:
+            # 兼容单数（compilation_template_group_id）和复数（..._ids）两种键名
             for key in ("compilation_template_group_ids", "compilation_template_group_id"):
                 for group_id in _normalize_compilation_template_group_ids(candidate.get(key)):
                     if group_id not in seen:
@@ -188,6 +249,16 @@ def _extract_pipeline_compiler_group_ids(dsl) -> list[str]:
 
 
 def _pipeline_compilation_template_ids(pipeline_id: str, tenant_id: str) -> list[str]:
+    """查流水线上 Compiler 组件挂的编译模板 ID 列表 —— 流水线模板解析工。
+
+    参数:
+        pipeline_id: 流水线（画布）ID，示例："pipeline_01"；空串直接返回 []
+        tenant_id: 租户 ID，示例："tenant_01"
+
+    返回值:
+        模板 ID 列表（去重、保序），长这样：["tpl_wiki_01", "tpl_tree_02"]；
+        流水线不存在时返回 []。
+    """
     pipeline_id = (pipeline_id or "").strip()
     if not pipeline_id:
         return []
@@ -211,7 +282,16 @@ def _pipeline_compilation_template_ids(pipeline_id: str, tenant_id: str) -> list
 
 
 def _pipeline_compiler_llm_id(pipeline_id: str) -> str | None:
-    """Return the chat model configured on a pipeline's Compiler component."""
+    """返回流水线 Compiler 组件上配置的聊天大模型 ID —— Compiler 聊天模型侦探。
+
+    参数:
+        pipeline_id: 流水线（画布）ID，示例："pipeline_01"；空串直接返回 None
+
+    返回值:
+        聊天模型 ID，示例："deepseek-chat@deepseek"；
+        流水线不存在 / 无 Compiler / Compiler 没配 LLM 时返回 None。
+        注意：只看第一个 Compiler 组件（循环体里找到就直接 return）。
+    """
     pipeline_id = (pipeline_id or "").strip()
     if not pipeline_id:
         return None
@@ -250,7 +330,23 @@ def _pipeline_compiler_llm_id(pipeline_id: str) -> str | None:
 
 
 def _validate_wiki_eligible_docs(eligible: list[tuple[dict, str]]) -> dict[str, str]:
-    """Validate one Wiki template and return each doc's pipeline chat model."""
+    """校验合格文档集，返回每个文档对应流水线的聊天模型 ID —— 文档集资格审讯工。
+
+    两条硬规则，违反任何一条直接抛 ValueError（整个 wiki 任务失败）：
+    1. 所有合格文档必须使用同一个 Wiki 模板；
+    2. 每个文档必须挂在摄取流水线上，且流水线的 Compiler 组件配置了 LLM。
+
+    参数:
+        eligible: 合格文档列表，每项是 (文档字典, 模板 ID) 元组，长这样：
+            [
+                ({"id": "doc_01", "pipeline_id": "pipeline_01"}, "tpl_wiki_01"),
+                ({"id": "doc_02", "pipeline_id": "pipeline_02"}, "tpl_wiki_01")
+            ]
+
+    返回值:
+        文档 ID -> 该文档流水线 Compiler 的聊天模型 ID 映射，长这样：
+            {"doc_01": "deepseek-chat@deepseek", "doc_02": "qwen-plus@ali"}
+    """
     template_ids = {template_id for _, template_id in eligible}
     if len(template_ids) > 1:
         raise ValueError("Eligible Wiki documents must use the same template")
@@ -268,14 +364,21 @@ def _validate_wiki_eligible_docs(eligible: list[tuple[dict, str]]) -> dict[str, 
 
 
 def _wiki_empty_eligible_message(all_docs) -> str:
-    """Return the user-facing progress message when ``_wiki_eligible_docs``
-    returned an empty list. Distinguishes two failure modes (#18683):
+    """当 _wiki_eligible_docs 筛出空列表时，生成面向用户的进度提示文案 —— 空筛结果解说工。
 
-    * No enabled documents in the dataset — user needs to upload / enable
-      documents first.
-    * Enabled documents exist but none of them has a Wiki compilation
-      template attached — user needs to configure a Wiki template on
-      the dataset or on each document's parser_config.
+    区分两种失败场景（issue #18683）：
+
+    * 知识库里没有启用的文档 —— 用户得先上传 / 启用文档；
+    * 有启用的文档但一个都没挂 Wiki 编译模板 —— 用户得在知识库或每份
+      文档的 parser_config 上配置 Wiki 模板。
+
+    参数:
+        all_docs: 知识库全部文档字典列表，长这样：
+            [{"id": "doc_01", "status": "1"}, {"id": "doc_02", "status": "0"}]
+            （status "1"=启用 "0"=禁用）
+
+    返回值:
+        提示文案字符串，两种场景各一句。
     """
     enabled_docs = [d for d in (all_docs or []) if str(d.get("status", "1")) == "1"]
     if not enabled_docs:
@@ -288,15 +391,28 @@ def _wiki_empty_eligible_message(all_docs) -> str:
 
 
 def _wiki_eligible_docs(all_docs, tenant_id: str, skip_doc_ids=None) -> list[tuple[dict, str]]:
-    """Docs eligible for wiki compilation, each paired with its wiki template id.
+    """筛出有资格参与 Wiki 编译的文档，每个配上它的 wiki 模板 ID —— 合格文档筛选工。
 
-    A doc is eligible when its ``parser_config`` OR its ingestion pipeline
-    resolves to at least one artifacts-kind ("wiki") compilation template — the
-    pipeline path is essential for docs uploaded/parsed through a pipeline, which
-    carry their compilation templates on the pipeline's compiler rather than in
-    ``parser_config``. Returns ``(doc, template_id)`` for the first wiki template
-    matched per doc. Used by :func:`run_wiki_incremental` to decide which
-    docs participate in a compile run.
+    一个文档合格的判定：它的 ``parser_config`` 或它的摄取流水线能解析出
+    至少一个 artifacts 类（kind 为 "wiki"）的编译模板 —— 流水线路径对
+    通过流水线上传/解析的文档至关重要，这类文档的编译模板挂在流水线的
+    Compiler 组件上而不是 ``parser_config`` 里。
+
+    参数:
+        all_docs: 知识库全部文档字典列表，长这样：
+            [
+                {"id": "doc_01", "status": "1", "parser_config": {...},
+                 "pipeline_id": "pipeline_01"},
+                {"id": "doc_02", "status": "0", "parser_config": {...}}
+            ]
+        tenant_id: 租户 ID，示例："tenant_01"
+        skip_doc_ids: 要跳过的文档 ID 集合，示例：{"doc_99"}（本次运行
+            已判定为"已删除"的文档，不再参与筛选）
+
+    返回值:
+        (文档, wiki 模板 ID) 元组列表，每个文档只取第一个命中的 wiki 模板，
+        长这样：
+            [({"id": "doc_01", ...}, "tpl_wiki_01")]
     """
     from api.db.services.compilation_template_service import CompilationTemplateService
     from api.apps.restful_apis.chunk_api import _compilation_template_kind
@@ -307,12 +423,12 @@ def _wiki_eligible_docs(all_docs, tenant_id: str, skip_doc_ids=None) -> list[tup
     for d in all_docs or []:
         if str(d.get("id")) in skip_doc_ids:
             continue
-        # Disabled documents remain in the document table and still retain
-        # their compilation-template configuration, but their source chunks
-        # have ``available_int=0``. They must not make the KB look buildable:
-        # after a Wiki clear there is intentionally no MAP input for them.
+        # 禁用的文档仍留在文档表里、也保留着编译模板配置，但它们的来源分块
+        # available_int=0。不能让它们把知识库显得"可构建"：Wiki 清空之后，
+        # 这些文档名下故意不留任何 MAP 输入。
         if str(d.get("status", "1")) != "1":
             continue
+        # 路线一：parser_config 里配置的模板组 → 模板 ID
         pc = d.get("parser_config") or {}
         template_ids: list[str] = []
         seen_template_ids: set[str] = set()
@@ -321,6 +437,7 @@ def _wiki_eligible_docs(all_docs, tenant_id: str, skip_doc_ids=None) -> list[tup
                 continue
             seen_template_ids.add(template_id)
             template_ids.append(template_id)
+        # 路线二：摄取流水线的 Compiler 组件 → 模板 ID（同一流水线的解析结果缓存复用）
         pipeline_id = (d.get("pipeline_id") or "").strip()
         if pipeline_id:
             if pipeline_id not in pipeline_template_ids_cache:
@@ -331,6 +448,7 @@ def _wiki_eligible_docs(all_docs, tenant_id: str, skip_doc_ids=None) -> list[tup
                 seen_template_ids.add(template_id)
                 template_ids.append(template_id)
 
+        # 在文档的全部模板里找第一个 kind=="wiki" 的，找到即入选并停止
         for template_id in template_ids:
             template = CompilationTemplateService.get_saved(template_id, tenant_id)
             config = template.get("config") if template else {}
@@ -342,17 +460,34 @@ def _wiki_eligible_docs(all_docs, tenant_id: str, skip_doc_ids=None) -> list[tup
 
 
 async def _wiki_existing_map_doc_ids(tenant_id: str, kb_id: str) -> set[str]:
+    """查上次构建的活跃快照里出现过哪些文档 ID —— 增量判定探针。
+
+    参数:
+        tenant_id: 租户 ID，示例："tenant_01"
+        kb_id: 知识库 ID，示例："kb_001"
+
+    返回值:
+        上次构建覆盖的文档 ID 集合，长这样：{"doc_01", "doc_02"}；
+        从未构建过（无快照）时返回空集合 —— 空集合即"首次全量构建"的信号。
+    """
     state = await _wiki_load_active_map_state(tenant_id, kb_id)
     return {str(item.get("doc_id") or "") for item in state.values() if item.get("doc_id")}
 
 
 async def _wiki_has_compiled_pages(tenant_id: str, kb_id: str) -> bool | None:
-    """True when at least one compiled wiki page already exists for the KB.
+    """探测知识库里是否已有编译好的 wiki 页面 —— 页面存在性探针。
 
-    Used to tell "nothing changed and pages already exist" (a genuine no-op)
-    apart from "MAP rows exist but no pages were ever produced" (a prior run
-    persisted MAP then never finished REDUCE) — only the latter should trigger a
-    full rebuild from the stored extracts.
+    用来区分两种状态："没变化且页面已存在"（真正的无事可做）和
+    "MAP 行存在但从没产出过页面"（上次跑完 MAP 就中断了、REDUCE 没跑完）
+    —— 只有后者才应该触发从已存抽取结果重建页面的全量重算。
+
+    参数:
+        tenant_id: 租户 ID，示例："tenant_01"
+        kb_id: 知识库 ID，示例："kb_001"
+
+    返回值:
+        True=已有页面 / False=一个页面都没有（含索引不存在的情况）/
+        None=探测本身失败（吃掉异常返回 None，调用方按 False 以外的逻辑分支处理）。
     """
     from common.doc_store.doc_store_base import OrderByExpr
 
@@ -383,6 +518,18 @@ async def _wiki_delete_deleted_doc_state(
     kb_id: str,
     deleted_doc_ids: set[str],
 ) -> None:
+    """清理"上次构建里有、这次已经不在文档表里"的文档残留状态 —— 删文残留清道夫。
+
+    增量构建时，上次快照里的文档这次找不到了（被用户删除），就要把它
+    拖累的派生行清干净。核心策略是引用计数：一条派生行（如 wiki_page）
+    的 source_doc_ids 里有多个文档，只要还有一个文档活着，行就保留、
+    只把死文档从列表里剔掉；全死光才整行删除。
+
+    参数:
+        tenant_id: 租户 ID，示例："tenant_01"
+        kb_id: 知识库 ID，示例："kb_001"
+        deleted_doc_ids: 已删除文档的 ID 集合，示例：{"doc_99"}
+    """
     if not deleted_doc_ids:
         return
 
@@ -390,11 +537,10 @@ async def _wiki_delete_deleted_doc_state(
     if not settings.docStoreConn.index_exist(index, kb_id):
         return
 
-    # MAP extraction versions are historical cache entries and deliberately
-    # survive document deletion.  The committed active-state snapshot decides
-    # which versions are allowed to participate in the current Wiki.
+    # MAP 抽取版本行是历史缓存条目，故意在文档删除后继续保留。
+    # 由已提交的活跃状态快照决定哪些版本有权参与当前的 Wiki。
 
-    # doc_page_source rows are current derived state and are deleted outright.
+    # wiki_doc_page_source 行是当前派生状态，直接整行删除。
     try:
         await thread_pool_exec(
             settings.docStoreConn.delete,
@@ -411,23 +557,25 @@ async def _wiki_delete_deleted_doc_state(
             kb_id,
         )
 
-    # 2. Derived KB-scoped rows: reference-counted self-healing backstop for
-    # the eager delete-time cleanup (DocumentService.remove_wiki_products).
-    # Read every row referencing any deleted doc, drop the ones left with no
-    # surviving owner, and shrink the rest to their surviving doc set. This
-    # replaces the former blunt "delete every derived row" wipe so products
-    # shared with still-present docs survive a peer's deletion.
+    # 2. 知识库级派生行：引用计数式的自我修复兜底（对应删文档时刻的
+    # 急性清理 DocumentService.remove_wiki_products）。读出所有引用了任一
+    # 已删文档的行，把"没有任何存活文档撑腰"的行删掉，其余的收缩成只剩
+    # 存活文档的列表。这取代了以前"见删就全清"的粗暴擦除，让与现存文档
+    # 共享的产物在同伴被删后仍能存活。
     from common.doc_store.doc_store_base import OrderByExpr
 
     deleted = set(deleted_doc_ids)
     derived_kwds = list(WIKI_DERIVED_COMPILE_KWDS)
     select_fields = ["id", "source_doc_ids", "compile_kwd", "slug_kwd", "page_type_kwd"]
+    # 待整行删除的行 ID 列表 / 待收缩 source_doc_ids 的 (行ID, 剩余文档列表) 对
     to_delete: list[str] = []
     to_shrink: list[tuple[str, list[str]]] = []
+    # 整行删除的 wiki_page 行要连版本历史一起删：(行ID, slug, page_type)
     page_history_to_delete: list[tuple[str, str, str]] = []
     failed_delete_row_ids: set[str] = set()
     offset = 0
     page_size = 1000
+    # 分页扫描所有"引用了任一已删文档"的派生行
     while True:
         try:
             res = await thread_pool_exec(
@@ -448,6 +596,7 @@ async def _wiki_delete_deleted_doc_state(
             return
         if not field_map:
             break
+        # source_doc_ids 可能是单个字符串（老数据）或列表，统一成列表
         for row_id, row in field_map.items():
             raw = row.get("source_doc_ids")
             if isinstance(raw, str):
@@ -456,6 +605,7 @@ async def _wiki_delete_deleted_doc_state(
                 owners = [d for d in raw if isinstance(d, str) and d]
             else:
                 owners = []
+            # 引用计数裁决：剔除已删文档后还有存活者 → 收缩；一个不剩 → 整行删
             remaining = [d for d in owners if d not in deleted]
             if remaining:
                 to_shrink.append((row_id, remaining))
@@ -469,7 +619,7 @@ async def _wiki_delete_deleted_doc_state(
             break
         offset += page_size
 
-    # Drop rows with no surviving owner (delete by id in batches).
+    # 没有存活撑腰者的行：按 ID 分批整行删除。
     for i in range(0, len(to_delete), page_size):
         batch_ids = to_delete[i : i + page_size]
         try:
@@ -479,12 +629,14 @@ async def _wiki_delete_deleted_doc_state(
                 index,
                 kb_id,
             )
+            # 删除数对不上说明有行没删掉，记下来防止后面误删它的版本历史
             if not isinstance(deleted_count, int) or deleted_count != len(batch_ids):
                 failed_delete_row_ids.update(batch_ids)
         except Exception:
             logging.exception("wiki: failed to drop orphaned derived rows in kb=%s", kb_id)
             failed_delete_row_ids.update(batch_ids)
 
+    # wiki_page 行删除成功后，连带删除该页面的版本历史（手动编辑历史）
     if page_history_to_delete:
         from api.db.services.file_commit_service import FileCommitService
 
@@ -500,7 +652,7 @@ async def _wiki_delete_deleted_doc_state(
                     kb_id,
                 )
 
-    # Shrink rows still owned by surviving docs to just those docs.
+    # 仍有存活文档撑腰的行：把 source_doc_ids 收缩成只剩存活文档。
     for row_id, remaining in to_shrink:
         try:
             await thread_pool_exec(
@@ -522,17 +674,34 @@ async def _wiki_delete_deleted_doc_state(
     )
 
 
-# ----- mode persistence & full reset ----------------------------------------
+# ----- 模式持久化 & 全量重置 ----------------------------------------
 
 
 def _wiki_mode_meta_id(kb_id: str) -> str:
-    """Stable row id for the KB-level mode meta record."""
+    """生成知识库级模式元数据行的固定行 ID —— 模式行身份证工。
+
+    参数:
+        kb_id: 知识库 ID，示例："kb_001"
+
+    返回值:
+        行 ID 字符串，示例："wiki_mode_meta_kb_001"。
+        每个知识库永远用同一个 ID，写入（insert）时靠 ES 的同 ID 覆盖
+        达到"更新"效果。
+    """
     return f"wiki_mode_meta_{kb_id}"
 
 
 async def _wiki_load_mode(tenant_id: str, kb_id: str) -> str | None:
-    """Return the mode value recorded by the previous build, or None
-    if this KB has never recorded a mode (e.g. first ever build)."""
+    """读取上次构建记录的 wiki 模式 —— 模式读取工。
+
+    参数:
+        tenant_id: 租户 ID，示例："tenant_01"
+        kb_id: 知识库 ID，示例："kb_001"
+
+    返回值:
+        上次记录的模式，"entity"（一实体一页）或 "topic"（主题聚页）；
+        这个知识库从没记录过模式（比如首次构建）时返回 None。
+    """
     from common.doc_store.doc_store_base import OrderByExpr
 
     index = search.index_name(tenant_id)
@@ -565,7 +734,18 @@ async def _wiki_load_mode(tenant_id: str, kb_id: str) -> str | None:
 
 
 async def _wiki_load_embedding_fingerprint(tenant_id: str, kb_id: str) -> str | None:
-    """Return the embedding-space identity recorded by the previous build."""
+    """读取上次构建记录的嵌入模型指纹 —— 嵌入指纹读取工。
+
+    参数:
+        tenant_id: 租户 ID，示例："tenant_01"
+        kb_id: 知识库 ID，示例："kb_001"
+
+    返回值:
+        指纹字符串（"厂商:模型ID:模型名" 用冒号拼接），示例：
+            "siliconflow:BAAI/bge-large-zh-v1.5:bge-large-zh-v1.5"
+        从未记录过时返回 None。用途：本次构建开始前对比指纹，发现换了
+        嵌入模型就全量重建（换模型=换向量空间，旧 KNN 结果全部作废）。
+    """
     from common.doc_store.doc_store_base import OrderByExpr
 
     index = search.index_name(tenant_id)
@@ -596,6 +776,16 @@ async def _wiki_load_embedding_fingerprint(tenant_id: str, kb_id: str) -> str | 
 
 
 def _wiki_embedding_fingerprint(embedding_model) -> str:
+    """从嵌入模型对象提取身份指纹 —— 嵌入模型指纹提取工。
+
+    参数:
+        embedding_model: 嵌入模型对象（带 model_config 配置属性）
+
+    返回值:
+        "厂商:模型ID:模型名" 冒号拼接的指纹串，非空部分才参与拼接，示例：
+            "siliconflow:BAAI/bge-large-zh-v1.5:bge-large-zh-v1.5"
+        三项都取不到时返回 ""。
+    """
     config = getattr(embedding_model, "model_config", {}) or {}
     factory = str(config.get("llm_factory") or "").strip()
     model_id = str(config.get("id") or config.get("llm_id") or "").strip()
@@ -604,6 +794,21 @@ def _wiki_embedding_fingerprint(embedding_model) -> str:
 
 
 async def _wiki_save_mode(tenant_id: str, kb_id: str, mode: str, embedding_fingerprint: str = "") -> None:
+    """把 wiki 模式和嵌入指纹写进知识库级元数据行 —— 模式落盘工。
+
+    参数:
+        tenant_id: 租户 ID，示例："tenant_01"
+        kb_id: 知识库 ID，示例："kb_001"
+        mode: wiki 模式，只能是 "entity"（一实体一页）或 "topic"（主题聚页）
+        embedding_fingerprint: 嵌入模型指纹串，示例："siliconflow:...:bge-large-zh-v1.5"
+
+    返回值:
+        无返回值（None）。写入的是单行 wiki_mode_meta 行（固定行 ID，重复
+        写靠 ES 同 ID 覆盖），行长相：
+            {"id": "wiki_mode_meta_kb_001", "compile_kwd": "wiki_mode_meta",
+             "mode_kwd": "entity", "embedding_model_kwd": "...",
+             "kb_id": "kb_001", "create_timestamp_flt": 1757...}
+    """
     if mode not in ("entity", "topic"):
         raise ValueError(f"Unsupported wiki mode: {mode}")
     index = search.index_name(tenant_id)
@@ -627,11 +832,24 @@ async def _wiki_save_mode(tenant_id: str, kb_id: str, mode: str, embedding_finge
 
 
 async def _wiki_reset_all_wiki_state(tenant_id: str, kb_id: str) -> None:
-    """Drop every wiki-derived row for the KB (canonical, pages, relations,
-    entities, plan/draft/reduce, topics, doc_page_source, mode meta). Used when
-    the plan (mode) setting toggles: Mode A and Mode B pages are structurally
-    different and cannot be merged incrementally, so a mode switch must rebuild
-    from a clean slate."""
+    """删光这个知识库的所有 wiki 派生行 —— wiki 状态推土机。
+
+    清理范围（按 compile_kwd 删）：wiki_canonical_entity（规范实体）、
+    wiki_page（页面）、wiki_entity / wiki_relation（画布投影）、
+    wiki_page_graph（旧版图 blob）、wiki_page_topic、wiki_compilation_plan、
+    wiki_plan_group、wiki_reduce_result、wiki_page_draft、
+    wiki_doc_page_source、wiki_map_state(+meta)（分块快照）、wiki_mode_meta
+    （模式元数据）。在模式（entity/topic）切换或嵌入模型变更时使用：
+    Mode A（entity）和 Mode B（topic）的页面结构完全不同，没法增量混着来，
+    切模式必须从白纸重建；换嵌入模型则是换向量空间，旧向量全部作废。
+
+    参数:
+        tenant_id: 租户 ID，示例："tenant_01"
+        kb_id: 知识库 ID，示例："kb_001"
+
+    返回值:
+        无返回值（None）。
+    """
 
     index = search.index_name(tenant_id)
     if not settings.docStoreConn.index_exist(index, kb_id):
@@ -652,7 +870,7 @@ async def _wiki_reset_all_wiki_state(tenant_id: str, kb_id: str) -> None:
         WIKI_MAP_STATE_META_COMPILE_KWD,
         "wiki_mode_meta",
     ]
-    # Delete in one bulk call using compile_kwd IN filter.
+    # 用 compile_kwd IN 过滤条件一次批量删除
     try:
         await thread_pool_exec(
             settings.docStoreConn.delete,
@@ -664,30 +882,60 @@ async def _wiki_reset_all_wiki_state(tenant_id: str, kb_id: str) -> None:
         logging.exception("wiki: failed to reset all wiki state for kb=%s", kb_id)
 
 
-# ----- persistence ---------------------------------------------------
+# ----- 持久化 ---------------------------------------------------
 
 
 def build_wiki_page_graph(
     pages: List[Dict],
     kb_id: str,
 ) -> tuple[List[Dict], List[Dict]]:
-    """Project the REFINE-emitted page list onto per-entity and
-    per-relation ES rows.
+    """把 REFINE 产出的页面列表投影成节点行和边行 —— 画布图投影工。
 
-    Returns:
-        (entity_rows, relation_rows)
+    参数:
+        pages: 页面字典列表（来自 _wiki_load_pages_for_graph 从 ES 读回），每项长这样：
+            {
+                "slug": "entity/caocao",            # 页面唯一键（深链接用）
+                "title": "曹操",                     # 页面标题
+                "summary": "东汉末年军事家...",       # 摘要
+                "page_type": "entity",              # 页面类型（entity/concept）
+                "entity_names": ["曹操", "曹孟德"],  # 页面收编的实体名
+                "outlinks": ["entity/liubei"],      # 出链目标 slug 列表
+                "source_chunk_ids": ["c1", "c2"],   # 来源分块
+                "source_doc_ids": ["doc_01"]        # 来源文档
+            }
+        kb_id: 知识库 ID，示例："kb_001"
 
-    Both lists are ES-ready docs (one per node / per surviving edge)
-    using the standard artifact envelope. They are BM25-only (no
-    ``q_<dim>_vec``) — entities carry ``content_ltks`` derived from
-    ``slug + " " + summary`` so name/summary lookups hit the lexical
-    index.
-
-    ``by_slug`` is kept internally only to filter dangling outlinks
-    (a target slug not present as a node in this KB).
+    返回值:
+        (实体节点行列表, 关系边行列表) 二元组，两类都是可直接写 ES 的行：
+            实体节点行（每页一行，只走 BM25、无 q_<dim>_vec 向量列）：
+            {
+                "id": "a1b2...",                      # xxh64("wiki_entity:{kb}:{slug}")
+                "kb_id": "kb_001",
+                "doc_id": "kb_001",                   # 知识库级哨兵：不属于任何文档
+                "available_int": 1,
+                "compile_kwd": "wiki_entity",
+                "type_kwd": "wiki_entity",            # "wiki_" + page_type
+                "slug_kwd": "entity/caocao",
+                "weight_int": 1,                      # 出链数，驱动画布节点大小
+                "source_chunk_ids": ["c1", "c2"],     # 截顶 64 个的来源分块
+                "source_doc_ids": ["doc_01"],         # 删文档时引用计数用
+                "content_ltks": "曹操 东汉...",        # slug+摘要分词，BM25 命中用
+                "content_with_weight": "{...}"        # payload JSON
+            }
+            关系边行（每条存活边一行，悬空目标被丢弃；kb_id/doc_id/
+            available_int/type_kwd 同实体行的取值方式）：
+            {
+                "id": "c3d4...",                      # xxh64("wiki_relation:{kb}:{src}:{tgt}")
+                "compile_kwd": "wiki_relation",
+                "from_kwd": "entity/caocao",          # 起点=页面 slug
+                "to_kwd": "entity/liubei",            # 终点=页面 slug
+                "source_doc_ids": ["doc_01", "doc_02"], # 两端来源文档并集
+                "content_with_weight": "{\"from\": ..., \"to\": ...}"
+            }
     """
     from rag.nlp import rag_tokenizer
 
+    # 第一遍：建 slug → 页面摘要索引（by_slug），同时产出全部实体节点行
     by_slug: Dict[str, Dict] = {}
     entity_rows: List[Dict] = []
     for p in pages or []:
@@ -695,15 +943,12 @@ def build_wiki_page_graph(
         if not slug:
             continue
         outlinks_raw = p.get("outlinks") or []
-        # ``weight`` is the page's outlink count. Drives node size on
-        # the canvas. Computed on the raw outlink list before dangling-
-        # target filtering so visual weight reflects what the writer
-        # actually emitted.
+        # weight = 该页的出链数，驱动画布上节点的大小。在过滤悬空目标
+        # 之前用原始出链列表计算，让视觉权重反映写作者真实写下的链接量。
         weight = len(outlinks_raw) if isinstance(outlinks_raw, list) else 0
 
-        # Per-node provenance: union of source chunks REFINE attributed
-        # to this page. Dedup preserves first-seen order; cap the list
-        # to keep the graph blob small.
+        # 节点级溯源：REFINE 归到本页的来源分块取并集。去重保持首见顺序；
+        # 列表截顶（WIKI_GRAPH_MAX_CHUNK_IDS_PER_NODE=64）控制图 blob 体积。
         raw_chunk_ids = p.get("source_chunk_ids") or []
         seen_chunk_ids: dict[str, None] = {}
         for cid in raw_chunk_ids:
@@ -718,9 +963,8 @@ def build_wiki_page_graph(
         name = p.get("title") or slug
         aliases = list(p.get("entity_names") or [])
 
-        # Per-node doc provenance: the documents that fed this page. Stamped
-        # onto the entity row so document deletion can reference-count it
-        # (drop the entity only when its last source doc is removed).
+        # 节点级文档溯源：喂出这个页面的那些文档。盖到实体行上，
+        # 删除文档时才能做引用计数（最后一个来源文档也被删时才删实体）。
         page_doc_ids = [d for d in (p.get("source_doc_ids") or []) if isinstance(d, str) and d]
 
         by_slug[slug] = {
@@ -734,8 +978,8 @@ def build_wiki_page_graph(
             "source_doc_ids": page_doc_ids,
         }
 
-        # Per-entity ES row. content_ltks is built from slug + summary
-        # so BM25 hits both the deep-link key and human prose.
+        # 每个实体一条 ES 行。content_ltks 用 slug + 摘要构建，
+        # 让 BM25 既能命中深链接键也能命中人类散文。
         content_text = (slug + " " + description).strip()
         entity_payload = {
             "slug": slug,
@@ -747,11 +991,12 @@ def build_wiki_page_graph(
         }
         entity_rows.append(
             {
+                # 行 ID 由 kb+slug 哈希得出：同一页重投影得到同一 ID，ES 同 ID 覆盖
                 "id": xxhash.xxh64(
                     f"wiki_entity:{kb_id}:{slug}".encode("utf-8", "surrogatepass"),
                 ).hexdigest(),
                 "kb_id": kb_id,
-                "doc_id": kb_id,  # KB-scoped sentinel
+                "doc_id": kb_id,  # 知识库级哨兵：这行不属于任何单个文档
                 "available_int": 1,
                 "compile_kwd": "wiki_entity",
                 "type_kwd": "wiki_" + page_type,
@@ -764,23 +1009,25 @@ def build_wiki_page_graph(
             }
         )
 
+    # 第二遍：产出关系边行，目标不在 by_slug 里（悬空）的出链直接丢弃
     relation_rows: List[Dict] = []
     for p in pages or []:
         src = (p.get("slug") or "").strip()
         if not src or src not in by_slug:
             continue
         for raw_target in p.get("outlinks") or []:
+            # 出链目标可能是字符串（纯 slug）或 {"slug": ...} 字典，统一取 slug
             if isinstance(raw_target, str):
                 tgt = raw_target.strip()
             elif isinstance(raw_target, dict):
                 tgt = str(raw_target.get("slug") or "").strip()
             else:
                 tgt = ""
+            # 丢弃：空目标 / 自指 / 目标不在本知识库的节点集里（悬空链）
             if not tgt or tgt == src or tgt not in by_slug:
                 continue
-            # Edge provenance is the union of both endpoints' source docs, so
-            # the relation is dropped only once neither endpoint traces to a
-            # surviving document.
+            # 边的溯源 = 两端节点来源文档的并集：两端都追溯不到任何存活
+            # 文档时，这条边才会被删除（配合删文档时的引用计数清理）。
             edge_doc_ids: list[str] = []
             edge_seen: set[str] = set()
             for endpoint in (src, tgt):
@@ -791,6 +1038,7 @@ def build_wiki_page_graph(
             relation_payload = {"from": src, "to": tgt}
             relation_rows.append(
                 {
+                    # 行 ID 由 kb+两端 slug 哈希得出，同一条边重投影同 ID 覆盖
                     "id": xxhash.xxh64(
                         f"wiki_relation:{kb_id}:{src}:{tgt}".encode("utf-8", "surrogatepass"),
                     ).hexdigest(),
@@ -813,19 +1061,23 @@ async def persist_wiki_page_graph(
     ctx: TaskContext,
     pages: List[Dict],
 ) -> None:
-    """Materialize and store the per-entity / per-relation doc-store rows
-    derived from artifact pages.
+    """把页面列表物化并写入节点/边两类 ES 行 —— 画布图落盘工。
 
-    Writes two row types — both delete-then-insert for idempotent
-    re-runs:
+    写两种行类型，都用「先删后插」保证重复运行幂等（同结果不叠加）：
 
-    1. ``compile_kwd="wiki_entity"`` — one row per page node,
-       BM25-only via ``content_ltks``.
-    2. ``compile_kwd="wiki_relation"`` — one row per surviving
-       edge (dangling outlinks dropped by the builder).
+    1. ``compile_kwd="wiki_entity"`` —— 每个页面节点一行，
+       靠 content_ltks 走 BM25 检索（无向量列）。
+    2. ``compile_kwd="wiki_relation"`` —— 每条存活边一行
+       （悬空出链在 build_wiki_page_graph 里已被丢弃）。
 
-    Also sweeps any leftover legacy ``wiki_page_graph`` blob so
-    the index doesn't accumulate stale state.
+    顺带扫掉遗留的老 ``wiki_page_graph`` blob 行，不让索引积攒陈旧状态。
+
+    参数:
+        ctx: 任务上下文（用它的 tenant_id / kb_id 定位目标索引）
+        pages: 页面字典列表（形状见 build_wiki_page_graph 的参数说明）
+
+    返回值:
+        无返回值（None）。
     """
     kb_id_str = str(ctx.kb_id)
     entity_rows, relation_rows = build_wiki_page_graph(pages or [], kb_id_str)
@@ -833,7 +1085,9 @@ async def persist_wiki_page_graph(
     index = search.index_name(ctx.tenant_id)
 
     async def _replace_bucket(kwd: str, rows: List[Dict]) -> None:
+        """清空并重写某个 compile_kwd 桶：先删旧桶，再插新行。"""
         try:
+            # 先删掉该类型的全部旧行（知识库范围内）
             await thread_pool_exec(
                 settings.docStoreConn.delete,
                 {"compile_kwd": kwd},
@@ -863,6 +1117,7 @@ async def persist_wiki_page_graph(
             )
 
     async def _sweep_legacy_blob() -> None:
+        """扫掉旧版整图 blob 行（wiki_page_graph），现在图拆成节点/边行了。"""
         try:
             await thread_pool_exec(
                 settings.docStoreConn.delete,
@@ -876,6 +1131,7 @@ async def persist_wiki_page_graph(
                 kb_id_str,
             )
 
+    # 三个清理任务并发执行：节点桶重写、边桶重写、旧 blob 扫除
     await asyncio.gather(
         _replace_bucket("wiki_entity", entity_rows),
         _replace_bucket("wiki_relation", relation_rows),
@@ -883,7 +1139,7 @@ async def persist_wiki_page_graph(
     )
 
 
-# ----- dual-mode incremental entry point ---------------------------------
+# ----- 双模式增量编译入口 -----------------------------------------
 
 
 async def run_wiki_incremental(
@@ -892,22 +1148,28 @@ async def run_wiki_incremental(
     load_chunks_for_doc: Callable[..., AsyncIterator[list[dict]]],
     mode: str | None = None,
 ) -> None:
-    """Dual-mode wiki compilation with incremental support.
+    """知识库级 Wiki 编译总入口（双模式 + 增量）—— Wiki 编译总指挥。
 
-    Entity mode:
-        1 concept = 1 page (WeKnora style).
-        MAP → REDUCE → per-concept REFINE → FINALIZE.
-        Incremental: per-concept modify based on doc_change tracking.
+    Entity 模式（一实体一页，WeKnora 风格）：
+        1 个概念 = 1 个页面。流程 MAP → REDUCE → 逐概念 REFINE → FINALIZE。
+        增量：基于文档变更跟踪做逐概念修改。
+    Topic 模式（主题聚页）：
+        PLAN 把实体分组 → 每组炼一个页面。增量：向量检索页面候选，
+        LLM 做最终路由。
 
-    Topic mode:
-        PLAN groups entities → per-page REFINE.
-        Incremental: embeddings retrieve page candidates; the LLM makes final routes.
+    参数:
+        ctx: 任务上下文（tenant_id / kb_id / language / progress_cb 进度回调）
+        embedding_model: 嵌入模型对象（向量化的唯一口径）
+        load_chunks_for_doc: 分块加载器（由 TaskHandler 注入的异步生成器
+            工厂），调用后按批吐分块：
+                load_chunks_for_doc(tenant_id, kb_id, doc_id, batch_size=64)
+                每批长这样：[{"id": "c1", "content_with_weight": "...", ...}]
+        mode: 编译模式 "entity" 或 "topic"；None 时依次从文档模板、
+            上次记录的模式元数据里解析
 
-    Args:
-        ctx: Task context
-        embedding_model: Embedding model
-        load_chunks_for_doc: Chunk loader
-        mode: ``entity`` or ``topic``
+    返回值:
+        无返回值（None）。进度经 ctx.progress_cb 上报，失败时上报
+        progress(-1, 原因)。
     """
     from api.db.services.document_service import DocumentService
     from api.db.services.compilation_template_service import CompilationTemplateService
@@ -921,13 +1183,13 @@ async def run_wiki_incremental(
     progress = ctx.progress_cb
     progress(0.0, "Loading documents for wiki compilation...")
 
-    # 1. Check if this is incremental (existing MAP rows present)
+    # 1. 判定这次是增量还是首次全量：上次快照里有文档 → 增量
     existing_map_doc_ids = await _wiki_existing_map_doc_ids(ctx.tenant_id, ctx.kb_id)
     is_incremental = bool(existing_map_doc_ids)
     deleted_doc_ids = set()
 
     if is_incremental:
-        # Find deleted docs
+        # 找出"上次构建时还在、现在文档表里已经没有"的文档（= 已删除）
         all_docs, _ = await thread_pool_exec(
             DocumentService.get_by_kb_id,
             kb_id=ctx.kb_id,
@@ -940,13 +1202,15 @@ async def run_wiki_incremental(
             types=[],
             suffix=[],
         )
+        # 差集示例: {"doc_01","doc_02"} - {"doc_01"} = {"doc_02"}
         current_doc_ids = {str(d.get("id")) for d in all_docs or [] if d.get("id")}
         deleted_doc_ids = existing_map_doc_ids - current_doc_ids
         if deleted_doc_ids:
             progress(0.02, f"Cleaning {len(deleted_doc_ids)} deleted doc(s) ...")
+            # 引用计数式清理已删文档的派生行（见 _wiki_delete_deleted_doc_state）
             await _wiki_delete_deleted_doc_state(ctx.tenant_id, ctx.kb_id, deleted_doc_ids)
 
-    # 2. Pick eligible docs
+    # 2. 筛选合格文档（启用 + 挂了 wiki 模板），刚判死的文档跳过
     all_docs, _ = await thread_pool_exec(
         DocumentService.get_by_kb_id,
         kb_id=ctx.kb_id,
@@ -961,19 +1225,28 @@ async def run_wiki_incremental(
     )
     eligible = _wiki_eligible_docs(all_docs, ctx.tenant_id, skip_doc_ids=deleted_doc_ids)
 
+    # 首次构建且没有合格文档：直接报进度收工（区分"没文档"和"没模板"两种文案）
     if not eligible and not is_incremental:
         progress(1.0, _wiki_empty_eligible_message(all_docs))
         return
     pipeline_chat_llm_ids = _validate_wiki_eligible_docs(eligible) if eligible else {}
 
+    # 四路分块增量比对：上代快照 vs 当前扫描，每个分块按内容哈希对比
+    # eligible_doc_ids 示例: {"doc_01", "doc_02"}
     eligible_doc_ids = {str(doc.get("id")) for doc, _ in eligible if doc.get("id")}
+    # previous_chunk_state / current_chunk_state 长相:
+    #     {"chunk_101": {"doc_id": "doc_01", "hash": "3f2a..."}}
     previous_chunk_state = await _wiki_load_active_map_state(ctx.tenant_id, ctx.kb_id)
     current_chunk_state = await _wiki_scan_current_chunk_state(
         ctx.tenant_id,
         ctx.kb_id,
         eligible_doc_ids,
     )
+    # chunk_delta 四集合示例:
+    #     {"new_chunk_ids": {"c3"}, "changed_chunk_ids": {"c1"},
+    #      "deleted_chunk_ids": {"c2"}, "unchanged_chunk_ids": set()}
     chunk_delta = _wiki_compare_chunk_states(previous_chunk_state, current_chunk_state)
+    # 本次需要重新 MAP 的目标 = 新增 ∪ 内容变化；纯删除不算 MAP 目标
     target_chunk_ids = chunk_delta["new_chunk_ids"] | chunk_delta["changed_chunk_ids"]
     has_chunk_delta = bool(target_chunk_ids or chunk_delta["deleted_chunk_ids"])
     logging.info(
@@ -985,10 +1258,10 @@ async def run_wiki_incremental(
         len(chunk_delta["unchanged_chunk_ids"]),
     )
 
-    # Resolve mode from the eligible documents' templates. Each eligible
-    # doc resolves to a wiki template either via its own parser_config or via
-    # its ingestion pipeline (doc.pipeline_id → pipeline dsl → compiler →
-    # template). This also covers pipeline-bound templates.
+    # 从合格文档的模板里解析模式。每个合格文档要么经自己的 parser_config、
+    # 要么经摄取流水线（doc.pipeline_id → 流水线 DSL → Compiler → 模板）
+    # 解析出一个 wiki 模板，两种路径都覆盖。
+    # resolved_modes 示例: {"entity"}（全部文档模板 mode 一致时只有一个元素）
     resolved_modes = set()
     for _doc, tid in eligible:
         tpl = CompilationTemplateService.get_saved(tid, ctx.tenant_id)
@@ -998,24 +1271,26 @@ async def run_wiki_incremental(
             raise ValueError(f"Wiki template {tid} must define mode as 'entity' or 'topic'")
         resolved_modes.add(candidate_mode)
 
+    # 模板们的 mode 必须一致；以模板配置为准覆盖外部传入的 mode 参数
     if len(resolved_modes) > 1:
         raise ValueError("Eligible Wiki templates must use the same mode")
     if resolved_modes:
         mode = resolved_modes.pop()
 
+    # 模板里没解析到 mode 时，兜底读上次构建记录的模式元数据
     if mode is None:
         mode = await _wiki_load_mode(ctx.tenant_id, ctx.kb_id)
     if mode not in ("entity", "topic"):
         raise ValueError("Wiki template mode must be either 'entity' or 'topic'")
 
-    # Mode-change detection. Switching entity/topic is a config change: the page
-    # structures differ fundamentally (single-entity pages vs PLAN-grouped
-    # pages), so switching modes must reset all wiki-derived state and rebuild
-    # from scratch instead of incrementally mixing old-mode and new-mode pages.
+    # 模式变化检测。entity/topic 互切属于配置变更：两种模式的页面结构
+    # 根本不同（单实体页 vs PLAN 分组页），切模式必须清光全部 wiki 派生
+    # 状态从零重建，不能增量混用旧模式和新模式的页面。
     previous_mode = await _wiki_load_mode(ctx.tenant_id, ctx.kb_id)
     previous_embedding = await _wiki_load_embedding_fingerprint(ctx.tenant_id, ctx.kb_id)
     current_embedding = _wiki_embedding_fingerprint(embedding_model)
     mode_changed = is_incremental and previous_mode is not None and previous_mode != mode
+    # 换嵌入模型同理：换模型=换向量空间，旧向量对新模型毫无意义
     embedding_changed = bool(previous_embedding and current_embedding and previous_embedding != current_embedding)
     if is_incremental and (mode_changed or embedding_changed):
         if mode_changed:
@@ -1023,18 +1298,21 @@ async def run_wiki_incremental(
         else:
             reason = "Embedding model changed"
         progress(0.05, f"{reason}; rebuilding wiki from scratch...")
+        # 推土机全清 + 一切归零，从此按首次全量构建处理
         await _wiki_reset_all_wiki_state(ctx.tenant_id, ctx.kb_id)
-        # Everything is gone; this is now a first build.
+        # 状态已全部清空，从这里开始按首次全量构建处理
         is_incremental = False
         existing_map_doc_ids = set()
         deleted_doc_ids = set()
         previous_chunk_state = {}
+        # 旧快照清空后，全部当前分块都算"新增"，全量重 MAP
         chunk_delta = _wiki_compare_chunk_states(previous_chunk_state, current_chunk_state)
         target_chunk_ids = set(chunk_delta["new_chunk_ids"])
         has_chunk_delta = bool(target_chunk_ids)
+    # 把本次的 mode + 嵌入指纹记进元数据行，供下次构建对比
     await _wiki_save_mode(ctx.tenant_id, ctx.kb_id, mode, current_embedding)
 
-    # 3. Resolve chat model
+    # 3. 解析聊天模型：按 llm_id 缓存 LLMBundle，避免重复建连
     llm_bundle_cache: dict[str, LLMBundle] = {}
 
     def _bundle_for(llm_id: str) -> LLMBundle:
@@ -1047,21 +1325,27 @@ async def run_wiki_incremental(
         llm_bundle_cache[key] = bundle
         return bundle
 
+    # MAP 阶段的 LLM 调用池：20 并发、全局在途上限 25，优先级排队
     map_llm_pool = LLMCallPool(WIKI_MAP_LLM_POOL_SIZE, max_pending=WIKI_MAP_MAX_PENDING)
     kb_chat_llm_id = None
     first_template_found = False
 
-    # 4. MAP per doc
+    # 4. 逐文档 MAP：生产者-消费者流水线
+    # 有界队列（容量 5）：生产太快时 put 会 await 挂起，自动反压限内存
     map_queue: asyncio.Queue = asyncio.Queue(maxsize=WIKI_MAP_QUEUE_SIZE)
     n_docs = len(eligible)
 
-    # Pre-resolve parser_cfg for each eligible doc (avoids sync DB call in worker)
+    # 预解析每个合格文档的模板配置（避免 worker 里再打同步 DB 调用）
+    # doc_configs 示例: {"doc_01": {"mode": "entity", "kind": "wiki", ...}}
     doc_configs: dict[str, dict] = {}
     for d, template_id in eligible:
         try:
             template = CompilationTemplateService.get_saved(template_id, ctx.tenant_id)
             cfg = (template.get("config") or {}) if template else {}
             doc_configs[d["id"]] = cfg
+            # 第一个成功解析到配置的文档，顺手记下它的 Compiler 聊天模型
+            # 作为整个知识库的 REFINE 模型（各文档流水线配的 LLM 可能不同，
+            # 这里统一取第一个文档的那个）
             if not first_template_found and isinstance(cfg, dict):
                 first_template_found = True
                 kb_chat_llm_id = pipeline_chat_llm_ids[str(d.get("id") or "")]
@@ -1070,10 +1354,17 @@ async def run_wiki_incremental(
             doc_configs[d["id"]] = {}
 
     async def _produce_doc(i: int, job: tuple[dict, str]) -> None:
+        """生产者：把一个文档的分块按批灌进队列。
+
+        队列元素长这样 (序号, 文档字典, 模板ID, 模板配置, 一批分块):
+            (0, {"id": "doc_01", ...}, "tpl_wiki_01", {...},
+             [{"id": "c1", "content_with_weight": "..."}])
+        """
         doc, template_id = job
         doc_id = doc["id"]
         progress(0.05 + 0.6 * (i / max(n_docs, 1)), f"MAP {i + 1}/{n_docs}: {doc.get('name', doc_id)}")
         try:
+            # 异步生成器逐批吐分块，每批 64 个（WIKI_MAP_BATCH_CHUNKS）
             async for batch in load_chunks_for_doc(
                 ctx.tenant_id,
                 ctx.kb_id,
@@ -1085,6 +1376,7 @@ async def run_wiki_incremental(
             logging.exception("wiki: MAP chunk loading failed for doc %s", doc_id)
 
     async def _map_worker() -> None:
+        """消费者：循环取批次调用 MAP 抽取（wiki_map_from_chunks）。"""
         while True:
             item = await map_queue.get()
             try:
@@ -1092,10 +1384,13 @@ async def run_wiki_incremental(
                     return
                 _, doc, template_id, parser_cfg, batch = item
                 doc_id = doc["id"]
+                # 该文档流水线 Compiler 上配置的 MAP 聊天模型
                 map_llm_id = pipeline_chat_llm_ids[str(doc_id)]
 
                 await wiki_map_from_chunks(
                     chunks=batch,
+                    # 包装进调用池：priority=30（MAP 低于 REFINE 的优先让路关系
+                    # 由池的优先级队列决定），label/context 供日志追踪
                     chat_mdl=map_llm_pool.wrap(
                         _bundle_for(map_llm_id),
                         priority=30,
@@ -1111,25 +1406,33 @@ async def run_wiki_incremental(
                     batch_size_cap=8,
                     window_fraction=0.5,
                     max_workers=WIKI_MAP_LLM_POOL_SIZE,
+                    # 只重新抽取本次有变动的分块（断点续跑的核心闸门）
                     target_chunk_ids=target_chunk_ids,
                 )
             except Exception:
                 logging.exception("wiki: MAP failed for doc %s", doc_id)
             finally:
+                # 每消费一项都要 task_done，queue.join() 靠它判断全部完工
                 map_queue.task_done()
 
+    # 每个文档一个生产者协程 + 20 个常驻消费者 worker，全部后台并发
     producers = [asyncio.create_task(_produce_doc(i, job)) for i, job in enumerate(eligible)]
     workers = [asyncio.create_task(_map_worker()) for _ in range(WIKI_MAP_LLM_POOL_SIZE)]
     try:
-        await asyncio.gather(*producers)
-        await map_queue.join()
+        await asyncio.gather(*producers)  # 等所有生产者灌完
+        await map_queue.join()  # 等队列里每一项都被消费完
     finally:
+        # 收尾：取消还没结束的协程（比如 worker 在等不存在的下一项）
         for task in producers + workers:
             if not task.done():
                 task.cancel()
         await asyncio.gather(*producers, *workers, return_exceptions=True)
 
+    # MAP 完整性校验：目标分块都应有对应版本的抽取结果行
     if target_chunk_ids:
+        # resolved_versions 每项长这样:
+        #     {"doc_id": "doc_01", "_map_version": {"chunk_id": "c1", "hash": "..."},
+        #      "entities": [...], "concepts": [], "claims": [], "relations": [], "topics": [...]}
         resolved_versions = await _wiki_load_map_extracts_for_state(
             ctx.tenant_id,
             ctx.kb_id,
@@ -1139,6 +1442,7 @@ async def run_wiki_incremental(
         resolved_chunk_ids = {str((extract.get("_map_version") or {}).get("chunk_id") or "") for extract in resolved_versions}
         missing_chunk_ids = target_chunk_ids - resolved_chunk_ids
         if missing_chunk_ids:
+            # 有目标分块没抽出结果：MAP 阶段失败，报 -1 终止本次构建
             logging.error(
                 "wiki: MAP extraction/cache resolution incomplete kb=%s missing_chunks=%s",
                 ctx.kb_id,
@@ -1148,14 +1452,11 @@ async def run_wiki_incremental(
             return
 
     if not has_chunk_delta and not deleted_doc_ids:
-        # Nothing fresh, changed, or deleted this run. Skip only when there is
-        # genuinely nothing to build: an existing MAP baseline already has
-        # compiled pages. When the Wiki was explicitly cleared, both
-        # ``existing_map_doc_ids`` and the pages are gone; eligible documents
-        # must go through the first full MAP/REDUCE/REFINE run again. Likewise,
-        # when MAP rows exist but no pages were ever produced (for example a
-        # prior run stopped after MAP), fall through so the compiler can rebuild
-        # pages from the stored extracts.
+        # 本次一样新增、变化、删除都没有。只有"确实无事可建"才跳过：
+        # 已有 MAP 基线且页面已编译完成的情况。Wiki 被显式清空时，
+        # existing_map_doc_ids 和页面都没了，合格文档必须重新走一遍完整的
+        # MAP/REDUCE/REFINE。同理，MAP 行在但页面从没产出过（比如上次
+        # 跑完 MAP 就停了），也要放行，让编译器从已存抽取结果重建页面。
         has_compiled_pages = await _wiki_has_compiled_pages(ctx.tenant_id, ctx.kb_id) if existing_map_doc_ids else None
         if existing_map_doc_ids and has_compiled_pages is True:
             from rag.advanced_rag.knowlege_compile.wiki_incremental import (
@@ -1164,9 +1465,8 @@ async def run_wiki_incremental(
             )
 
             progress(0.9, "Wiki is up to date; recomputing cross-references ...")
-            # FINALIZE recomputes outlinks / auto-links / dead-link cleanup from
-            # the persisted pages (zero LLM cost) so a re-run backfills graph
-            # edges for pages written before auto-linking existed.
+            # FINALIZE 从已落盘页面重算出链/自动互链/死链清理（零 LLM
+            # 成本），让重跑能为"自动互链功能出现之前"写入的页面补齐图边。
             try:
                 await _wiki_finalize(
                     ctx.tenant_id,
@@ -1177,9 +1477,9 @@ async def run_wiki_incremental(
             except Exception:
                 logging.exception("wiki: up-to-date FINALIZE failed for kb=%s", ctx.kb_id)
 
-            # (Re)materialize the canvas graph so pages built before graph
-            # persistence existed (or a graph lost to an interrupted run) still
-            # render. Reload pages → project → persist wiki_entity/relation.
+            # （重新）物化画布图：让"图持久化功能出现之前"构建的页面
+            # （或一次中断跑丢的图）也能渲染。重读页面 → 投影 → 落盘
+            # wiki_entity/relation 行。
             try:
                 graph_pages = await _wiki_load_pages_for_graph(
                     ctx.tenant_id,
@@ -1191,18 +1491,24 @@ async def run_wiki_incremental(
             except Exception:
                 logging.exception("wiki: up-to-date page-graph persist failed for kb=%s", ctx.kb_id)
 
+            # 快照没变也要重新提交一次（补齐可能缺失的快照行）
             await _wiki_commit_active_map_state(ctx.tenant_id, ctx.kb_id, current_chunk_state)
             progress(1.0, "Wiki is up to date.")
             return
         logging.info("wiki: MAP rows exist but no pages found for kb=%s; rebuilding from stored extracts.", ctx.kb_id)
 
-    # 5. Run incremental wiki compilation (Mode A or Mode B)
+    # 5. 跑增量 wiki 编译（Mode A=entity 或 Mode B=topic，由 mode 参数分流）
+    # 全部文档都没解析出 Compiler 模型时在此报错（前面校验只覆盖有 eligible 的情况）
     if not kb_chat_llm_id:
         raise ValueError("Wiki compilation requires an ingestion pipeline Compiler with an LLM configured")
     kb_chat_mdl = _bundle_for(kb_chat_llm_id)
 
     progress(0.65, f"Wiki {mode} incremental compilation ...")
+    # summary 长这样:
+    #     {"pages_created": 3, "pages_modified": 1, "pages_deleted": 0, "errors": []}
     summary = await wiki_compile_incremental(
+        # REFINE 阶段的 LLM 也走同一个池，priority=20 高于 MAP 的 30
+        # （数字越小越优先，REFINE 是收尾关键路径）
         chat_mdl=map_llm_pool.wrap(
             kb_chat_mdl,
             priority=20,
@@ -1221,10 +1527,9 @@ async def run_wiki_incremental(
         callback=lambda p, msg: progress(p, msg),
     )
 
-    # 6. Materialize the canvas graph from the compiled pages. The incremental
-    # entry point persists wiki_page rows internally (without returning the page
-    # list), so reload them and project onto the graph shape that
-    # build_wiki_page_graph expects.
+    # 6. 从编译好的页面物化画布图。增量入口在内部落盘 wiki_page 行
+    # （不返回页面列表），所以先重读回来，再投影成 build_wiki_page_graph
+    # 需要的形状。
     try:
         from rag.advanced_rag.knowlege_compile.wiki_incremental import (
             _wiki_load_pages_for_graph,
@@ -1240,6 +1545,7 @@ async def run_wiki_incremental(
     except Exception:
         logging.exception("wiki: page-graph persist failed for kb=%s", ctx.kb_id)
 
+    # 只有零错误才提交新快照；有错误时保留旧快照，下次重跑还能增量续命
     if not summary.get("errors"):
         await _wiki_commit_active_map_state(ctx.tenant_id, ctx.kb_id, current_chunk_state)
 
@@ -1247,4 +1553,5 @@ async def run_wiki_incremental(
         logging.warning("wiki: incomplete compilation errors: %s", summary["errors"])
         progress(-1, f"Wiki incomplete: {len(summary['errors'])} page(s) failed; retry required.")
     else:
+        # 成功收尾：+新建 ~修改 -删除 的页面计数
         progress(1.0, f"Wiki done: +{summary.get('pages_created', 0)} ~{summary.get('pages_modified', 0)} -{summary.get('pages_deleted', 0)}")
