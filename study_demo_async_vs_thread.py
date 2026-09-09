@@ -53,7 +53,7 @@ def which_thread():
 # 待办事项的卡片。卡片必须交给事件循环（await 它 / create_task 它）
 # 才会真正被执行。
 async def say_hello():
-    print("    你好！")
+    print(" 你好！")
 
 
 def experiment_0():
